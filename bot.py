@@ -29,7 +29,7 @@ intents.dm_messages = True
 
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 scan_lock = asyncio.Lock()
-stop_scan_flag = False
+stop_scan_event = asyncio.Event()
 
 async def check_server(session, ip):
     """
@@ -125,22 +125,20 @@ async def help(ctx):
 @bot.command()
 async def stop(ctx):
     """Stops the currently running scan."""
-    global stop_scan_flag
     if scan_lock.locked():
-        stop_scan_flag = True
+        stop_scan_event.set()
         await ctx.send("🛑 **Stop requested.** The scan will stop shortly...")
     else:
         await ctx.send("⚠️ **No scan is currently running.**")
 
 @bot.command(aliases=['scan'])
 async def check(ctx):
-    global stop_scan_flag
     if scan_lock.locked():
         await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
         return
 
     async with scan_lock:
-        stop_scan_flag = False  # Reset the stop flag at the start of scan
+        stop_scan_event.clear()  # Reset the stop event at the start of scan
         
         # --- File Input ---
         if not ctx.message.attachments:
@@ -174,7 +172,7 @@ async def check(ctx):
         async with aiohttp.ClientSession() as session:
             for index, ip in enumerate(ips):
                 # Check for stop request
-                if stop_scan_flag:
+                if stop_scan_event.is_set():
                     await ctx.send("🛑 **Scan stopped by user.**")
                     await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
                     return
