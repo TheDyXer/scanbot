@@ -27,8 +27,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 scan_lock = asyncio.Lock()
+stop_scan_flag = False
 
 async def check_server(session, ip):
     """
@@ -95,13 +96,52 @@ async def on_ready():
     print(f'Logged in as {bot.user.name}')
     await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
 
+@bot.command()
+async def help(ctx):
+    """Displays a list of available commands."""
+    embed = discord.Embed(
+        title="📖 Scanbot Help",
+        description="Here are all available commands:",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="!check / !scan",
+        value="Scans a list of Minecraft server IPs from an attached `.txt` file.",
+        inline=False
+    )
+    embed.add_field(
+        name="!stop",
+        value="Stops the currently running scan.",
+        inline=False
+    )
+    embed.add_field(
+        name="!help",
+        value="Displays this help message.",
+        inline=False
+    )
+    embed.set_footer(text="Attach a .txt file with IPs (one per line) to use !scan.")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def stop(ctx):
+    """Stops the currently running scan."""
+    global stop_scan_flag
+    if scan_lock.locked():
+        stop_scan_flag = True
+        await ctx.send("🛑 **Stop requested.** The scan will stop shortly...")
+    else:
+        await ctx.send("⚠️ **No scan is currently running.**")
+
 @bot.command(aliases=['scan'])
 async def check(ctx):
+    global stop_scan_flag
     if scan_lock.locked():
         await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
         return
 
     async with scan_lock:
+        stop_scan_flag = False  # Reset the stop flag at the start of scan
+        
         # --- File Input ---
         if not ctx.message.attachments:
             await ctx.send("❌ Please attach a `.txt` file.")
@@ -133,6 +173,12 @@ async def check(ctx):
         
         async with aiohttp.ClientSession() as session:
             for index, ip in enumerate(ips):
+                # Check for stop request
+                if stop_scan_flag:
+                    await ctx.send("🛑 **Scan stopped by user.**")
+                    await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
+                    return
+                
                 if index % 50 == 0:
                     await bot.change_presence(activity=discord.Game(name=f"Scanning {index}/{total_ips} ({ip})..."))
                 
