@@ -147,7 +147,6 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
 class RunTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        scanbot.stop_scan_event.clear()
         self.state = {'phase': '', 'done': 0, 'total': 0, 'found': 0, 'blocked': 0}
 
     async def test_run_direct_uses_the_bedrock_check(self):
@@ -250,7 +249,6 @@ class EditionOptionTests(unittest.IsolatedAsyncioTestCase):
 
 class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        scanbot.stop_scan_event.clear()
         scanbot.bot.direct_ok = False
         scanbot.bot.direct_ok_bedrock = False
         self.progress = mock.MagicMock(edit=mock.AsyncMock())

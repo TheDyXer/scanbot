@@ -176,7 +176,6 @@ class RunDirectTests(unittest.IsolatedAsyncioTestCase):
 
         ips = ['up.example.com', 'evil.example.com', 'down.example.com']
         results, state = {}, {'phase': '', 'done': 0, 'total': 0, 'found': 0, 'blocked': 0}
-        bot.stop_scan_event.clear()
         with mock.patch.object(bot, 'check_direct', fake_check):
             retry = await bot.run_direct(ips, results, state)
 

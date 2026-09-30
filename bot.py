@@ -21,7 +21,7 @@ import re
 import socket
 import sys
 import time
-from typing import Literal
+from typing import Literal, Optional
 
 # --- CONFIGURATION ---
 MC_API_URLS = {
@@ -37,10 +37,11 @@ GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
 USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
 GEO_DB_MAX_AGE_DAYS = 40  # DB-IP publishes a new database every month
 MAX_IPS_PER_SCAN = 5000
-DIRECT_CONCURRENCY = 50   # Direct pings running at the same time
+MAX_CONCURRENT_SCANS = 5  # Scans running at the same time (one per user); more wait in a queue
+DIRECT_CONCURRENCY = 50   # Direct pings running at the same time, per scan
 DIRECT_TIMEOUT = 3        # Seconds to wait for a server to answer a direct ping
-API_DELAY = 0.2           # mcstatus.io allows 5 requests/second per client IP
-GEO_DELAY = 4             # ip-api.com batch allows 15 requests/minute
+API_DELAY = 0.2           # mcstatus.io allows 5 requests/second per client IP, shared by all scans
+GEO_DELAY = 4             # ip-api.com batch allows 15 requests/minute, shared by all scans
 # Pinged at startup to see if direct pings work from this network: one answer is enough. Direct pings
 # connect to the server's IP, so these must answer that way (Hypixel, for one, routes by hostname).
 PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
@@ -177,10 +178,80 @@ class ScanBot(commands.Bot):
 bot = ScanBot(command_prefix=commands.when_mentioned if SLASH_ONLY else '!',
               intents=build_intents(SLASH_ONLY), help_command=None,
               allowed_mentions=discord.AllowedMentions.none())
-scan_lock = asyncio.Lock()
-stop_scan_event = asyncio.Event()
 bot.direct_ok = None  # Set by the startup probe in on_ready
 bot.direct_ok_bedrock = None  # Same for Bedrock: it's UDP, so it can work when Java's TCP port is blocked
+
+class Scan:
+    """
+    One user's scan. Each has its own stop switch and progress, so several people can scan
+    at the same time without stopping or overwriting each other.
+    """
+    def __init__(self, owner, guild_id):
+        self.owner = owner            # The user who started it
+        self.guild_id = guild_id      # Server it was started in (None in DMs), for moderators' /stop
+        self.stop = asyncio.Event()
+        self.turn = asyncio.Event()   # Set when a queued scan may start, or was cancelled
+        self.running = False
+
+scans = {}  # User ID -> that user's scan, queued or running
+queue = []  # Scans waiting for a free slot, oldest first
+
+def running_count():
+    return sum(1 for s in scans.values() if s.running)
+
+def claim_slot(scan):
+    """
+    Starts the scan right away if a slot is free and nobody is waiting, otherwise queues it.
+    Returns its place in the queue, or 0 if it can start now.
+    """
+    if not queue and running_count() < MAX_CONCURRENT_SCANS:
+        scan.running = True
+        return 0
+    queue.append(scan)
+    return len(queue)
+
+def start_queued():
+    """Hands free slots to queued scans, oldest first."""
+    while queue and running_count() < MAX_CONCURRENT_SCANS:
+        scan = queue.pop(0)
+        scan.running = True
+        scan.turn.set()
+
+def request_stop(scan):
+    scan.stop.set()
+    if scan in queue:
+        # Never started: take it out of the queue and wake it up so it can finish
+        queue.remove(scan)
+        scan.turn.set()
+
+def release(scan):
+    """Forgets a finished, stopped or cancelled scan and lets the next queued one start."""
+    if scans.get(scan.owner.id) is scan:
+        del scans[scan.owner.id]
+    if scan in queue:
+        queue.remove(scan)
+    scan.running = False
+    start_queued()
+
+class Pacer:
+    """
+    Spaces out requests to a rate-limited service. mcstatus.io and ip-api.com count requests
+    per client IP, so all scans running at the same time share one pacer each. Waiters are
+    served in order, which makes concurrent scans take turns.
+    """
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._next = 0.0
+
+    async def wait(self, interval):
+        async with self._lock:
+            delay = self._next - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next = time.monotonic() + interval
+
+api_pacer = Pacer()  # mcstatus.io
+geo_pacer = Pacer()  # ip-api.com
 
 def to_int(value):
     try:
@@ -380,11 +451,12 @@ def lookup_countries(ips):
             found[ip] = code
     return found
 
-async def batch_get_locations(session, ips):
+async def batch_get_locations(session, ips, stop=None):
     """
     Uses ip-api.com batch endpoint to get locations for a list of IPs.
     Max 100 IPs per request.
     """
+    stop = stop or asyncio.Event()
     locations = {}
     if not ips:
         return locations
@@ -392,8 +464,10 @@ async def batch_get_locations(session, ips):
     # Split into chunks of 100
     chunks = [ips[i:i + 100] for i in range(0, len(ips), 100)]
 
-    for index, chunk in enumerate(chunks):
-        if stop_scan_event.is_set():
+    for chunk in chunks:
+        # Other scans may be using ip-api.com too, so wait for our turn
+        await geo_pacer.wait(GEO_DELAY)
+        if stop.is_set():
             break
         try:
             payload = [{"query": ip, "fields": "query,countryCode"} for ip in chunk]
@@ -408,9 +482,6 @@ async def batch_get_locations(session, ips):
                     log.warning("Geolocation returned HTTP %s", resp.status)
         except Exception as e:
             log.warning("Geolocation failed: %s", e)
-
-        if index < len(chunks) - 1:
-            await asyncio.sleep(GEO_DELAY)
 
     return locations
 
@@ -432,8 +503,20 @@ async def set_status(text):
     except Exception as e:
         log.warning("Could not update presence: %s", e)
 
+async def update_presence():
+    """Shows how many scans are running and queued. Only called when a scan starts or ends."""
+    running, waiting = running_count(), len(queue)
+    if not running:
+        await set_status("Idle | Waiting for IPs")
+        return
+    text = f"Scanning · {running} running"
+    if waiting:
+        text += f", {waiting} queued"
+    await set_status(text)
+
 def progress_text(state):
-    return f"🔎 **{state['phase']}:** {state['done']}/{state['total']} · **Found:** {state['found']}"
+    owner = f"{state['owner']} · " if state.get('owner') else ""
+    return f"🔎 {owner}**{state['phase']}:** {state['done']}/{state['total']} · **Found:** {state['found']}"
 
 async def report_progress(message, state):
     """Edits the progress message every few seconds while a scan runs."""
@@ -448,11 +531,12 @@ async def report_progress(message, state):
                 log.warning("Could not update progress message: %s", e)
             last = text
 
-async def run_direct(ips, results, state, edition='java'):
+async def run_direct(ips, results, state, edition='java', stop=None):
     """
     Pings every server directly, DIRECT_CONCURRENCY at a time.
     Returns the IPs that didn't answer, in file order.
     """
+    stop = stop or asyncio.Event()
     state.update(phase="Pinging servers", done=0, total=len(ips))
     semaphore = asyncio.Semaphore(DIRECT_CONCURRENCY)
     pinged = set()
@@ -460,7 +544,7 @@ async def run_direct(ips, results, state, edition='java'):
 
     async def ping(ip):
         async with semaphore:
-            if stop_scan_event.is_set():
+            if stop.is_set():
                 return
             try:
                 result = await check_server(ip)
@@ -478,10 +562,12 @@ async def run_direct(ips, results, state, edition='java'):
     await asyncio.gather(*(ping(ip) for ip in ips))
     return [ip for ip in ips if ip in pinged and ip not in results]
 
-async def run_api(session, ips, results, state, retrying, edition='java'):
+async def run_api(session, ips, results, state, retrying, edition='java', stop=None):
     """
     Checks servers through mcstatus.io, starting one request every API_DELAY seconds.
+    Scans running at the same time take turns, so together they stay within the limit.
     """
+    stop = stop or asyncio.Event()
     phase = "Retrying unreachable servers via API" if retrying else "Checking servers via API"
     state.update(phase=phase, done=0, total=len(ips))
 
@@ -493,15 +579,13 @@ async def run_api(session, ips, results, state, retrying, edition='java'):
             state['found'] += 1
 
     tasks = []
-    for index, ip in enumerate(ips):
-        if stop_scan_event.is_set():
+    for ip in ips:
+        await api_pacer.wait(API_DELAY)
+        if stop.is_set():
             break
-        if index % 50 == 0:
-            await set_status(f"API {index}/{len(ips)}...")
         tasks.append(asyncio.create_task(check(ip)))
-        await asyncio.sleep(API_DELAY)
 
-    if stop_scan_event.is_set():
+    if stop.is_set():
         # Cancel checks still in flight before the session closes
         for t in tasks:
             t.cancel()
@@ -551,7 +635,7 @@ async def send_channel(ctx, *args, **kwargs):
     except discord.Forbidden:
         return await ctx.send(*args, **kwargs)
 
-async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java'):
+async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -561,6 +645,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     title = "🛑 **Scan stopped** — partial results" if stopped else "📊 **Scan Complete!**"
     if edition != 'java':
         title += f" ({EDITION_LABELS[edition]})"
+    if owner:
+        title += f" · {owner}"  # Several people may be scanning in the same channel
     summary = (f"{title}\n🟢 {len(populated)} with players · ⚪ {len(empty)} empty · 🔎 {total_ips} IPs\n"
                f"⏱️ **Time:** {minutes}m {seconds}s")
     if not stopped and duration > 0:
@@ -623,7 +709,7 @@ async def on_ready():
             log.warning("Direct Bedrock pings to %s all failed; Bedrock scans use the mcstatus.io API only (5 checks/second).",
                         ", ".join(BEDROCK_PROBE_SERVERS))
     log.info("Logged in as %s", bot.user.name)
-    await set_status("Idle | Waiting for IPs")
+    await update_presence()
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -644,12 +730,15 @@ async def help(ctx):
     )
     embed.add_field(
         name="/scan file:<.txt> [edition]  (or !scan [edition])",
-        value="Scans a list of Minecraft server IPs from a `.txt` file. `edition` is `java` (default) or `bedrock`.",
+        value="Scans a list of Minecraft server IPs from a `.txt` file. `edition` is `java` (default) or `bedrock`.\n"
+              f"Up to {MAX_CONCURRENT_SCANS} people can scan at once, one scan each; more wait in a queue.",
         inline=False
     )
     embed.add_field(
         name="/stop  (or !stop)",
-        value="Stops the currently running scan and posts what it found so far.",
+        value="Stops your scan and posts what it found so far, or cancels it if it's still queued.\n"
+              "Moderators (**Manage Messages**) can stop someone else's scan with `/stop user:@name` "
+              "(`!stop @name`), or every scan in the server with `/stop all:all` (`!stop all`).",
         inline=False
     )
     embed.add_field(
@@ -661,101 +750,153 @@ async def help(ctx):
                           "Country flags: IP Geolocation by DB-IP (db-ip.com)")
     await ctx.send(embed=embed)
 
-@bot.hybrid_command(name="stop", description="Stop the running scan and post what it found so far")
-async def stop(ctx):
-    """Stops the currently running scan."""
-    if scan_lock.locked():
-        stop_scan_event.set()
-        await ctx.send("🛑 **Stop requested.** The scan will stop shortly and post what it found so far...")
+def is_moderator(ctx):
+    """Manage Messages in a server lets someone stop other people's scans there."""
+    return ctx.guild is not None and ctx.permissions.manage_messages
+
+@bot.hybrid_command(name="stop", description="Stop your scan. Moderators can stop someone else's, or all of them")
+@app_commands.describe(scope="Moderators: stop every scan in this server",
+                       user="Moderators: stop this person's scan")
+@app_commands.rename(scope="all")
+async def stop(ctx, scope: Optional[Literal['all']] = None, user: Optional[discord.User] = None):
+    """Stops your own scan. With Manage Messages: someone else's, or every scan in this server."""
+    if scope or (user and user.id != ctx.author.id):
+        if not is_moderator(ctx):
+            await ctx.send("❌ Only moderators (**Manage Messages** permission) can stop other people's scans.")
+            return
+        in_server = [s for s in scans.values() if s.guild_id == ctx.guild.id]
+        targets = in_server if scope else [s for s in in_server if s.owner.id == user.id]
+        if not targets:
+            await ctx.send(f"⚠️ **{user.mention} has no scan running here.**" if not scope
+                           else "⚠️ **No scans are running in this server.**")
+            return
+        for scan in targets:
+            request_stop(scan)
+        owners = ", ".join(s.owner.mention for s in targets)
+        await ctx.send(f"🛑 **Stopping {len(targets)} scan(s)** ({owners}). "
+                       "Running scans stop shortly and post what they found so far.")
+        return
+
+    scan = scans.get(ctx.author.id)
+    if scan is None:
+        await ctx.send("⚠️ **You don't have a scan running.**")
+        return
+    started = scan.running
+    request_stop(scan)
+    if started:
+        await ctx.send("🛑 **Stop requested.** Your scan will stop shortly and post what it found so far...")
     else:
-        await ctx.send("⚠️ **No scan is currently running.**")
+        await ctx.send("🛑 **Scan cancelled** before it started.")
 
 @bot.hybrid_command(name="scan", aliases=['check'], description="Check a list of Minecraft servers from a .txt file")
 @app_commands.describe(file="A .txt file with one IP or hostname per line",
                        edition="Minecraft edition of the servers in the file (default: java)")
 async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock'] = 'java'):
-    # No await between this check and acquiring the lock, so two commands can't both get past it
-    if scan_lock.locked():
-        await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
+    await ctx.defer()  # A slash command must be answered within 3 seconds
+
+    # No await between this check and registering the scan, so nobody can start two at once
+    if ctx.author.id in scans:
+        await ctx.send("⏳ **You already have a scan running or queued.** Use `/stop` to stop it first.")
+        return
+    scan = Scan(ctx.author, ctx.guild.id if ctx.guild else None)
+    scans[ctx.author.id] = scan
+    try:
+        await run_scan(ctx, scan, file, edition)
+    finally:
+        release(scan)
+        await update_presence()
+
+async def run_scan(ctx, scan, file, edition):
+    # --- File Input --- (checked before queueing, so a bad file is rejected right away)
+    if not file.filename.lower().endswith('.txt'):
+        await ctx.send("❌ Must be a `.txt` file.")
         return
 
-    async with scan_lock:
-        stop_scan_event.clear()  # Reset the stop event at the start of scan
-        await ctx.defer()  # A slash command must be answered within 3 seconds
+    try:
+        content = await file.read()
+        ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8'))
+    except Exception as e:
+        await ctx.send(f"❌ Error reading file: {e}")
+        return
 
-        # --- File Input ---
-        if not file.filename.lower().endswith('.txt'):
-            await ctx.send("❌ Must be a `.txt` file.")
-            return
+    if not ips:
+        note = f" ({blocked} private or local address(es) are never scanned)" if blocked else ""
+        await ctx.send(f"⚠️ No valid IPs in the file.{note}")
+        return
 
-        try:
-            content = await file.read()
-            ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8'))
-        except Exception as e:
-            await ctx.send(f"❌ Error reading file: {e}")
-            return
+    total_ips = len(ips)
+    if total_ips > MAX_IPS_PER_SCAN:
+        await ctx.send(f"❌ Too many IPs. Maximum allowed per scan is {MAX_IPS_PER_SCAN}.")
+        return
 
-        if not ips:
-            note = f" ({blocked} private or local address(es) are never scanned)" if blocked else ""
-            await ctx.send(f"⚠️ No valid IPs in the file.{note}")
-            return
+    notes = []
+    if invalid: notes.append(f"skipped {invalid} invalid line(s)")
+    if blocked: notes.append(f"skipped {blocked} private or local address(es)")
+    if duplicates: notes.append(f"removed {duplicates} duplicate(s)")
+    extra = f" ({', '.join(notes)})" if notes else ""
 
-        total_ips = len(ips)
-        if total_ips > MAX_IPS_PER_SCAN:
-            await ctx.send(f"❌ Too many IPs. Maximum allowed per scan is {MAX_IPS_PER_SCAN}.")
-            return
+    # --- Wait for a free slot --- (unless /stop came while the file was being read)
+    place = 0 if scan.stop.is_set() else claim_slot(scan)
+    if place:
+        await ctx.send(f"🕒 **Queued** (#{place}). All {MAX_CONCURRENT_SCANS} scan slots are busy; your scan of "
+                       f"{total_ips} IPs starts automatically when one frees up. `/stop` cancels it.")
+        await update_presence()
+        await scan.turn.wait()
+    if scan.stop.is_set():
+        if not place:
+            await ctx.send("🛑 **Scan cancelled.**")
+        return  # Stopped before it started; /stop already said so
 
-        notes = []
-        if invalid: notes.append(f"skipped {invalid} invalid line(s)")
-        if blocked: notes.append(f"skipped {blocked} private or local address(es)")
-        if duplicates: notes.append(f"removed {duplicates} duplicate(s)")
-        extra = f" ({', '.join(notes)})" if notes else ""
+    start_time = time.time()
+    owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
+    label = "Bedrock " if edition == 'bedrock' else ""
+    started = f"🚀 **Scan started** by {owner} on {total_ips} {label}IPs{extra}..."
+    if place:
+        # The slash command's reply stops working after 15 minutes, which the queue may have taken
+        await send_channel(ctx, started)
+    else:
+        await ctx.send(started)
+    await update_presence()
 
-        start_time = time.time()
-        label = "Bedrock " if edition == 'bedrock' else ""
-        await ctx.send(f"🚀 **Scan started** on {total_ips} {label}IPs{extra}...")
+    state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0, "blocked": 0, "owner": owner}
+    progress = await send_channel(ctx, progress_text(state))
+    updater = asyncio.create_task(report_progress(progress, state))
+    results = {}
+    locations = {}
 
-        state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0, "blocked": 0}
-        progress = await send_channel(ctx, progress_text(state))
-        updater = asyncio.create_task(report_progress(progress, state))
-        results = {}
-        locations = {}
+    try:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
+            # 1. Direct pings, many at once (skipped if the startup probe failed)
+            direct_ok = bot.direct_ok if edition == 'java' else bot.direct_ok_bedrock
+            if direct_ok:
+                retry = await run_direct(ips, results, state, edition, stop=scan.stop)
+            else:
+                retry = ips
 
-        try:
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
-                # 1. Direct pings, many at once (skipped if the startup probe failed)
-                direct_ok = bot.direct_ok if edition == 'java' else bot.direct_ok_bedrock
-                if direct_ok:
-                    await set_status(f"Pinging {total_ips} servers...")
-                    retry = await run_direct(ips, results, state, edition)
-                else:
-                    retry = ips
+            # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans
+            if retry and not scan.stop.is_set():
+                await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition, stop=scan.stop)
 
-                # 2. mcstatus.io API for everything that didn't answer, 5 per second
-                if retry and not stop_scan_event.is_set():
-                    await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition)
+            # 3. Geolocation: offline database first (instant), ip-api.com for the rest
+            addresses = sorted({r['address'] for r in results.values() if r['address']})
+            locations = lookup_countries(addresses)
+            unknown = [a for a in addresses if a not in locations]
+            if unknown and not scan.stop.is_set():
+                state.update(phase="Resolving locations", done=len(locations), total=len(addresses))
+                locations.update(await batch_get_locations(session, unknown, stop=scan.stop))
+                state['done'] = len(addresses)
+    finally:
+        updater.cancel()
 
-                # 3. Geolocation: offline database first (instant), ip-api.com for the rest
-                addresses = sorted({r['address'] for r in results.values() if r['address']})
-                locations = lookup_countries(addresses)
-                unknown = [a for a in addresses if a not in locations]
-                if unknown and not stop_scan_event.is_set():
-                    state.update(phase="Resolving locations", done=len(locations), total=len(addresses))
-                    await set_status("Resolving locations...")
-                    locations.update(await batch_get_locations(session, unknown))
-                    state['done'] = len(addresses)
-        finally:
-            updater.cancel()
-            await set_status("Idle | Waiting for IPs")
+    stopped = scan.stop.is_set()
+    try:
+        await progress.edit(content=("🛑 **Stopped.**" if stopped else "✅ **Done.**") +
+                            f" {owner} found {state['found']} online servers.")
+    except discord.HTTPException:
+        pass
 
-        stopped = stop_scan_event.is_set()
-        try:
-            await progress.edit(content=("🛑 **Stopped.**" if stopped else "✅ **Done.**") + f" Found {state['found']} online servers.")
-        except discord.HTTPException:
-            pass
-
-        await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
-                           blocked=state['blocked'], edition=edition)
+    await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
+                       blocked=state['blocked'], edition=edition, owner=owner)
 
 async def main():
     discord.utils.setup_logging(root=True)
