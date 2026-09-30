@@ -80,8 +80,9 @@ try:
     # Scans running at the same time (one per user); more wait in a queue
     MAX_CONCURRENT_SCANS = env_int('MAX_CONCURRENT_SCANS', 5, 1, 50)
     # Direct pings in flight at the same time, per scan, and for all scans together. Pings to addresses that
-    # don't answer wait out DIRECT_TIMEOUT, so on mostly dead ranges a scan checks about this many per timeout.
-    DIRECT_CONCURRENCY = env_int('DIRECT_CONCURRENCY', 50, 1, 2000)
+    # don't answer wait out DIRECT_TIMEOUT, so on mostly dead ranges a scan checks about this many per timeout:
+    # 300 / 3 s = 100 a second. (Until October 2026 it was 50: about 17 a second.)
+    DIRECT_CONCURRENCY = env_int('DIRECT_CONCURRENCY', 300, 1, 2000)
     DIRECT_CONCURRENCY_TOTAL = env_int('DIRECT_CONCURRENCY_TOTAL', 2 * DIRECT_CONCURRENCY, 1, 20000)
     # Seconds to wait for a server to answer a direct ping
     DIRECT_TIMEOUT = env_float('DIRECT_TIMEOUT', 3, 0.5, pinger.MAX_TIMEOUT,
