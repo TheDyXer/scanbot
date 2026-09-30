@@ -45,7 +45,7 @@ def make_ctx(user_id, guild_id=10, moderator=False, log=None):
 
 
 def attachment():
-    return types.SimpleNamespace(filename='ips.txt', read=mock.AsyncMock(return_value=b'8.8.8.8\n1.1.1.1\n'))
+    return types.SimpleNamespace(filename='ips.txt', size=20, read=mock.AsyncMock(return_value=b'8.8.8.8\n1.1.1.1\n'))
 
 
 def texts(mock_send):

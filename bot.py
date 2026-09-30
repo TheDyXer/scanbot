@@ -37,6 +37,7 @@ GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
 USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
 GEO_DB_MAX_AGE_DAYS = 40  # DB-IP publishes a new database every month
 MAX_IPS_PER_SCAN = 5000
+MAX_FILE_BYTES = 1_000_000  # Largest list file the bot reads (5,000 lines are about 100 KB)
 MAX_CONCURRENT_SCANS = 5  # Scans running at the same time (one per user); more wait in a queue
 DIRECT_CONCURRENCY = 50   # Direct pings running at the same time, per scan
 DIRECT_TIMEOUT = 3        # Seconds to wait for a server to answer a direct ping
@@ -605,6 +606,15 @@ def format_entry(r, locations, markdown=True):
     if names: text += f"\n   └ 👤 {bold('Users:')} {names}"
     return text
 
+def csv_cell(value):
+    """
+    Spreadsheets run cells that start with = + - @ as formulas, and MOTDs, versions and player names
+    come from strangers' servers. A leading ' makes the cell plain text.
+    """
+    if isinstance(value, str) and value.startswith(('=', '+', '-', '@', '\t', '\r')):
+        return "'" + value
+    return value
+
 def build_files(populated, empty, locations):
     """Returns a readable .txt report and a .csv of every online server."""
     lines = []
@@ -621,8 +631,9 @@ def build_files(populated, empty, locations):
     writer = csv.writer(buffer)
     writer.writerow(["ip", "resolved_ip", "country", "players_online", "players_max", "version", "motd", "players", "edition"])
     for r in populated + empty:
-        writer.writerow([r['ip'], r['address'] or '', locations.get(r['address']) or '', r['players'],
-                         r['max'], r['version'], r['motd'], "; ".join(r['names']), r['edition']])
+        writer.writerow([csv_cell(v) for v in (r['ip'], r['address'] or '', locations.get(r['address']) or '',
+                                                r['players'], r['max'], r['version'], r['motd'],
+                                                "; ".join(r['names']), r['edition'])])
     table = discord.File(io.BytesIO(buffer.getvalue().encode('utf-8')), filename="scan_results.csv")
     return [txt, table]
 
@@ -635,6 +646,8 @@ async def send_channel(ctx, *args, **kwargs):
     try:
         return await ctx.channel.send(*args, **kwargs)
     except discord.Forbidden:
+        for file in kwargs.get('files', []):
+            file.reset()  # The failed upload already read them to the end
         return await ctx.send(*args, **kwargs)
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None):
@@ -721,6 +734,11 @@ async def on_command_error(ctx, error):
         await ctx.send("❌ The edition must be `java` or `bedrock`, for example `!scan bedrock`.")
     elif not isinstance(error, commands.CommandNotFound):
         log.error("Command %s failed", ctx.command, exc_info=error)
+        # A slash command that was deferred would otherwise sit on "thinking..." with no explanation
+        try:
+            await ctx.send("❌ Something went wrong. Please try again.")
+        except discord.HTTPException:
+            pass
 
 @bot.hybrid_command(name="help", description="Show the commands and how to use them")
 async def help(ctx):
@@ -813,10 +831,14 @@ async def run_scan(ctx, scan, file, edition):
     if not file.filename.lower().endswith('.txt'):
         await ctx.send("❌ Must be a `.txt` file.")
         return
+    if file.size > MAX_FILE_BYTES:
+        await ctx.send(f"❌ That file is too big ({file.size // 1000} KB). "
+                       f"A list of {MAX_IPS_PER_SCAN} servers is about 100 KB.")
+        return
 
     try:
         content = await file.read()
-        ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8'))
+        ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8-sig'))  # -sig: some editors add a BOM
     except Exception as e:
         await ctx.send(f"❌ Error reading file: {e}")
         return

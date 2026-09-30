@@ -214,7 +214,7 @@ play.example.com
 play.example.com:25566
 ```
 
-- Up to **5,000** servers per scan
+- Up to **5,000** servers per scan, in a file of at most 1 MB
 - Lines without a port use **25565** for Java and **19132** for Bedrock. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
@@ -296,7 +296,7 @@ Settings are at the top of `bot.py`:
 
 The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
 
-Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file.
+Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file. An install made before this setting existed keeps its own `docker-compose.yml`, which doesn't pass it on: add `SLASH_ONLY: ${SLASH_ONLY:-}` under `environment:` there, or delete `docker-compose.yml` and run the installer again.
 
 Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate-limited, which makes scans slower, not faster.
 

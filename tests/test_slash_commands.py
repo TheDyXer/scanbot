@@ -4,6 +4,7 @@ Tests for the slash commands (hybrid commands: /scan and !scan share one impleme
 Run from the repository root:  python -m unittest discover -s tests
 """
 import asyncio
+import io
 import os
 import sys
 import types
@@ -84,8 +85,15 @@ class ErrorHandlerTests(unittest.IsolatedAsyncioTestCase):
         await scanbot.bot.on_command_error(ctx, commands.CommandNotFound('nope'))
         ctx.send.assert_not_awaited()
 
-    async def test_other_errors_are_logged_not_raised(self):
+    async def test_other_errors_are_logged_and_the_user_is_told(self):
+        # After defer() a slash command would otherwise sit on "thinking..." forever
         ctx = mock.MagicMock(send=mock.AsyncMock())
+        with self.assertLogs('scanbot', level='ERROR'):
+            await scanbot.bot.on_command_error(ctx, commands.CommandError('boom'))
+        self.assertIn('went wrong', ctx.send.await_args.args[0])
+
+    async def test_failing_to_tell_the_user_is_not_fatal(self):
+        ctx = mock.MagicMock(send=mock.AsyncMock(side_effect=http_error(discord.HTTPException, 500)))
         with self.assertLogs('scanbot', level='ERROR'):
             await scanbot.bot.on_command_error(ctx, commands.CommandError('boom'))
 
@@ -113,8 +121,9 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def attachment(self, filename='ips.txt', data=b'8.8.8.8\n1.1.1.1\n'):
-        return types.SimpleNamespace(filename=filename, read=mock.AsyncMock(return_value=data))
+    def attachment(self, filename='ips.txt', data=b'8.8.8.8\n1.1.1.1\n', size=None):
+        return types.SimpleNamespace(filename=filename, size=len(data) if size is None else size,
+                                     read=mock.AsyncMock(return_value=data))
 
     def texts(self, mock_send):
         return [call.args[0] for call in mock_send.await_args_list if call.args]
@@ -146,12 +155,55 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
         attachment.read.assert_not_awaited()
         self.ctx.channel.send.assert_not_awaited()
 
+    async def test_oversized_files_are_refused_before_they_are_read(self):
+        attachment = self.attachment(size=scanbot.MAX_FILE_BYTES + 1)
+        await self.scan(self.ctx, attachment)
+        self.assertIn('too big', self.texts(self.ctx.send)[-1])
+        attachment.read.assert_not_awaited()
+        self.ctx.channel.send.assert_not_awaited()
+
+    async def test_a_file_at_the_size_limit_is_accepted(self):
+        await self.scan(self.ctx, self.attachment(size=scanbot.MAX_FILE_BYTES))
+        self.assertTrue(any('Scan Complete' in t for t in self.texts(self.ctx.channel.send)))
+
+    async def test_utf8_bom_does_not_cost_the_first_server(self):
+        # Some editors save "UTF-8 with BOM"; the marker used to glue itself to the first line
+        await self.scan(self.ctx, self.attachment(data=b'\xef\xbb\xbf8.8.8.8\n1.1.1.1\n'))
+        start = self.texts(self.ctx.send)[0]
+        self.assertIn('2 IPs', start)
+        self.assertNotIn('invalid', start)
+
     async def test_a_second_scan_by_the_same_person_is_refused(self):
         scanbot.scans[self.ctx.author.id] = scanbot.Scan(self.ctx.author, None)
         self.addCleanup(scanbot.scans.clear)
         await self.scan(self.ctx, self.attachment())
         self.assertIn('already have a scan', self.texts(self.ctx.send)[0])
         self.ctx.channel.send.assert_not_awaited()
+
+
+class SendChannelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fallback_resends_files_from_the_start(self):
+        # The failed upload already read the files to the end; without a rewind they arrive empty
+        file = discord.File(io.BytesIO(b'hello'), filename='a.txt')
+        position = {}
+
+        async def failing_channel_send(*args, **kwargs):
+            kwargs['files'][0].fp.read()
+            raise http_error(discord.Forbidden, 403)
+
+        async def fallback_send(*args, **kwargs):
+            position['at'] = kwargs['files'][0].fp.tell()
+
+        ctx = mock.MagicMock(send=fallback_send)
+        ctx.channel.send = failing_channel_send
+        await scanbot.send_channel(ctx, 'results', files=[file])
+        self.assertEqual(position['at'], 0)
+
+    async def test_plain_messages_still_fall_back(self):
+        ctx = mock.MagicMock(send=mock.AsyncMock())
+        ctx.channel.send = mock.AsyncMock(side_effect=http_error(discord.Forbidden, 403))
+        await scanbot.send_channel(ctx, 'hello')
+        ctx.send.assert_awaited_once_with('hello')
 
 
 class StopCommandTests(unittest.IsolatedAsyncioTestCase):
