@@ -303,7 +303,7 @@ Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate
 
 ## DNS: Quad9 over TLS
 
-Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used, and direct pings connect to the address Quad9 returned.
+Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used, and direct pings connect to the address Quad9 returned. The one exception is the [VPN](#vpn)'s pinger: the bot finds it by its Docker name (`gluetun`), which only Docker's own DNS knows, and that lookup never leaves the machine.
 
 Check that port 853 works from the machine running the bot:
 
@@ -327,12 +327,25 @@ With Docker, that means building your own image: make the change in a clone, add
 
 ## VPN
 
-With Docker, the bot can send all its traffic through a VPN: Discord, the APIs, and every server it scans. That's useful for two reasons:
+With Docker, the bot can send its pings to the servers you scan through a VPN. That's useful for two reasons:
 
-- **Privacy:** scans come from the VPN's address, not yours.
+- **Privacy:** the scanned servers see the VPN's address, not yours.
 - **Blocked port:** if your router or ISP blocks Minecraft's port 25565, the tunnel gets around it and the fast direct pings work again.
 
-It uses [gluetun](https://github.com/qdm12/gluetun), a VPN client container; the bot shares its network. **If the VPN drops, the bot goes offline until it reconnects.** It never falls back to your own connection.
+**Only the pings go through the VPN.** Discord, mcstatus.io, ip-api.com, DNS (Quad9) and the country-database download all use your own connection. mcstatus.io and ip-api.com limit requests per IP address, and a VPN address is shared with many other people, so API checks from it would be rate-limited much sooner.
+
+How it's built:
+
+- [gluetun](https://github.com/qdm12/gluetun) is a VPN client container.
+- A small **pinger** container shares gluetun's network and sends the pings.
+- The bot asks the pinger for each server, at `gluetun:8765` on the Docker network. The pinger only accepts public IP addresses. It never looks up names, because the bot does that (through Quad9) and checks them first.
+
+**If the VPN drops:**
+
+- The bot stays online.
+- Scans check every server through the API until the VPN is back, and say so: in the start message, the progress line, the results, and the bot's status (`· VPN down`).
+- **Pings never fall back to your own connection.** gluetun's firewall blocks anything that isn't going through the tunnel.
+- The bot checks the VPN again every minute while it's down, and before each scan.
 
 ### Providers
 
@@ -372,7 +385,36 @@ Fastest Mullvad locations from here:
 Choose [1-5] (Enter = 1):
 ```
 
-The VPN then connects to any server in that city, and moves to another one there if a server fails.
+With Proton and WARP, the VPN then connects to any server in that city, and moves to another one there if a server fails. With Mullvad, the bot picks the server itself; see below.
+
+### Mullvad: switching servers when one is down
+
+With Mullvad, the bot keeps an eye on the server the VPN is using, and moves the VPN to another one when:
+
+- **Mullvad lists it as offline** on its [server list](https://mullvad.net/en/servers). The bot checks every 5 minutes.
+- **Or pings through it fail** on two checks in a row, about 1 to 6 minutes. This only counts while Mullvad's site answers: if your own internet is down, switching servers wouldn't help, so the bot waits.
+
+**Where it switches to:**
+
+- First the other servers in your city.
+- Then the next-fastest cities from the ping test at setup, up to 10 of them (`VPN_FALLBACK_CITIES` in `.env`).
+- A server that didn't let pings through isn't used again for 30 minutes. If it fails again, the wait doubles each time, up to a day.
+
+**Switching back:** once a better server has been listed as up for 30 minutes, the VPN moves back to it.
+
+Every switch is in the bot's log, with the reason:
+
+```text
+Switched Mullvad server from rs-beg-wg-101 to rs-beg-wg-102: rs-beg-wg-101 is listed as offline on Mullvad's site
+```
+
+**How it works:**
+
+- The bot tells gluetun which server to use through gluetun's control server, reachable only inside Docker at `gluetun:8000`.
+- The installer creates a key for it: `GLUETUN_API_KEY` in `.env`, and `vpn/auth/config.toml`. The key allows switching servers and nothing else. It can't read gluetun's settings, which include your WireGuard key.
+- The server list comes from Mullvad's API, over your own connection like the other APIs.
+- **Trade-off:** the VPN stays on the one server the bot picked, instead of gluetun choosing any server in the city. If the bot is stopped, the VPN stays on its last server. If gluetun restarts, it uses `vpn.env`'s city until the bot picks a server again, within 5 minutes.
+- **Installed before this existed?** Run the installer again (no `--vpn` needed): it adds the key and the list of cities.
 
 ### Set it up by hand
 
@@ -396,7 +438,25 @@ The VPN then connects to any server in that city, and moves to another one there
    ```
 
    On Windows, use `;` between the file names and also add `COMPOSE_PATH_SEPARATOR=;`.
-4. Run `docker compose up -d`.
+4. For Mullvad server switching (optional):
+   - Add a random key and your cities, best first, to `.env`:
+
+     ```ini
+     GLUETUN_API_KEY=<a long random string>
+     VPN_PROVIDER=Mullvad
+     VPN_FALLBACK_CITIES="Belgrade,Zagreb,Budapest"
+     ```
+
+   - Create `vpn/auth/config.toml`, readable only by you, with the same key:
+
+     ```toml
+     [[roles]]
+     name = "scanbot"
+     routes = ["PUT /v1/vpn/settings", "GET /v1/vpn/status"]
+     auth = "apikey"
+     apikey = "<the same key>"
+     ```
+5. Run `docker compose up -d`.
 
 To find the fastest city yourself:
 
@@ -407,10 +467,11 @@ docker run --rm -v ./vpn:/gluetun:ro ghcr.io/thedyxer/scanbot python /app/vpn_se
 
 ### Good to know
 
-- **Updates:** Watchtower also updates gluetun, and restarts the bot along with it.
+- **Updates:** Watchtower also updates gluetun and the pinger. When gluetun is updated, the pinger restarts with it and the bot keeps running.
 - **What gets extra access:** gluetun needs the `NET_ADMIN` capability and `/dev/net/tun` to create the tunnel. The WARP keys come from wgcf, a third-party open-source tool; the installer pins version 2.3.0 and checks its SHA-256 before running it.
-- **Some servers ignore VPN addresses.** Hypixel, for example, doesn't answer Mullvad's.
-- **mcstatus.io's limit is per address.** Its limit of 5 requests per second is per IP address, and a VPN address is shared with other people, so the API fallback can be rate-limited sooner.
+- **Some servers ignore VPN addresses.** Hypixel, for example, doesn't answer Mullvad's. Those get checked through the API, from your own address.
+- **Updating from an older version:** before this, the whole bot went through the VPN. Run the installer again (with or without `--vpn`) to switch: it replaces `docker-compose.vpn.yml` and keeps your old one as `docker-compose.vpn.yml.bak`.
+- **Never publish port 8765.** The pinger is meant to be reachable only by the bot, inside Docker.
 
 ## Keep it running without Docker (Linux)
 
@@ -460,9 +521,12 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
+| Log says `Mullvad server switching is off: there's no GLUETUN_API_KEY` | The install is older than server switching | Run the installer again |
+| Log says `gluetun refused the API key` | `GLUETUN_API_KEY` in `.env` and `vpn/auth/config.toml` don't match, or gluetun hasn't restarted since the file changed | Run the installer again, or `docker compose restart gluetun` |
 | Installer says `The VPN didn't connect` | Wrong key, or your network blocks the VPN's UDP port | Check the key in `vpn.env`, or run the installer again with `--vpn`. For a blocked port, add `WIREGUARD_ENDPOINT_PORT=53` (Mullvad also takes `123`) to `vpn.env`, then `docker compose up -d` |
-| Bot went offline while using a VPN | The VPN dropped, and the bot waits for it instead of using your connection | `docker compose logs gluetun`; it reconnects by itself, usually within seconds |
-| WARP connects but the bot can't reach anything | The packet size (MTU) is too big for your network | Lower `WIREGUARD_MTU=1280` to `1200` in `vpn.env`, then `docker compose up -d` |
+| `⚠️ The VPN is down: checking every server through the API only` | The VPN dropped or hasn't connected yet. Pings never use your own connection, so the scan uses the API | `docker compose logs gluetun`; it reconnects by itself, usually within seconds. The bot checks again every minute |
+| Bot's status says `· VPN down` | Same as above | Same as above |
+| WARP connects but every scan says the VPN is down | The packet size (MTU) is too big for your network | Lower `WIREGUARD_MTU=1280` to `1200` in `vpn.env`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
 | `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second) |
 | `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |

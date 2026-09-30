@@ -139,16 +139,27 @@ fi
 
 # --- VPN ---
 disable_vpn() {
-  # Drop the override from .env first, so "up --remove-orphans" below removes gluetun
+  # Drop the override from .env first, so "up --remove-orphans" below removes gluetun and the pinger
   env_unset COMPOSE_FILE; env_unset VPN_PROVIDER; env_unset VPN_LOCATION
+  clear_mullvad_switch
   ok "No VPN: the bot uses this machine's connection"
 }
 
-enable_vpn() {  # enable_vpn "<provider label>" "<location label>"
-  if [ ! -f docker-compose.vpn.yml ]; then
-    curl -fsSL "${RAW}/docker-compose.vpn.yml" -o docker-compose.vpn.yml \
-      || die "Couldn't download docker-compose.vpn.yml from ${RAW}"
+# docker-compose.vpn.yml belongs to the installer, so it's replaced on every run: older versions sent
+# all of the bot's traffic through the VPN. A changed copy is kept as docker-compose.vpn.yml.bak.
+fetch_vpn_compose() {
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL "${RAW}/docker-compose.vpn.yml" -o "${tmp}" \
+    || { rm -f "${tmp}"; die "Couldn't download docker-compose.vpn.yml from ${RAW}"; }
+  if [ -f docker-compose.vpn.yml ] && ! cmp -s "${tmp}" docker-compose.vpn.yml; then
+    cp docker-compose.vpn.yml docker-compose.vpn.yml.bak
+    ok "Updated docker-compose.vpn.yml (your old one is docker-compose.vpn.yml.bak)"
   fi
+  cat "${tmp}" > docker-compose.vpn.yml; rm -f "${tmp}"
+}
+
+enable_vpn() {  # enable_vpn "<provider label>" "<location label>"
+  fetch_vpn_compose
   env_set COMPOSE_FILE "${VPN_COMPOSE_FILE}"
   env_set VPN_PROVIDER "\"$1\""
   env_set VPN_LOCATION "\"$2\""
@@ -156,18 +167,23 @@ enable_vpn() {  # enable_vpn "<provider label>" "<location label>"
 
 valid_key() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 
-pick_city() {  # pick_city <provider> <on|off free only> <label>; sets PICK_COUNTRY and PICK_CITY
-  local rows choice line count
-  info "Finding the fastest $3 location from here..."
+rank_cities() {  # rank_cities <provider> <on|off free only> <label>; sets RANKED: the 10 fastest cities, tab-separated rows
+  info "Finding the fastest $3 locations from here..."
   mkdir -p vpn
   # gluetun writes its own server list into vpn/, so the city names match what it expects
   docker run --rm -v "$(pwd)/vpn:/gluetun" "${GLUETUN_IMAGE}" format-servers "-$1" >/dev/null 2>&1 \
     || warn "Couldn't read gluetun's server list; using the online copy"
   docker pull -q "${IMAGE}" >/dev/null 2>&1 || true
-  local args=(--provider "$1")
+  local args=(--provider "$1" --top 10)
   if [ "$2" = on ]; then args+=(--free); fi
-  rows="$(docker run --rm -v "$(pwd)/vpn:/gluetun:ro" "${IMAGE}" python /app/vpn_select.py "${args[@]}")" \
+  RANKED="$(docker run --rm -v "$(pwd)/vpn:/gluetun:ro" "${IMAGE}" python /app/vpn_select.py "${args[@]}")" \
     || die "Couldn't test the $3 locations (see above)."
+}
+
+pick_city() {  # pick_city <provider> <on|off free only> <label>; sets PICK_COUNTRY, PICK_CITY and RANKED
+  local rows choice line count
+  rank_cities "$1" "$2" "$3"
+  rows="$(printf '%s\n' "${RANKED}" | head -n 5)"
   count="$(printf '%s\n' "${rows}" | wc -l | tr -d ' ')"
   echo "Fastest $3 locations from here:"
   while IFS=$'\t' read -r rank country city ms; do
@@ -179,6 +195,48 @@ pick_city() {  # pick_city <provider> <on|off free only> <label>; sets PICK_COUN
   PICK_COUNTRY="$(printf '%s' "${line}" | cut -f2)"
   PICK_CITY="$(printf '%s' "${line}" | cut -f3)"
   ok "Using ${PICK_CITY}, ${PICK_COUNTRY}"
+}
+
+# --- Mullvad server switching ---
+# The bot moves the VPN to another Mullvad server when the current one is down: first the other
+# servers in the chosen city, then the next-fastest cities (VPN_FALLBACK_CITIES). It tells gluetun
+# through gluetun's control server, with a key that allows exactly that (vpn/auth/config.toml).
+GLUETUN_RESTART=""
+set_fallback_cities() {  # set_fallback_cities <chosen city>; uses RANKED
+  local cities
+  cities="$( { printf '%s\n' "$1"; printf '%s\n' "${RANKED}" | cut -f3; } | awk 'NF && !seen[$0]++' | head -n 10 | paste -sd, -)"
+  env_set VPN_FALLBACK_CITIES "\"${cities}\""
+  ok "If a Mullvad server goes down, the bot switches to another one in: ${cities//,/, }"
+}
+
+setup_mullvad_switch() {
+  local key tmp
+  key="$(env_get GLUETUN_API_KEY)"
+  if [ -z "${key}" ]; then
+    key="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    env_set GLUETUN_API_KEY "${key}"
+  fi
+  mkdir -p vpn/auth
+  tmp="$(mktemp)"
+  {
+    echo "# Written by install.sh: lets the scanbot bot switch Mullvad servers, and nothing else"
+    echo "[[roles]]"
+    echo 'name = "scanbot"'
+    echo 'routes = ["PUT /v1/vpn/settings", "GET /v1/vpn/status"]'
+    echo 'auth = "apikey"'
+    echo "apikey = \"${key}\""
+  } > "${tmp}"
+  if ! cmp -s "${tmp}" vpn/auth/config.toml 2>/dev/null; then
+    rm -f vpn/auth/config.toml
+    (umask 077; cat "${tmp}" > vpn/auth/config.toml)
+    GLUETUN_RESTART="yes"  # gluetun reads it only when it starts
+  fi
+  rm -f "${tmp}"
+}
+
+clear_mullvad_switch() {
+  env_unset VPN_FALLBACK_CITIES; env_unset GLUETUN_API_KEY
+  if [ -f vpn/auth/config.toml ]; then rm -f vpn/auth/config.toml; GLUETUN_RESTART="yes"; fi
 }
 
 setup_provider() {  # setup_provider mullvad|protonvpn
@@ -226,6 +284,12 @@ setup_provider() {  # setup_provider mullvad|protonvpn
     echo "UPDATER_PERIOD=480h"
   } > vpn.env)
   enable_vpn "${label}" "${PICK_CITY}, ${PICK_COUNTRY}"
+  if [ "${provider}" = mullvad ]; then
+    set_fallback_cities "${PICK_CITY}"
+    setup_mullvad_switch
+  else
+    clear_mullvad_switch
+  fi
 }
 
 setup_warp() {
@@ -233,6 +297,7 @@ setup_warp() {
   if grep -q "^WIREGUARD_ENDPOINT_PORT=2408$" vpn.env 2>/dev/null; then
     ok "Keeping your existing Cloudflare WARP keys"
     enable_vpn "Cloudflare WARP" "nearest (automatic)"
+    clear_mullvad_switch
     return
   fi
   case "$(docker info --format '{{.Architecture}}' 2>/dev/null)" in
@@ -268,6 +333,7 @@ setup_warp() {
   rm -rf vpn/warp  # The account file isn't needed once the keys are in vpn.env
   ok "Cloudflare WARP keys saved to vpn.env"
   enable_vpn "Cloudflare WARP" "nearest (automatic)"
+  clear_mullvad_switch
 }
 
 if [ -n "${VPN_SETUP}" ]; then
@@ -295,7 +361,16 @@ EOF
     *) die "Unknown SCANBOT_VPN value: ${choice} (use none, mullvad, protonvpn or warp)" ;;
   esac
 elif vpn_enabled; then
+  fetch_vpn_compose
   ok "Keeping your VPN: $(env_get VPN_PROVIDER | tr -d '"'), $(env_get VPN_LOCATION | tr -d '"')"
+  # Installs from before Mullvad server switching get it now
+  if grep -q '^VPN_SERVICE_PROVIDER=mullvad$' vpn.env 2>/dev/null; then
+    if [ -z "$(env_get VPN_FALLBACK_CITIES)" ]; then
+      rank_cities mullvad off Mullvad
+      set_fallback_cities "$(grep -m1 '^SERVER_CITIES=' vpn.env | cut -d= -f2- | cut -d, -f1)"
+    fi
+    setup_mullvad_switch
+  fi
 fi
 
 # --- Start ---
@@ -308,17 +383,25 @@ if ! pull_output=$(docker compose pull 2>&1); then
   die "docker compose pull failed."
 fi
 
-if vpn_enabled; then info "Starting the VPN and the bot (the bot waits until the VPN is connected)..."; fi
+if vpn_enabled; then info "Starting the VPN, its pinger and the bot..."; fi
+vpn_failed=""
+# A gluetun that's already running must restart to read a new server-switching key; a new one reads it anyway
+gluetun_running="$(docker compose ps -q --status running gluetun 2>/dev/null || true)"
 if ! docker compose up -d --remove-orphans; then
-  if vpn_enabled; then
-    warn "The VPN didn't connect. Last gluetun log lines:"
-    docker compose logs --tail 15 gluetun 2>&1 || true
-    die "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
-  fi
-  die "docker compose up failed."
+  if ! vpn_enabled; then die "docker compose up failed."; fi
+  # The bot doesn't wait for the VPN: it runs anyway and checks servers through the API until the VPN is up
+  vpn_failed="yes"
+  warn "The VPN didn't connect. Last gluetun log lines:"
+  docker compose logs --tail 15 gluetun 2>&1 || true
+  warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
+  warn "Until then the bot still runs, and checks every server through the API only."
+elif vpn_enabled && [ -n "${GLUETUN_RESTART}" ] && [ -n "${gluetun_running}" ]; then
+  # gluetun reads vpn/auth/config.toml only when it starts (the pinger restarts with it)
+  info "Restarting the VPN so it picks up the server-switching key..."
+  docker compose restart gluetun >/dev/null 2>&1 || warn "Couldn't restart gluetun. Run: docker compose restart gluetun"
 fi
 
-if vpn_enabled; then
+if vpn_enabled && [ -z "${vpn_failed}" ]; then
   vpn_ip=""
   for _ in $(seq 1 20); do
     vpn_ip="$(docker compose logs gluetun 2>&1 | grep -oE "Public IP address is .*" | tail -n 1 || true)"
@@ -326,6 +409,16 @@ if vpn_enabled; then
     sleep 1
   done
   ok "VPN connected ($(env_get VPN_PROVIDER | tr -d '"'), $(env_get VPN_LOCATION | tr -d '"'))${vpn_ip:+. ${vpn_ip}}"
+  pinger_up=""
+  for _ in $(seq 1 20); do
+    if docker compose logs pinger 2>&1 | grep -q "Pinger listening"; then pinger_up="yes"; break; fi
+    sleep 1
+  done
+  if [ -n "${pinger_up}" ]; then
+    ok "Pinger ready: server pings go through the VPN; Discord, the APIs and DNS use this machine's connection"
+  else
+    warn "The pinger hasn't started yet. Check it with: docker compose logs pinger"
+  fi
 fi
 
 info "Waiting for the bot to log in..."
@@ -345,8 +438,9 @@ echo
 case "${status}" in
   ok)
     ok "Scanbot is running."
-    # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it)
-    printf '%s' "${logs}" | grep -oE "Direct (Bedrock (\(UDP\) )?)?pings? .*" | tail -n 2 | sed 's/^/    /' || true
+    # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it).
+    # With the VPN, one line says whether pings through it work.
+    printf '%s' "${logs}" | grep -oE "(Direct (Bedrock (\(UDP\) )?)?pings?|Pings through the VPN) .*" | tail -n 2 | sed 's/^/    /' || true
     ;;
   bad-token)
     # Stop it so it doesn't keep retrying a bad login (Discord blocks IPs that do that a lot)

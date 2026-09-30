@@ -23,6 +23,10 @@ import sys
 import time
 from typing import Literal, Optional
 
+import pinger
+import vpn_switch
+from pinger import is_public_ip
+
 # --- CONFIGURATION ---
 MC_API_URLS = {
     'java': 'https://api.mcstatus.io/v2/status/java/',
@@ -49,6 +53,18 @@ PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
 BEDROCK_PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'geo.hivebedrock.network')  # Same, over UDP
 PROGRESS_INTERVAL = 3     # Seconds between progress message updates
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
+# With the VPN, pings are sent by the pinger inside the VPN container; everything else uses this
+# machine's connection. Set by docker-compose.vpn.yml; empty means the bot pings servers itself.
+PINGER_URL = os.environ.get('PINGER_URL', '').strip().rstrip('/')
+VPN_CHECK_DOWN = 60       # With the VPN: seconds between checks while pings through it fail
+VPN_CHECK_UP = 300        # ... and while they work
+VPN_SWITCH_SETTLE = 30    # Seconds to let the VPN connect after moving to another server, before checking again
+# Mullvad server switching: gluetun's control server, and the cities to use, best first (set by the installer)
+GLUETUN_URL = os.environ.get('GLUETUN_URL', '').strip().rstrip('/')
+GLUETUN_API_KEY = os.environ.get('GLUETUN_API_KEY', '').strip()
+VPN_PROVIDER = os.environ.get('VPN_PROVIDER', '').strip().strip('"')
+VPN_LOCATION = os.environ.get('VPN_LOCATION', '').strip().strip('"')
+VPN_FALLBACK_CITIES = os.environ.get('VPN_FALLBACK_CITIES', '').strip().strip('"')
 # ---------------------
 
 log = logging.getLogger('scanbot')
@@ -106,9 +122,6 @@ INTERNAL_SUFFIXES = ('.localhost', '.local', '.lan', '.internal', '.home.arpa', 
 
 class BlockedAddress(Exception):
     """The address is private or local, so it is never contacted."""
-
-def is_public_ip(ip):
-    return ip.is_global and not ip.is_multicast
 
 def is_internal_name(host):
     host = host.lower().rstrip('.')
@@ -181,6 +194,8 @@ bot = ScanBot(command_prefix=commands.when_mentioned if SLASH_ONLY else '!',
               allowed_mentions=discord.AllowedMentions.none())
 bot.direct_ok = None  # Set by the startup probe in on_ready
 bot.direct_ok_bedrock = None  # Same for Bedrock: it's UDP, so it can work when Java's TCP port is blocked
+bot.probed_at = 0.0  # With the VPN: when the probes last ran (time.monotonic)
+bot.vpn_switcher = None  # With Mullvad: moves the VPN off servers that are down (set in on_ready)
 
 class Scan:
     """
@@ -274,6 +289,48 @@ def make_result(ip, address, players, players_max, names, version, motd, edition
         "motd": (motd or '').strip().replace('\n', '  '),
     }
 
+pinger_session = None
+
+def get_pinger_session():
+    """
+    HTTP session to the pinger in the VPN container. Unlike every other session here it doesn't use
+    Quad9: the pinger's name ("gluetun") only exists in Docker's own DNS.
+    """
+    global pinger_session
+    if pinger_session is None or pinger_session.closed:
+        pinger_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=0),  # 5 scans x 50 pings can be in flight at once
+            timeout=aiohttp.ClientTimeout(total=DIRECT_TIMEOUT + 2))
+    return pinger_session
+
+def clean_status(data):
+    """The pinger's answer, with every field forced to the type a result needs."""
+    names = data.get('names')
+    return {"players": data.get('players'), "max": data.get('max'),
+            "names": [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
+            "version": data.get('version') if isinstance(data.get('version'), str) else None,
+            "motd": data.get('motd') if isinstance(data.get('motd'), str) else ''}
+
+async def ping_server(address, port, edition):
+    """
+    The only place a server gets pinged. Without the VPN the bot pings it itself. With it, the pinger
+    in the VPN container does, and if the pinger can't be reached the answer is None: a ping never
+    falls back to this machine's own connection.
+    """
+    if not PINGER_URL:
+        return await pinger.ping(address, port, edition, DIRECT_TIMEOUT)
+    try:
+        request = {"edition": edition, "ip": address, "port": port, "timeout": DIRECT_TIMEOUT}
+        async with get_pinger_session().post(f"{PINGER_URL}/ping", json=request) as response:
+            if response.status != 200:
+                return None
+            data = await response.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get('online'):
+        return None
+    return clean_status(data)
+
 async def check_direct(ip):
     """
     Pings the server itself. Returns a result if it answers, None otherwise.
@@ -292,15 +349,16 @@ async def check_direct(ip):
         address = await resolve_public_address(server.address.host)
         if address is None:
             return None
-        status = await JavaServer(str(address), server.address.port, timeout=DIRECT_TIMEOUT).async_status(tries=1)
+        status = await ping_server(str(address), server.address.port, 'java')
     except BlockedAddress:
         raise
     except Exception:
         return None
+    if status is None:
+        return None
 
-    names = [p.name for p in (status.players.sample or []) if p.name]
-    return make_result(ip, str(address), status.players.online, status.players.max,
-                       names, status.version.name, status.motd.to_plain())
+    return make_result(ip, str(address), status['players'], status['max'],
+                       status['names'], status['version'], status['motd'])
 
 def split_entry(entry, default_port):
     """Splits "host" or "host:port" from the IP list."""
@@ -320,14 +378,16 @@ async def check_direct_bedrock(entry):
         address = await resolve_public_address(host)
         if address is None:
             return None
-        status = await BedrockServer(str(address), port, timeout=DIRECT_TIMEOUT).async_status(tries=1)
+        status = await ping_server(str(address), port, 'bedrock')
     except BlockedAddress:
         raise
     except Exception:
         return None
+    if status is None:
+        return None
 
-    return make_result(entry, str(address), status.players.online, status.players.max,
-                       [], status.version.name, status.motd.to_plain(), edition='bedrock')
+    return make_result(entry, str(address), status['players'], status['max'],
+                       [], status['version'], status['motd'], edition='bedrock')
 
 async def check_api(session, ip, edition='java'):
     """
@@ -506,15 +566,24 @@ async def set_status(text):
     except Exception as e:
         log.warning("Could not update presence: %s", e)
 
+def vpn_down():
+    """True when the bot uses the VPN and the last check found pings through it failing."""
+    return bool(PINGER_URL) and bot.direct_ok is not None and not (bot.direct_ok or bot.direct_ok_bedrock)
+
 async def update_presence():
-    """Shows how many scans are running and queued. Only called when a scan starts or ends."""
+    """
+    Shows how many scans are running and queued, and whether the VPN is down.
+    Called when a scan starts or ends, and when the VPN goes down or comes back.
+    """
     running, waiting = running_count(), len(queue)
     if not running:
-        await set_status("Idle | Waiting for IPs")
-        return
-    text = f"Scanning · {running} running"
-    if waiting:
-        text += f", {waiting} queued"
+        text = "Idle | Waiting for IPs"
+    else:
+        text = f"Scanning · {running} running"
+        if waiting:
+            text += f", {waiting} queued"
+    if vpn_down():
+        text += " · VPN down"
     await set_status(text)
 
 def progress_text(state):
@@ -565,13 +634,15 @@ async def run_direct(ips, results, state, edition='java', stop=None):
     await asyncio.gather(*(ping(ip) for ip in ips))
     return [ip for ip in ips if ip in pinged and ip not in results]
 
-async def run_api(session, ips, results, state, retrying, edition='java', stop=None):
+async def run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False):
     """
     Checks servers through mcstatus.io, starting one request every API_DELAY seconds.
     Scans running at the same time take turns, so together they stay within the limit.
     """
     stop = stop or asyncio.Event()
     phase = "Retrying unreachable servers via API" if retrying else "Checking servers via API"
+    if vpn_down:
+        phase += " (VPN down)"
     state.update(phase=phase, done=0, total=len(ips))
 
     async def check(ip):
@@ -650,7 +721,8 @@ async def send_channel(ctx, *args, **kwargs):
             file.reset()  # The failed upload already read them to the end
         return await ctx.send(*args, **kwargs)
 
-async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None):
+async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
+                       vpn_down=False):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -668,6 +740,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         summary += f"\n⚡ **Speed:** {total_ips / duration:.2f} IPs/sec"
     if blocked:
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
+    if vpn_down:
+        summary += "\n⚠️ The VPN was down: every server was checked through the API only"
 
     if not results:
         await send_channel(ctx, f"❌ No working servers found.\n{summary}")
@@ -708,10 +782,107 @@ async def probe_direct(edition='java'):
 
     return any(await asyncio.gather(*(probe(server) for server in servers)))
 
+async def check_vpn():
+    """
+    With the VPN: probes both editions through the pinger, and logs and shows it when
+    the VPN goes down or comes back. The first check always logs.
+    """
+    first, was_down = bot.direct_ok is None, vpn_down()
+    bot.direct_ok, bot.direct_ok_bedrock = await asyncio.gather(probe_direct('java'), probe_direct('bedrock'))
+    bot.probed_at = time.monotonic()
+    if vpn_down() and (first or not was_down):
+        log.warning("Pings through the VPN fail (VPN down or still connecting): scans check every server through "
+                    "the mcstatus.io API only until it's back. Checking again every %d s.", VPN_CHECK_DOWN)
+    elif not vpn_down() and (first or was_down):
+        log.info("Pings through the VPN work: scans ping servers through it, with API fallback.")
+    if not first and vpn_down() != was_down:
+        await update_presence()
+
+async def fetch_mullvad_relays():
+    """Mullvad's WireGuard server list, over this machine's own connection like the other APIs."""
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver()),
+                                     headers={'User-Agent': USER_AGENT}) as session:
+        async with session.get(vpn_switch.RELAYS_URL, timeout=aiohttp.ClientTimeout(total=15)) as response:
+            response.raise_for_status()
+            return await response.json()
+
+async def set_vpn_server(hostname):
+    """
+    Tells gluetun to use one Mullvad server, through its control server (only the bot can reach it).
+    gluetun ignores it when nothing changed, so repeating it costs nothing. Returns False if gluetun
+    doesn't know that server.
+    """
+    body = {"provider": {"server_selection": {"hostnames": [hostname], "cities": [], "countries": []}}}
+    async with get_pinger_session().put(f"{GLUETUN_URL}/v1/vpn/settings", json=body,
+                                        headers={"X-API-Key": GLUETUN_API_KEY},
+                                        timeout=aiohttp.ClientTimeout(total=60)) as response:
+        if response.status == 400:
+            log.debug("gluetun refused %s: %s", hostname, (await response.text()).strip())
+            return False
+        if response.status in (401, 403):
+            raise PermissionError("gluetun refused the API key (GLUETUN_API_KEY and vpn/auth/config.toml must match)")
+        response.raise_for_status()
+        return True
+
+def make_vpn_switcher():
+    """The Mullvad server switcher, or None when the VPN isn't Mullvad or can't be controlled."""
+    if not PINGER_URL or VPN_PROVIDER.lower() != 'mullvad':
+        return None
+    if not (GLUETUN_URL and GLUETUN_API_KEY):
+        log.info("Mullvad server switching is off: there's no GLUETUN_API_KEY. Run the installer again to turn it on.")
+        return None
+    cities = [c.strip() for c in VPN_FALLBACK_CITIES.split(',') if c.strip()]
+    if not cities and VPN_LOCATION:
+        cities = [VPN_LOCATION.split(',')[0].strip()]
+        log.info("No VPN_FALLBACK_CITIES: only servers in %s are used. Run the installer again for more cities.", cities[0])
+    if not cities:
+        log.info("Mullvad server switching is off: no city to pick servers from (VPN_FALLBACK_CITIES).")
+        return None
+    log.info("Mullvad server switching is on. Cities, best first: %s", ", ".join(cities))
+    return vpn_switch.MullvadSwitcher(cities, fetch_mullvad_relays, set_vpn_server)
+
+async def switch_vpn_server():
+    """
+    With Mullvad: moves the VPN to another server if the current one is listed as offline or doesn't
+    let pings through. Returns how many seconds to wait before the next VPN check.
+    """
+    wait = VPN_CHECK_DOWN if vpn_down() else VPN_CHECK_UP
+    if bot.vpn_switcher is not None:
+        try:
+            if await bot.vpn_switcher.tick(vpn_ok=not vpn_down()):
+                wait = VPN_SWITCH_SETTLE  # Check again soon, so scans use the new server quickly
+        except Exception:
+            log.exception("Mullvad server switching failed")
+    return wait
+
+async def watch_vpn():
+    """Checks the VPN in the background, more often while it's down, and switches Mullvad servers."""
+    while True:
+        await asyncio.sleep(await switch_vpn_server())
+        try:
+            await check_vpn()
+        except Exception:
+            log.exception("VPN check failed")
+
+async def direct_pings_work(edition):
+    """
+    Whether a scan starting now can ping servers directly. With the VPN, a failed check is
+    tried again right away (unless it just ran), in case the VPN has come back since.
+    """
+    if PINGER_URL and vpn_down() and time.monotonic() - bot.probed_at > 10:
+        await check_vpn()
+    return bot.direct_ok if edition == 'java' else bot.direct_ok_bedrock
+
 @bot.event
 async def on_ready():
     # on_ready runs again after reconnects; only probe once
-    if bot.direct_ok is None:
+    if bot.direct_ok is None and PINGER_URL:
+        log.info("Pings go through the VPN (pinger at %s); Discord, the APIs and DNS use this machine's connection.",
+                 PINGER_URL)
+        await check_vpn()
+        bot.vpn_switcher = make_vpn_switcher()
+        bot.vpn_watcher = asyncio.create_task(watch_vpn())
+    elif bot.direct_ok is None:
         bot.direct_ok, bot.direct_ok_bedrock = await asyncio.gather(probe_direct('java'), probe_direct('bedrock'))
         if bot.direct_ok:
             log.info("Direct pings work; scans use direct pings with API fallback.")
@@ -877,9 +1048,15 @@ async def run_scan(ctx, scan, file, edition):
         return
 
     start_time = time.time()
+    # Direct pings, unless the startup probe failed. With the VPN, pings only ever go through it:
+    # while it's down, every server is checked through the API instead.
+    direct_ok = await direct_pings_work(edition)
+    no_vpn = bool(PINGER_URL) and not direct_ok
     owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
     label = "Bedrock " if edition == 'bedrock' else ""
     started = f"🚀 **Scan started** by {owner} on {total_ips} {label}IPs{extra}..."
+    if no_vpn:
+        started += "\n⚠️ **The VPN is down:** checking every server through the API only, so this is slower."
     if place:
         # The slash command's reply stops working after 15 minutes, which the queue may have taken
         await send_channel(ctx, started)
@@ -895,8 +1072,7 @@ async def run_scan(ctx, scan, file, edition):
 
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
-            # 1. Direct pings, many at once (skipped if the startup probe failed)
-            direct_ok = bot.direct_ok if edition == 'java' else bot.direct_ok_bedrock
+            # 1. Direct pings, many at once
             if direct_ok:
                 retry = await run_direct(ips, results, state, edition, stop=scan.stop)
             else:
@@ -904,7 +1080,8 @@ async def run_scan(ctx, scan, file, edition):
 
             # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans
             if retry and not scan.stop.is_set():
-                await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition, stop=scan.stop)
+                await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition,
+                              stop=scan.stop, vpn_down=no_vpn)
 
             # 3. Geolocation: offline database first (instant), ip-api.com for the rest
             addresses = sorted({r['address'] for r in results.values() if r['address']})
@@ -925,15 +1102,19 @@ async def run_scan(ctx, scan, file, edition):
         pass
 
     await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
-                       blocked=state['blocked'], edition=edition, owner=owner)
+                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn)
 
 async def main():
     discord.utils.setup_logging(root=True)
     await load_geo_db()
     # discord.py only builds its own connector if none is set, so Discord traffic uses Quad9 too
     bot.http.connector = aiohttp.TCPConnector(limit=0, resolver=Quad9Resolver())
-    async with bot:
-        await bot.start(TOKEN)
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    finally:
+        if pinger_session is not None:
+            await pinger_session.close()
 
 if __name__ == '__main__':
     try:
