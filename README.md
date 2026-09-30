@@ -319,9 +319,26 @@ Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate
 
 ## DNS: Quad9 over TLS
 
-Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used, and direct pings connect to the address Quad9 returned. The one exception is the [VPN](#vpn)'s pinger: the bot finds it by its Docker name (`gluetun`), which only Docker's own DNS knows, and that lookup never leaves the machine.
+Every hostname the bot looks up goes to [Quad9](https://quad9.net), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used, and direct pings connect to the address Quad9 returned. The one exception is the [VPN](#vpn)'s pinger: the bot finds it by its Docker name (`gluetun`), which only Docker's own DNS knows, and that lookup never leaves the machine.
 
-Check that port 853 works from the machine running the bot:
+The bot reaches Quad9 one of two ways, and picks the one that works when it starts:
+
+- **DNS-over-TLS** (port 853), tried first.
+- **DNS-over-HTTPS** (port 443, like normal web traffic), used when port 853 is blocked. The log says so: `Quad9 over TLS (port 853): ...; using Quad9 over HTTPS (port 443) instead.`
+
+If neither works, the bot stops with `DNS lookups failed` and both reasons. That means the machine, or with Docker its containers, can't reach the internet at all.
+
+The installer checks port 853 from a container. If it's blocked, it writes `DNS_TRANSPORT=doh` to `.env`, which skips the failed try on every start. You can set it yourself:
+
+| `DNS_TRANSPORT` | Meaning |
+|---|---|
+| `auto` (default) | TLS first, HTTPS if that fails |
+| `dot` | Only TLS; the bot stops if port 853 is blocked |
+| `doh` | Only HTTPS |
+
+With Docker Compose, put it in the `.env` file. An install made before this setting existed keeps its own `docker-compose.yml`, which doesn't pass it on: add `DNS_TRANSPORT: ${DNS_TRANSPORT:-}` under `environment:` there, or delete `docker-compose.yml` and run the installer again. `auto` needs no setting.
+
+To check port 853 from the machine running the bot:
 
 ```bash
 openssl s_client -connect 9.9.9.9:853 -servername dns.quad9.net </dev/null 2>/dev/null | grep "Verify return code"
@@ -329,17 +346,6 @@ openssl s_client -connect 9.9.9.9:853 -servername dns.quad9.net </dev/null 2>/de
 ```
 
 On Windows: `Test-NetConnection 9.9.9.9 -Port 853` should show `TcpTestSucceeded : True`.
-
-**If port 853 is blocked**, switch to DNS-over-HTTPS, which uses port 443 like normal web traffic:
-
-1. `pip install httpx`
-2. In `bot.py`, replace the two `DoTNameserver(...)` lines with:
-
-   ```python
-   dns.nameserver.DoHNameserver('https://dns.quad9.net/dns-query', bootstrap_address='9.9.9.9'),
-   ```
-
-With Docker, that means building your own image: make the change in a clone, add `httpx` to `requirements.txt`, run `docker build -t scanbot-doh .`, set `SCANBOT_IMAGE=scanbot-doh` in `.env`, and delete the `watchtower:` block (it can only update published images).
 
 ## VPN
 
@@ -549,7 +555,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
 | `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second) |
 | `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
-| Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
+| `DNS lookups failed, so the bot can't reach Discord` | Neither TLS (853) nor HTTPS (443) reaches Quad9: the machine or its containers have no internet | Fix the connection (the message shows both reasons), then `docker compose up -d`; see [DNS](#dns-quad9-over-tls) |
+| `Quad9 over TLS (port 853) ...; using Quad9 over HTTPS` in the log | Port 853 is blocked on your network | Nothing to fix: the bot switched to HTTPS by itself. Set `DNS_TRANSPORT=doh` to skip the failed try on every start |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
 | `⏳ You already have a scan running or queued` | Everyone gets one scan at a time | Wait for it to finish, or `/stop` it first |
 | `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
