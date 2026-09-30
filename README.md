@@ -45,12 +45,12 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Several people can scan at once:** up to 5 scans run side by side, one per person, and more wait in a queue
 - **`/stop` at any point**, which posts what was found so far. It stops your own scan; moderators can stop anyone's
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
-- **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message
+- **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message. A huge scan's files are split to fit Discord's upload limit and arrive as several messages
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
 - **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
 - **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS
-- Up to 5,000 IPs per scan
+- Up to 30,000 IPs per scan
 - **Docker image** for `amd64` and `arm64`, a one-line installer, and automatic daily updates
 
 ## Discord bot setup
@@ -136,7 +136,7 @@ To uninstall, run `docker compose down --rmi all` and delete the folder.
 
 ### Automatic updates
 
-The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one.
+The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one. A scan that is running at that moment is ended, so start very large scans (a 30,000-IP scan can take well over an hour) outside that time.
 
 - It only touches scanbot, never your other containers.
 - The time zone is `TZ` in `.env` (default `UTC`), for example `TZ=Europe/Budapest`.
@@ -215,7 +215,7 @@ play.example.com
 play.example.com:25566
 ```
 
-- Up to **5,000** servers per scan, in a file of at most 1 MB
+- Up to **30,000** servers per scan, in a file of at most 2 MB
 - Lines without a port use **25565** for Java and **19132** for Bedrock. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
@@ -269,8 +269,8 @@ flowchart TD
     E --> F[Post results]
 ```
 
-1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
-2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
+1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 30 minutes, and usually far less.
+2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 30,000 IPs take about 100 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
    - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
@@ -283,7 +283,7 @@ Settings are at the top of `bot.py`:
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `MAX_IPS_PER_SCAN` | `5000` | Largest list the bot accepts |
+| `MAX_IPS_PER_SCAN` | `30000` | Largest list the bot accepts |
 | `MAX_CONCURRENT_SCANS` | `5` | Scans running at the same time (one per person); more wait in a queue |
 | `DIRECT_CONCURRENCY` | `50` | Direct pings running at the same time, per scan |
 | `DIRECT_TIMEOUT` | `3` | Seconds to wait for a server to answer a direct ping |

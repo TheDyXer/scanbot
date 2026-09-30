@@ -40,8 +40,11 @@ GEO_DB_PATH = os.environ.get('GEO_DB_PATH') or os.path.join(os.path.dirname(os.p
 GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
 USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
 GEO_DB_MAX_AGE_DAYS = 40  # DB-IP publishes a new database every month
-MAX_IPS_PER_SCAN = 5000
-MAX_FILE_BYTES = 1_000_000  # Largest list file the bot reads (5,000 lines are about 100 KB)
+MAX_IPS_PER_SCAN = 30000
+# Largest list file the bot reads: 30,000 lines of up to 64 bytes. Ordinary IP lists are about 0.6 MB.
+MAX_FILE_BYTES = 2_000_000
+UPLOAD_LIMIT = 10 * 1024 * 1024  # What Discord accepts per file, unless the server is boosted
+UPLOAD_HEADROOM = 0.9            # The bot stays this far under it
 MAX_CONCURRENT_SCANS = 5  # Scans running at the same time (one per user); more wait in a queue
 DIRECT_CONCURRENCY = 50   # Direct pings running at the same time, per scan
 DIRECT_TIMEOUT = 3        # Seconds to wait for a server to answer a direct ping
@@ -686,27 +689,82 @@ def csv_cell(value):
         return "'" + value
     return value
 
+def csv_line(values):
+    buffer = io.StringIO()
+    csv.writer(buffer).writerow(values)
+    return buffer.getvalue()
+
+def report_rows(populated, empty, locations):
+    """
+    Returns (text rows, CSV header, CSV rows) of the results. Each row is a whole entry, so a report
+    that is too big for one upload can be split between rows.
+    """
+    txt_rows = []
+    if populated:
+        txt_rows.append(f"Servers with Players ({len(populated)}):\n")
+        txt_rows += [format_entry(r, locations, markdown=False) + "\n" for r in populated]
+        txt_rows.append("\n")
+    if empty:
+        txt_rows.append(f"Online (Empty) Servers ({len(empty)}):\n")
+        txt_rows += [format_entry(r, locations, markdown=False) + "\n" for r in empty]
+
+    header = csv_line(["ip", "resolved_ip", "country", "players_online", "players_max", "version", "motd", "players",
+                       "edition"])
+    csv_rows = [csv_line([csv_cell(v) for v in (r['ip'], r['address'] or '', locations.get(r['address']) or '',
+                                                 r['players'], r['max'], r['version'], r['motd'],
+                                                 "; ".join(r['names']), r['edition'])])
+                for r in populated + empty]
+    return txt_rows, header, csv_rows
+
+def split_rows(filename, header, rows, limit):
+    """
+    Returns [(filename, bytes), ...]: the rows as one file, or as several when they wouldn't fit in `limit`
+    bytes. Only splits between rows, and every part starts with the header. Parts are named name_1.ext, name_2.ext, ...
+    """
+    header_bytes = header.encode('utf-8')
+    parts, current, size = [], [], len(header_bytes)
+    for row in rows:
+        data = row.encode('utf-8')
+        if current and size + len(data) > limit:
+            parts.append(current)
+            current, size = [], len(header_bytes)
+        current.append(data)
+        size += len(data)
+    parts.append(current)
+    if len(parts) == 1:
+        return [(filename, header_bytes + b"".join(parts[0]))]
+    stem, extension = os.path.splitext(filename)
+    return [(f"{stem}_{number}{extension}", header_bytes + b"".join(part)) for number, part in enumerate(parts, 1)]
+
+def batch_files(files, limit):
+    """Groups (filename, bytes) files, in order, into messages that each stay within `limit` bytes in total."""
+    batches, size = [], 0
+    for file in files:
+        if batches and size + len(file[1]) <= limit:
+            batches[-1].append(file)
+            size += len(file[1])
+        else:
+            batches.append([file])
+            size = len(file[1])
+    return batches
+
+def upload_limit(ctx):
+    """How many bytes the bot may upload in one message here: the server's limit (higher if boosted), minus headroom."""
+    limit = getattr(ctx.guild, 'filesize_limit', None)  # No guild in DMs
+    if not isinstance(limit, int):
+        limit = UPLOAD_LIMIT
+    return int(limit * UPLOAD_HEADROOM)
+
+def build_file_batches(populated, empty, locations, limit):
+    """Returns the results files as batches of discord.File, one batch per message, each within `limit` bytes."""
+    txt_rows, header, csv_rows = report_rows(populated, empty, locations)
+    files = split_rows("scan_results.txt", "", txt_rows, limit) + split_rows("scan_results.csv", header, csv_rows, limit)
+    return [[discord.File(io.BytesIO(data), filename=name) for name, data in batch]
+            for batch in batch_files(files, limit)]
+
 def build_files(populated, empty, locations):
     """Returns a readable .txt report and a .csv of every online server."""
-    lines = []
-    if populated:
-        lines.append(f"Servers with Players ({len(populated)}):")
-        lines += [format_entry(r, locations, markdown=False) for r in populated]
-        lines.append("")
-    if empty:
-        lines.append(f"Online (Empty) Servers ({len(empty)}):")
-        lines += [format_entry(r, locations, markdown=False) for r in empty]
-    txt = discord.File(io.BytesIO("\n".join(lines).encode('utf-8')), filename="scan_results.txt")
-
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(["ip", "resolved_ip", "country", "players_online", "players_max", "version", "motd", "players", "edition"])
-    for r in populated + empty:
-        writer.writerow([csv_cell(v) for v in (r['ip'], r['address'] or '', locations.get(r['address']) or '',
-                                                r['players'], r['max'], r['version'], r['motd'],
-                                                "; ".join(r['names']), r['edition'])])
-    table = discord.File(io.BytesIO(buffer.getvalue().encode('utf-8')), filename="scan_results.csv")
-    return [txt, table]
+    return build_file_batches(populated, empty, locations, float('inf'))[0]
 
 async def send_channel(ctx, *args, **kwargs):
     """
@@ -767,8 +825,13 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     message = summary
     if top:
         message += "\n\n**Top servers:**\n" + "\n".join(top)
+    batches = build_file_batches(populated, empty, locations, upload_limit(ctx))
     message += "\n\n📎 Full results are in the attached files."
-    await send_channel(ctx, message[:2000], files=build_files(populated, empty, locations))
+    if len(batches) > 1:
+        message += f" They're too big for one message, so they come in {len(batches)}."
+    await send_channel(ctx, message[:2000], files=batches[0])
+    for number, files in enumerate(batches[1:], 2):
+        await send_channel(ctx, f"📎 Results, continued ({number}/{len(batches)})", files=files)
 
 async def probe_direct(edition='java'):
     """True if a direct ping to any of the probe servers gets an answer."""
@@ -1003,8 +1066,8 @@ async def run_scan(ctx, scan, file, edition):
         await ctx.send("❌ Must be a `.txt` file.")
         return
     if file.size > MAX_FILE_BYTES:
-        await ctx.send(f"❌ That file is too big ({file.size // 1000} KB). "
-                       f"A list of {MAX_IPS_PER_SCAN} servers is about 100 KB.")
+        await ctx.send(f"❌ That file is too big ({file.size // 1000} KB). The limit is {MAX_FILE_BYTES // 1_000_000} MB; "
+                       f"a list of {MAX_IPS_PER_SCAN} servers is usually well under 1 MB.")
         return
 
     try:
