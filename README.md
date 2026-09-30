@@ -2,7 +2,7 @@
 
 A Discord bot that checks a list of Minecraft Java servers and tells you which ones are online, how many players they have, and where they are.
 
-Drop a `.txt` file of IPs into Discord with `!scan`, watch the progress message count up, and get the results in chat or as a `.txt` / `.csv` file.
+Drop a `.txt` file of IPs into Discord with `/scan` (or `!scan`), watch the progress message count up, and get the results in chat or as a `.txt` / `.csv` file.
 
 ## Quick start
 
@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | 
 
 It asks for your bot token, starts the bot, and keeps it updated automatically. Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
 
-First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores commands.
+First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores `!` commands. The slash commands (`/scan`) don't need it.
 
 ## Contents
 
@@ -39,7 +39,8 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Fast scans:** pings servers directly, 50 at a time, and retries the ones that don't answer through `api.mcstatus.io`
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
-- **`!stop` at any point**, which posts what was found so far
+- **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
+- **`/stop` at any point**, which posts what was found so far
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
 - **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
@@ -53,7 +54,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
 2. Open **Bot**:
    - Click **Reset Token** and copy the token. You'll need it for `DISCORD_TOKEN`.
-   - Under **Privileged Gateway Intents**, turn on **Message Content Intent**. Without it the bot logs in but never sees `!scan`.
+   - Under **Privileged Gateway Intents**, turn on **Message Content Intent** if you want the `!` commands. Without it the bot logs in but never sees `!scan`. Slash commands don't need it: set `SLASH_ONLY=1` to run without that intent (see [Configuration](#configuration)).
 3. Invite the bot to your server. Replace `<CLIENT_ID>` with the **Application ID** from **General Information**:
 
    ```
@@ -70,6 +71,8 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
    | Attach Files | `scan_results.txt` / `.csv` |
 
 Commands also work in a direct message to the bot.
+
+The `bot` scope already includes `applications.commands`, so the slash commands appear once the bot has started and synced them. If `/scan` doesn't show up, wait a minute and restart Discord (Ctrl+R).
 
 ## Installation
 
@@ -181,9 +184,11 @@ or, if your network blocks Minecraft's port:
 
 | Command | What it does |
 | --- | --- |
-| `!scan` (or `!check`) + attached `.txt` | Scans every server in the file |
-| `!stop` | Stops the running scan and posts what it found so far |
-| `!help` | Lists the commands |
+| `/scan file:<.txt>` (or `!scan` + attached `.txt`) | Scans every server in the file |
+| `/stop` (or `!stop`) | Stops the running scan and posts what it found so far |
+| `/help` (or `!help`) | Lists the commands |
+
+Progress and results are posted as normal messages in the channel, not as replies to the slash command: Discord stops accepting replies to a slash command after 15 minutes, and a big scan can take longer. The bot needs **Send Messages** in that channel, otherwise it falls back to replying.
 
 ### The IP list
 
@@ -249,7 +254,7 @@ flowchart TD
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
    - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
 
-`!stop` works in every phase. Pings already in flight finish (at most 3 seconds), and nothing new starts.
+`/stop` works in every phase. Pings already in flight finish (at most 3 seconds), and nothing new starts.
 
 ## Configuration
 
@@ -268,6 +273,8 @@ Settings are at the top of `bot.py`:
 | `GEO_DB_MAX_AGE_DAYS` | `40` | Download a new country database when the current one is older than this (without Docker) |
 
 The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
+
+Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file.
 
 Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate-limited, which makes scans slower, not faster.
 
@@ -337,7 +344,9 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Bot is online but ignores `!scan` | Message Content Intent is off | Turn it on in the Developer Portal → **Bot** → **Privileged Gateway Intents**, then restart the bot |
+| Bot is online but ignores `!scan` | Message Content Intent is off | Use `/scan`, which doesn't need it, or turn the intent on in the Developer Portal → **Bot** → **Privileged Gateway Intents** and restart the bot |
+| `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 3 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
+| `PrivilegedIntentsRequired` at startup | `SLASH_ONLY` is off but the Message Content Intent isn't enabled | Enable the intent, or set `SLASH_ONLY=1` |
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
@@ -345,7 +354,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Direct ping to mc.hypixel.net failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
 | Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
-| `⏳ Bot is busy` | Another scan is running | Wait, or `!stop` it |
+| `⏳ Bot is busy` | Another scan is running | Wait, or `/stop` it |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database (for example a private `10.x` or `192.168.x` address) and ip-api.com didn't know it either, or was rate-limited | Normal for private addresses. For public ones, scan again in a minute |
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
