@@ -8,3 +8,5 @@ data/
 docker-compose.yml
 install.sh
 README.md
+*.mmdb
+*.mmdb.tmp

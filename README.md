@@ -40,7 +40,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
 - **`!stop` at any point**, which posts what was found so far
-- **Country flags** for every online server, including hostnames and `host:port` entries
+- **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
 - **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
@@ -238,14 +238,16 @@ flowchart TD
     B -- yes --> C[Ping every server directly<br/>50 at a time, 3 s timeout]
     B -- no --> D[Check via api.mcstatus.io<br/>5 per second]
     C -- no answer --> D
-    C -- online --> E[Look up countries<br/>ip-api.com, 100 per batch]
+    C -- online --> E[Look up countries<br/>offline DB-IP database,<br/>ip-api.com for the rest]
     D -- online --> E
     E --> F[Post results]
 ```
 
 1. **Direct pings.** When the bot starts it pings `mc.hypixel.net`. If that works, scans ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes.
-3. **Countries.** Online servers are looked up on `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
+3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
+   - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
+   - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
 
 `!stop` works in every phase. Pings already in flight finish (at most 3 seconds), and nothing new starts.
 
@@ -263,6 +265,9 @@ Settings are at the top of `bot.py`:
 | `PROBE_SERVER` | `mc.hypixel.net` | Server pinged at startup to test direct pings |
 | `PROGRESS_INTERVAL` | `3` | Seconds between progress message updates |
 | `INLINE_LIMIT` | `1900` | Results longer than this many characters are sent as files |
+| `GEO_DB_MAX_AGE_DAYS` | `40` | Download a new country database when the current one is older than this (without Docker) |
+
+The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
 
 Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate-limited, which makes scans slower, not faster.
 
@@ -342,7 +347,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
 | `⏳ Bot is busy` | Another scan is running | Wait, or `!stop` it |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
-| Servers show 🏳️ instead of a flag | ip-api.com was unreachable or rate-limited | Wait a minute and scan again; it allows 15 batches per minute |
+| Servers show 🏳️ instead of a flag | The IP isn't in the country database (for example a private `10.x` or `192.168.x` address) and ip-api.com didn't know it either, or was rate-limited | Normal for private addresses. For public ones, scan again in a minute |
+| `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
 | Many known-online servers missing | mcstatus.io rate-limited the bot | Don't run other tools using the API from the same IP; leave `API_DELAY` at `0.2` or higher |
 
 ## Credits
@@ -350,7 +356,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 - [discord.py](https://github.com/Rapptz/discord.py): Discord API wrapper
 - [mcstatus](https://github.com/py-mine/mcstatus): direct Minecraft server pings
 - [mcstatus.io](https://mcstatus.io): server status API (5 requests/second per IP)
-- [ip-api.com](https://ip-api.com): IP geolocation. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
+- [IP Geolocation by DB-IP](https://db-ip.com): the offline country database (DB-IP Lite), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- [ip-api.com](https://ip-api.com): fallback IP geolocation. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
 - [dnspython](https://www.dnspython.org) and [Quad9](https://quad9.net): encrypted DNS
 
 ## License
