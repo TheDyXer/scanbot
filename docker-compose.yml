@@ -11,6 +11,8 @@ services:
     user: "${SCANBOT_UID:-1000}:${SCANBOT_GID:-1000}"
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      # Set SLASH_ONLY=1 in .env to run without the Message Content intent (slash commands only)
+      SLASH_ONLY: ${SLASH_ONLY:-}
     volumes:
       - ./data:/data:ro
     labels:

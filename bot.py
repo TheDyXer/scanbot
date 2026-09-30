@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 from mcstatus import JavaServer
 import aiohttp
@@ -143,13 +144,32 @@ def get_flag_emoji(country_code):
         return "🏳️"
     return "".join([chr(ord(c.upper()) + 127397) for c in country_code])
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.dm_messages = True
+def env_flag(name):
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+# Slash commands need no privileged intent. The Message Content intent is only for the ! commands,
+# so SLASH_ONLY=1 lets the bot run with that switch off in the Developer Portal.
+SLASH_ONLY = env_flag('SLASH_ONLY')
+
+def build_intents(slash_only):
+    intents = discord.Intents.default()
+    intents.message_content = not slash_only
+    intents.dm_messages = True
+    return intents
+
+class ScanBot(commands.Bot):
+    async def setup_hook(self):
+        # Slash commands only show up in Discord once they've been synced
+        try:
+            synced = await self.tree.sync()
+            log.info("Synced %d slash command(s)", len(synced))
+        except discord.HTTPException as e:
+            log.warning("Could not sync slash commands: %s", e)
 
 # MOTDs and player names come from strangers' servers, so never let them ping anyone
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None,
-                   allowed_mentions=discord.AllowedMentions.none())
+bot = ScanBot(command_prefix=commands.when_mentioned if SLASH_ONLY else '!',
+              intents=build_intents(SLASH_ONLY), help_command=None,
+              allowed_mentions=discord.AllowedMentions.none())
 scan_lock = asyncio.Lock()
 stop_scan_event = asyncio.Event()
 bot.direct_ok = None  # Set by the startup probe in on_ready
@@ -483,6 +503,17 @@ def build_files(populated, empty, locations):
     table = discord.File(io.BytesIO(buffer.getvalue().encode('utf-8')), filename="scan_results.csv")
     return [txt, table]
 
+async def send_channel(ctx, *args, **kwargs):
+    """
+    Posts to the channel itself instead of replying to the interaction. A slash command's reply
+    stops working 15 minutes after it was used, and a big scan can take longer than that.
+    Falls back to replying if the bot isn't allowed to post in the channel.
+    """
+    try:
+        return await ctx.channel.send(*args, **kwargs)
+    except discord.Forbidden:
+        return await ctx.send(*args, **kwargs)
+
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
@@ -499,7 +530,7 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
 
     if not results:
-        await ctx.send(f"❌ No working servers found.\n{summary}")
+        await send_channel(ctx, f"❌ No working servers found.\n{summary}")
         return
 
     lines = []
@@ -513,7 +544,7 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     body = "\n".join(lines)
 
     if len(summary) + len(body) + 2 <= INLINE_LIMIT:
-        await ctx.send(f"{summary}\n\n{body}")
+        await send_channel(ctx, f"{summary}\n\n{body}")
         return
 
     # Too long for one message: summary + top servers in chat, everything in files
@@ -523,7 +554,7 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     if top:
         message += "\n\n**Top servers:**\n" + "\n".join(top)
     message += "\n\n📎 Full results are in the attached files."
-    await ctx.send(message[:2000], files=build_files(populated, empty, locations))
+    await send_channel(ctx, message[:2000], files=build_files(populated, empty, locations))
 
 async def probe_direct():
     """True if a direct ping to any of the PROBE_SERVERS gets an answer."""
@@ -548,7 +579,14 @@ async def on_ready():
     log.info("Logged in as %s", bot.user.name)
     await set_status("Idle | Waiting for IPs")
 
-@bot.command()
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredAttachment):
+        await ctx.send("❌ Please attach a `.txt` file.")
+    elif not isinstance(error, commands.CommandNotFound):
+        log.error("Command %s failed", ctx.command, exc_info=error)
+
+@bot.hybrid_command(name="help", description="Show the commands and how to use them")
 async def help(ctx):
     """Displays a list of available commands."""
     embed = discord.Embed(
@@ -557,25 +595,25 @@ async def help(ctx):
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="!check / !scan",
-        value="Scans a list of Minecraft server IPs from an attached `.txt` file.",
+        name="/scan file:<.txt>  (or !scan)",
+        value="Scans a list of Minecraft server IPs from a `.txt` file.",
         inline=False
     )
     embed.add_field(
-        name="!stop",
+        name="/stop  (or !stop)",
         value="Stops the currently running scan and posts what it found so far.",
         inline=False
     )
     embed.add_field(
-        name="!help",
+        name="/help  (or !help)",
         value="Displays this help message.",
         inline=False
     )
-    embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use !scan.\n"
+    embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use /scan.\n"
                           "Country flags: IP Geolocation by DB-IP (db-ip.com)")
     await ctx.send(embed=embed)
 
-@bot.command()
+@bot.hybrid_command(name="stop", description="Stop the running scan and post what it found so far")
 async def stop(ctx):
     """Stops the currently running scan."""
     if scan_lock.locked():
@@ -584,8 +622,9 @@ async def stop(ctx):
     else:
         await ctx.send("⚠️ **No scan is currently running.**")
 
-@bot.command(aliases=['scan'])
-async def check(ctx):
+@bot.hybrid_command(name="scan", aliases=['check'], description="Check a list of Minecraft servers from a .txt file")
+@app_commands.describe(file="A .txt file with one IP or hostname per line")
+async def check(ctx, file: discord.Attachment):
     # No await between this check and acquiring the lock, so two commands can't both get past it
     if scan_lock.locked():
         await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
@@ -593,19 +632,15 @@ async def check(ctx):
 
     async with scan_lock:
         stop_scan_event.clear()  # Reset the stop event at the start of scan
+        await ctx.defer()  # A slash command must be answered within 3 seconds
 
         # --- File Input ---
-        if not ctx.message.attachments:
-            await ctx.send("❌ Please attach a `.txt` file.")
-            return
-
-        attachment = ctx.message.attachments[0]
-        if not attachment.filename.endswith('.txt'):
+        if not file.filename.lower().endswith('.txt'):
             await ctx.send("❌ Must be a `.txt` file.")
             return
 
         try:
-            content = await attachment.read()
+            content = await file.read()
             ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8'))
         except Exception as e:
             await ctx.send(f"❌ Error reading file: {e}")
@@ -631,7 +666,7 @@ async def check(ctx):
         await ctx.send(f"🚀 **Scan started** on {total_ips} IPs{extra}...")
 
         state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0, "blocked": 0}
-        progress = await ctx.send(progress_text(state))
+        progress = await send_channel(ctx, progress_text(state))
         updater = asyncio.create_task(report_progress(progress, state))
         results = {}
         locations = {}
