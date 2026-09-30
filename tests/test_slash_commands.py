@@ -38,7 +38,7 @@ class RegistrationTests(unittest.TestCase):
 
     def test_scan_takes_a_required_attachment_first(self):
         params = scanbot.bot.tree.get_command('scan').parameters
-        self.assertEqual([p.name for p in params], ['file', 'edition'])
+        self.assertEqual([p.name for p in params], ['file', 'edition', 'api'])
         self.assertEqual(params[0].type, discord.AppCommandOptionType.attachment)
         self.assertTrue(params[0].required)
 

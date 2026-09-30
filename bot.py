@@ -779,8 +779,27 @@ async def send_channel(ctx, *args, **kwargs):
             file.reset()  # The failed upload already read them to the end
         return await ctx.send(*args, **kwargs)
 
+def speed_text(direct, api):
+    """
+    The results' speed line: servers checked per second, timed only while pinging and asking the API.
+    Geolocation, the VPN check and sending messages aren't part of it, and when both phases ran, each one's
+    own rate is shown too (the API phase is capped at 5 a second, shared by all scans, so it sets the pace).
+    `direct` and `api` are (servers checked, seconds) for a phase that ran, None for one that didn't.
+    Returns '' when there's nothing to show.
+    """
+    ran = {name: phase for name, phase in (('direct', direct), ('API', api)) if phase and phase[1] > 0}
+    if not ran:
+        return ''
+    checked = next(iter(ran.values()))[0]  # Every server goes through the first phase that ran
+    text = f"⚡ **Speed:** {checked / sum(seconds for _, seconds in ran.values()):.2f} IPs/sec"
+    if len(ran) == 2:
+        text += " (" + " · ".join(f"{name} {count / seconds:.2f}/s" for name, (count, seconds) in ran.items()) + ")"
+    elif 'API' in ran:
+        text += " (API)"
+    return text
+
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
-                       vpn_down=False):
+                       vpn_down=False, direct=None, api=None, not_retried=0):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -794,8 +813,12 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         title += f" · {owner}"  # Several people may be scanning in the same channel
     summary = (f"{title}\n🟢 {len(populated)} with players · ⚪ {len(empty)} empty · 🔎 {total_ips} IPs\n"
                f"⏱️ **Time:** {minutes}m {seconds}s")
-    if not stopped and duration > 0:
-        summary += f"\n⚡ **Speed:** {total_ips / duration:.2f} IPs/sec"
+    speed = speed_text(direct, api)
+    if speed and not stopped:
+        summary += f"\n{speed}"
+    if not_retried:
+        was = "wasn't" if not_retried == 1 else "weren't"
+        summary += f"\nℹ️ {not_retried} didn't answer a direct ping and {was} retried through the API"
     if blocked:
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
     if vpn_down:
@@ -978,7 +1001,10 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredAttachment):
         await ctx.send("❌ Please attach a `.txt` file.")
     elif isinstance(error, commands.BadLiteralArgument):
-        await ctx.send("❌ The edition must be `java` or `bedrock`, for example `!scan bedrock`.")
+        if error.param.name == 'api':
+            await ctx.send("❌ The API option must be `on` or `off`, for example `!scan java off`.")
+        else:
+            await ctx.send("❌ The edition must be `java` or `bedrock`, for example `!scan bedrock`.")
     elif not isinstance(error, commands.CommandNotFound):
         log.error("Command %s failed", ctx.command, exc_info=error)
         # A slash command that was deferred would otherwise sit on "thinking..." with no explanation
@@ -996,8 +1022,11 @@ async def help(ctx):
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="/scan file:<.txt> [edition]  (or !scan [edition])",
+        name="/scan file:<.txt> [edition] [api]  (or !scan [edition] [api])",
         value="Scans a list of Minecraft server IPs from a `.txt` file. `edition` is `java` (default) or `bedrock`.\n"
+              "`api` is `on` (default) or `off`: with `off`, a server that doesn't answer a direct ping counts as "
+              "offline instead of being retried through mcstatus.io, which is much faster for long lists of "
+              "mostly dead addresses.\n"
               f"Up to {MAX_CONCURRENT_SCANS} people can scan at once, one scan each; more wait in a queue.",
         inline=False
     )
@@ -1057,8 +1086,10 @@ async def stop(ctx, scope: Optional[Literal['all']] = None, user: Optional[disco
 
 @bot.hybrid_command(name="scan", aliases=['check'], description="Check a list of Minecraft servers from a .txt file")
 @app_commands.describe(file="A .txt file with one IP or hostname per line",
-                       edition="Minecraft edition of the servers in the file (default: java)")
-async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock'] = 'java'):
+                       edition="Minecraft edition of the servers in the file (default: java)",
+                       api="off: servers that don't answer a direct ping count as offline, no mcstatus.io retry (default: on)")
+async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock'] = 'java',
+                api: Literal['on', 'off'] = 'on'):
     await ctx.defer()  # A slash command must be answered within 3 seconds
 
     # No await between this check and registering the scan, so nobody can start two at once
@@ -1068,12 +1099,20 @@ async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock
     scan = Scan(ctx.author, ctx.guild.id if ctx.guild else None)
     scans[ctx.author.id] = scan
     try:
-        await run_scan(ctx, scan, file, edition)
+        await run_scan(ctx, scan, file, edition, api_retry=(api == 'on'))
     finally:
         release(scan)
         await update_presence()
 
-async def run_scan(ctx, scan, file, edition):
+def no_direct_reply():
+    """Why api:off can't run: it only checks servers with direct pings, and those don't work right now."""
+    if PINGER_URL:
+        return ("❌ `api:off` would check nothing: the VPN is down, so direct pings aren't working right now. "
+                "Try again in a minute, or scan with the API on (slower).")
+    return ("❌ `api:off` would check nothing: direct pings don't work from this network. "
+            "Scan with the API on instead (5 servers per second).")
+
+async def run_scan(ctx, scan, file, edition, api_retry=True):
     # --- File Input --- (checked before queueing, so a bad file is rejected right away)
     if not file.filename.lower().endswith('.txt'):
         await ctx.send("❌ Must be a `.txt` file.")
@@ -1106,6 +1145,12 @@ async def run_scan(ctx, scan, file, edition):
     if duplicates: notes.append(f"removed {duplicates} duplicate(s)")
     extra = f" ({', '.join(notes)})" if notes else ""
 
+    # api:off only checks servers with direct pings, so there's nothing to do while they don't work. Checked before
+    # queueing, so nobody waits in line for a refusal, and again once it's their turn.
+    if not api_retry and not await direct_pings_work(edition):
+        await ctx.send(no_direct_reply())
+        return
+
     # --- Wait for a free slot --- (unless /stop came while the file was being read)
     place = 0 if scan.stop.is_set() else claim_slot(scan)
     if place:
@@ -1123,14 +1168,23 @@ async def run_scan(ctx, scan, file, edition):
             await send_channel(ctx, f"🛑 {ctx.author.mention}, your queued scan was cancelled by {stopped_by.mention}.")
         return
 
-    start_time = time.time()
+    start_time = time.monotonic()  # Not time.time(): a clock adjustment mid-scan must not change the duration
     # Direct pings, unless the startup probe failed. With the VPN, pings only ever go through it:
     # while it's down, every server is checked through the API instead.
     direct_ok = await direct_pings_work(edition)
+    if not api_retry and not direct_ok:
+        # They stopped working while this scan was queued
+        if place:
+            await send_channel(ctx, no_direct_reply())
+        else:
+            await ctx.send(no_direct_reply())
+        return
     no_vpn = bool(PINGER_URL) and not direct_ok
     owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
     label = "Bedrock " if edition == 'bedrock' else ""
     started = f"🚀 **Scan started** by {owner} on {total_ips} {label}IPs{extra}..."
+    if not api_retry:
+        started += "\nℹ️ **API retry is off:** a server that doesn't answer a direct ping counts as offline."
     if no_vpn:
         started += "\n⚠️ **The VPN is down:** checking every server through the API only, so this is slower."
     if place:
@@ -1145,19 +1199,24 @@ async def run_scan(ctx, scan, file, edition):
     updater = asyncio.create_task(report_progress(progress, state))
     results = {}
     locations = {}
+    direct = api = None  # (servers checked, seconds) for each phase that ran, for the speed line
 
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
             # 1. Direct pings, many at once
             if direct_ok:
+                began = time.monotonic()
                 retry = await run_direct(ips, results, state, edition, stop=scan.stop)
+                direct = (len(ips) - state['blocked'], time.monotonic() - began)
             else:
                 retry = ips
 
             # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans
-            if retry and not scan.stop.is_set():
+            if retry and api_retry and not scan.stop.is_set():
+                began = time.monotonic()
                 await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition,
                               stop=scan.stop, vpn_down=no_vpn)
+                api = (len(retry), time.monotonic() - began)
 
             # 3. Geolocation: offline database first (instant), ip-api.com for the rest
             addresses = sorted({r['address'] for r in results.values() if r['address']})
@@ -1177,8 +1236,12 @@ async def run_scan(ctx, scan, file, edition):
     except discord.HTTPException:
         pass
 
-    await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
-                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn)
+    # With api:off, the servers that didn't answer a direct ping are offline as far as this scan knows. (A stopped
+    # scan doesn't know how many never got pinged, so it says nothing.)
+    not_retried = len(retry) if not api_retry and not stopped else 0
+    await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
+                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
+                       direct=direct, api=api, not_retried=not_retried)
 
 async def main():
     discord.utils.setup_logging(root=True)
