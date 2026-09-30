@@ -100,7 +100,6 @@ class ErrorHandlerTests(unittest.IsolatedAsyncioTestCase):
 
 class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        scanbot.stop_scan_event.clear()
         scanbot.bot.direct_ok = False  # API-only, so no network is needed
         self.progress = mock.MagicMock(edit=mock.AsyncMock())
         self.ctx = mock.MagicMock()
@@ -174,10 +173,11 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('2 IPs', start)
         self.assertNotIn('invalid', start)
 
-    async def test_busy_bot_refuses_a_second_scan(self):
-        async with scanbot.scan_lock:
-            await self.scan(self.ctx, self.attachment())
-        self.assertIn('busy', self.texts(self.ctx.send)[0])
+    async def test_a_second_scan_by_the_same_person_is_refused(self):
+        scanbot.scans[self.ctx.author.id] = scanbot.Scan(self.ctx.author, None)
+        self.addCleanup(scanbot.scans.clear)
+        await self.scan(self.ctx, self.attachment())
+        self.assertIn('already have a scan', self.texts(self.ctx.send)[0])
         self.ctx.channel.send.assert_not_awaited()
 
 
@@ -207,18 +207,19 @@ class SendChannelTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StopCommandTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stop_only_acts_while_a_scan_runs(self):
+    async def test_stop_only_acts_while_you_have_a_scan(self):
         stop = scanbot.bot.get_command('stop').callback
-        scanbot.stop_scan_event.clear()
         ctx = mock.MagicMock(send=mock.AsyncMock())
         await stop(ctx)
-        self.assertFalse(scanbot.stop_scan_event.is_set())
-        self.assertIn('No scan', ctx.send.await_args.args[0])
+        self.assertIn("don't have a scan", ctx.send.await_args.args[0])
 
-        async with scanbot.scan_lock:
-            await stop(ctx)
-        self.assertTrue(scanbot.stop_scan_event.is_set())
-        scanbot.stop_scan_event.clear()
+        scan = scanbot.Scan(ctx.author, None)
+        scan.running = True
+        scanbot.scans[ctx.author.id] = scan
+        self.addCleanup(scanbot.scans.clear)
+        await stop(ctx)
+        self.assertTrue(scan.stop.is_set())
+        self.assertIn('Stop requested', ctx.send.await_args.args[0])
 
 
 if __name__ == '__main__':

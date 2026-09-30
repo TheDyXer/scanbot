@@ -41,14 +41,15 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
 - **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
-- **`/stop` at any point**, which posts what was found so far
+- **Several people can scan at once:** up to 5 scans run side by side, one per person, and more wait in a queue
+- **`/stop` at any point**, which posts what was found so far. It stops your own scan; moderators can stop anyone's
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
 - **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
 - **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
 - **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS
-- One scan at a time, up to 5,000 IPs per scan
+- Up to 5,000 IPs per scan
 - **Docker image** for `amd64` and `arm64`, a one-line installer, and automatic daily updates
 
 ## Discord bot setup
@@ -187,10 +188,19 @@ or, if your network blocks Minecraft's port:
 | Command | What it does |
 | --- | --- |
 | `/scan file:<.txt> [edition]` (or `!scan [edition]` + attached `.txt`) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file |
-| `/stop` (or `!stop`) | Stops the running scan and posts what it found so far |
+| `/stop` (or `!stop`) | Stops your scan and posts what it found so far, or cancels it if it's still queued |
+| `/stop user:@name` (or `!stop @name`) | Moderators: stops that person's scan |
+| `/stop all:all` (or `!stop all`) | Moderators: stops every scan in this server |
 | `/help` (or `!help`) | Lists the commands |
 
 Progress and results are posted as normal messages in the channel, not as replies to the slash command: Discord stops accepting replies to a slash command after 15 minutes, and a big scan can take longer. The bot needs **Send Messages** in that channel, otherwise it falls back to replying.
+
+### Several people at once
+
+- **Up to 5 scans run at the same time** (`MAX_CONCURRENT_SCANS`), one per person. Start messages, progress and results name whose scan they belong to, so several scans can share a channel.
+- **When all 5 are busy,** a new scan waits in a queue and starts on its own when a slot frees up. The bot says where you are in line; `/stop` takes you out of it.
+- **Moderators** are people with the **Manage Messages** permission. They can stop someone else's scan, or every scan, in their own server. In DMs, everyone can only stop their own.
+- **Scans share the API limits.** mcstatus.io and ip-api.com count requests per bot, not per scan, so scans that use the API take turns. With direct pings working, that rarely matters: only the servers that didn't answer go through the API. When everything goes through the API, 5 checks per second are split between the running scans: two scans get about 2.5 each.
 
 ### The IP list
 
@@ -216,14 +226,20 @@ play.example.com:25566
 The start message, then a progress message that updates every 3 seconds:
 
 ```text
-🚀 Scan started on 4 IPs (skipped 1 invalid line(s), removed 1 duplicate(s))...
-🔎 Retrying unreachable servers via API: 1/2 · Found: 2
+🚀 Scan started by @Steve on 4 IPs (skipped 1 invalid line(s), removed 1 duplicate(s))...
+🔎 @Steve · Retrying unreachable servers via API: 1/2 · Found: 2
+```
+
+If all scan slots are busy, you see this first, and the start message follows when your turn comes:
+
+```text
+🕒 Queued (#1). All 5 scan slots are busy; your scan of 4 IPs starts automatically when one frees up. /stop cancels it.
 ```
 
 Then the results, sorted by player count. Example from a test run:
 
 ```text
-📊 Scan Complete!
+📊 Scan Complete! · @Steve
 🟢 2 with players · ⚪ 1 empty · 🔎 4 IPs
 ⏱️ Time: 0m 4s
 ⚡ Speed: 0.82 IPs/sec
@@ -253,7 +269,7 @@ flowchart TD
 ```
 
 1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
-2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes.
+2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
    - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
@@ -267,10 +283,11 @@ Settings are at the top of `bot.py`:
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `MAX_IPS_PER_SCAN` | `5000` | Largest list the bot accepts |
-| `DIRECT_CONCURRENCY` | `50` | Direct pings running at the same time |
+| `MAX_CONCURRENT_SCANS` | `5` | Scans running at the same time (one per person); more wait in a queue |
+| `DIRECT_CONCURRENCY` | `50` | Direct pings running at the same time, per scan |
 | `DIRECT_TIMEOUT` | `3` | Seconds to wait for a server to answer a direct ping |
-| `API_DELAY` | `0.2` | Seconds between API requests (mcstatus.io allows 5/second) |
-| `GEO_DELAY` | `4` | Seconds between ip-api.com batches (15/minute allowed) |
+| `API_DELAY` | `0.2` | Seconds between API requests (mcstatus.io allows 5/second), shared by all scans |
+| `GEO_DELAY` | `4` | Seconds between ip-api.com batches (15/minute allowed), shared by all scans |
 | `PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `play.wynncraft.com` | Java servers pinged at startup to test direct pings; one answer is enough |
 | `BEDROCK_PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `geo.hivebedrock.network` | The same for Bedrock (UDP) |
 | `PROGRESS_INTERVAL` | `3` | Seconds between progress message updates |
@@ -360,7 +377,9 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
 | Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
-| `⏳ Bot is busy` | Another scan is running | Wait, or `/stop` it |
+| `⏳ You already have a scan running or queued` | Everyone gets one scan at a time | Wait for it to finish, or `/stop` it first |
+| `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
+| `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
 | `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
