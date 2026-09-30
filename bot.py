@@ -29,34 +29,79 @@ import pinger
 import vpn_switch
 from pinger import is_public_ip
 
+# --- Settings from the environment (docker-compose.yml passes them on from .env) ---
+def env_flag(name):
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+def show_number(n):
+    return f"{n:,}" if float(n).is_integer() else f"{n:g}"
+
+def env_number(name, default, minimum, maximum, whole, why=''):
+    """
+    A number from the environment, or `default` when the variable is unset or empty (compose passes unset ones on
+    as empty). Raises ValueError naming the variable and the allowed range for anything else.
+    """
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw) if whole else float(raw)
+    except ValueError:
+        value = None
+    if value is None or not minimum <= value <= maximum:  # NaN fails the comparison too
+        kind = "a whole number" if whole else "a number"
+        raise ValueError(f"{name} must be {kind} from {show_number(minimum)} to {show_number(maximum)}, "
+                         f"not {raw!r}{why}")
+    return value
+
+def env_int(name, default, minimum, maximum):
+    return env_number(name, default, minimum, maximum, whole=True)
+
+def env_float(name, default, minimum, maximum, why=''):
+    return env_number(name, default, minimum, maximum, whole=False, why=why)
+
 # --- CONFIGURATION ---
 MC_API_URLS = {
     'java': 'https://api.mcstatus.io/v2/status/java/',
     'bedrock': 'https://api.mcstatus.io/v2/status/bedrock/',
 }
 EDITION_LABELS = {'java': 'Java', 'bedrock': 'Bedrock'}
-BEDROCK_PORT = 19132      # Default port for Bedrock servers (Java's 25565 is handled by mcstatus)
+JAVA_PORT = 25565         # Default port for Java servers given as an IP (hostnames go through mcstatus's SRV lookup)
+BEDROCK_PORT = 19132      # Default port for Bedrock servers
 GEO_BATCH_URL = 'http://ip-api.com/batch' # Fallback for IPs the offline database doesn't know
 # Offline country database (DB-IP Lite, CC BY 4.0), next to bot.py unless GEO_DB_PATH is set
 GEO_DB_PATH = os.environ.get('GEO_DB_PATH') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dbip-country-lite.mmdb')
 GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
 USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
-GEO_DB_MAX_AGE_DAYS = 40  # DB-IP publishes a new database every month
-MAX_IPS_PER_SCAN = 30000
-# Largest list file the bot reads: 30,000 lines of up to 64 bytes. Ordinary IP lists are about 0.6 MB.
-MAX_FILE_BYTES = 2_000_000
+# These can be changed in .env (see README, "Configuration"); a value out of range stops the bot at startup
+try:
+    GEO_DB_MAX_AGE_DAYS = env_int('GEO_DB_MAX_AGE_DAYS', 40, 1, 3650)  # DB-IP publishes a new database every month
+    MAX_IPS_PER_SCAN = env_int('MAX_IPS_PER_SCAN', 30000, 1, 1_000_000)
+    # Scans running at the same time (one per user); more wait in a queue
+    MAX_CONCURRENT_SCANS = env_int('MAX_CONCURRENT_SCANS', 5, 1, 50)
+    # Direct pings in flight at the same time, per scan, and for all scans together. Pings to addresses that
+    # don't answer wait out DIRECT_TIMEOUT, so on mostly dead ranges a scan checks about this many per timeout:
+    # 300 / 3 s = 100 a second. (Until October 2026 it was 50: about 17 a second.)
+    DIRECT_CONCURRENCY = env_int('DIRECT_CONCURRENCY', 300, 1, 2000)
+    DIRECT_CONCURRENCY_TOTAL = env_int('DIRECT_CONCURRENCY_TOTAL', 2 * DIRECT_CONCURRENCY, 1, 20000)
+    # Seconds to wait for a server to answer a direct ping
+    DIRECT_TIMEOUT = env_float('DIRECT_TIMEOUT', 3, 0.5, pinger.MAX_TIMEOUT,
+                               why=f" (the pinger waits at most {pinger.MAX_TIMEOUT} seconds)")
+    API_DELAY = env_float('API_DELAY', 0.2, 0.05, 60)  # mcstatus.io allows 5 requests/second per IP, shared by all scans
+    GEO_DELAY = env_float('GEO_DELAY', 4, 0, 600)      # ip-api.com batch allows 15 requests/minute, shared by all scans
+    PROGRESS_INTERVAL = env_int('PROGRESS_INTERVAL', 3, 2, 600)  # Seconds between progress message updates
+except ValueError as e:
+    print(f"❌ Error: {e}")
+    sys.exit(1)
+# Largest list file the bot reads: MAX_IPS_PER_SCAN lines of up to 64 bytes, and never less than 2 MB.
+# Ordinary IP lists are about 0.6 MB per 30,000 lines.
+MAX_FILE_BYTES = max(2_000_000, MAX_IPS_PER_SCAN * 64)
 UPLOAD_LIMIT = 10 * 1024 * 1024  # What Discord accepts per file, unless the server is boosted
 UPLOAD_HEADROOM = 0.9            # The bot stays this far under it
-MAX_CONCURRENT_SCANS = 5  # Scans running at the same time (one per user); more wait in a queue
-DIRECT_CONCURRENCY = 50   # Direct pings running at the same time, per scan
-DIRECT_TIMEOUT = 3        # Seconds to wait for a server to answer a direct ping
-API_DELAY = 0.2           # mcstatus.io allows 5 requests/second per client IP, shared by all scans
-GEO_DELAY = 4             # ip-api.com batch allows 15 requests/minute, shared by all scans
 # Pinged at startup to see if direct pings work from this network: one answer is enough. Direct pings
 # connect to the server's IP, so these must answer that way (Hypixel, for one, routes by hostname).
 PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
 BEDROCK_PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'geo.hivebedrock.network')  # Same, over UDP
-PROGRESS_INTERVAL = 3     # Seconds between progress message updates
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
 SHUTDOWN_GRACE = 35       # Seconds running scans get to post what they found when the bot is stopped (Docker allows 45)
 # With the VPN, pings are sent by the pinger inside the VPN container; everything else uses this
@@ -234,9 +279,6 @@ def get_flag_emoji(country_code):
         return "🏳️"
     return "".join([chr(ord(c.upper()) + 127397) for c in country_code])
 
-def env_flag(name):
-    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
-
 # Slash commands need no privileged intent. The Message Content intent is only for the ! commands,
 # so SLASH_ONLY=1 lets the bot run with that switch off in the Developer Portal.
 SLASH_ONLY = env_flag('SLASH_ONLY')
@@ -376,7 +418,7 @@ def get_pinger_session():
     global pinger_session
     if pinger_session is None or pinger_session.closed:
         pinger_session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0),  # 5 scans x 50 pings can be in flight at once
+            connector=aiohttp.TCPConnector(limit=0),  # Up to DIRECT_CONCURRENCY_TOTAL pings are in flight at once
             timeout=aiohttp.ClientTimeout(total=DIRECT_TIMEOUT + 2))
     return pinger_session
 
@@ -415,18 +457,28 @@ async def check_direct(ip):
     """
     if not is_public_entry(ip):
         raise BlockedAddress(ip)
+    host, _, port = ip.partition(':')
     try:
-        server = await JavaServer.async_lookup(ip, timeout=DIRECT_TIMEOUT)
-    except Exception:
-        return None
+        ipaddress.ip_address(host)
+    except ValueError:
+        # A hostname: the lookup follows SRV records, so check where the server really is below
+        try:
+            server = await JavaServer.async_lookup(ip, timeout=DIRECT_TIMEOUT)
+        except Exception:
+            return None
+        host, port = server.address.host, server.address.port
+    else:
+        # An IP address: no SRV lookup, which would only ask Quad9 about a name that can't exist
+        port = int(port) if port else JAVA_PORT
+        if not 1 <= port <= 65535:
+            return None
 
-    # The lookup follows SRV records, so check where the server really is. Then connect to that
-    # exact address: pinging by name would resolve it a second time, outside Quad9 and unchecked.
+    # Connect to the checked address: pinging by name would resolve it a second time, outside Quad9 and unchecked
     try:
-        address = await resolve_public_address(server.address.host)
+        address = await resolve_public_address(host)
         if address is None:
             return None
-        status = await ping_server(str(address), server.address.port, 'java')
+        status = await ping_server(str(address), port, 'java')
     except BlockedAddress:
         raise
     except Exception:
@@ -683,35 +735,53 @@ async def report_progress(message, state):
                 log.warning("Could not update progress message: %s", e)
             last = text
 
+direct_slots_state = None  # ((event loop, size), semaphore) behind direct_slots()
+
+def direct_slots():
+    """
+    The bot-wide limit on direct pings in flight, DIRECT_CONCURRENCY_TOTAL, shared by all scans. Every ping to an
+    address that doesn't answer leaves a connection-tracking entry behind for a while (in Docker's NAT and in the
+    VPN container), and too many of those make the machine drop packets, Discord's included.
+    """
+    global direct_slots_state
+    key = (asyncio.get_running_loop(), DIRECT_CONCURRENCY_TOTAL)  # Tests run each in a loop of its own
+    if direct_slots_state is None or direct_slots_state[0] != key:
+        direct_slots_state = (key, asyncio.Semaphore(DIRECT_CONCURRENCY_TOTAL))
+    return direct_slots_state[1]
+
 async def run_direct(ips, results, state, edition='java', stop=None):
     """
-    Pings every server directly, DIRECT_CONCURRENCY at a time.
-    Returns the IPs that didn't answer, in file order.
+    Pings every server directly: DIRECT_CONCURRENCY workers, each taking the next server from the list, and at most
+    DIRECT_CONCURRENCY_TOTAL pings in flight across all scans. Returns the IPs that didn't answer, in file order.
     """
     stop = stop or asyncio.Event()
     state.update(phase="Pinging servers", done=0, total=len(ips))
-    semaphore = asyncio.Semaphore(DIRECT_CONCURRENCY)
+    slots = direct_slots()
     pinged = set()
     check_server = check_direct if edition == 'java' else check_direct_bedrock
+    remaining = iter(ips)  # Shared by the workers. next() can't be interrupted, so each server is taken once
 
-    async def ping(ip):
-        async with semaphore:
+    async def worker():
+        for ip in remaining:
             if stop.is_set():
                 return
-            try:
-                result = await check_server(ip)
-            except BlockedAddress:
-                # Not pinged, and not passed on to the API either
-                state['done'] += 1
-                state['blocked'] += 1
-                return
-        state['done'] += 1
-        pinged.add(ip)
-        if result:
-            results[ip] = result
-            state['found'] += 1
+            async with slots:
+                if stop.is_set():
+                    return
+                try:
+                    result = await check_server(ip)
+                except BlockedAddress:
+                    # Not pinged, and not passed on to the API either
+                    state['done'] += 1
+                    state['blocked'] += 1
+                    continue
+            state['done'] += 1
+            pinged.add(ip)
+            if result:
+                results[ip] = result
+                state['found'] += 1
 
-    await asyncio.gather(*(ping(ip) for ip in ips))
+    await asyncio.gather(*(worker() for _ in range(min(DIRECT_CONCURRENCY, len(ips)))))
     return [ip for ip in ips if ip in pinged and ip not in results]
 
 async def run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False):
@@ -1387,8 +1457,24 @@ def install_signal_handlers(loop):
         except (NotImplementedError, RuntimeError):
             log.debug("Can't catch %s on this platform", sig.name)
 
+def check_settings():
+    """Logs the direct ping settings at startup, and warns about the ones likely to cause trouble."""
+    log.info("Direct pings: up to %d per scan (%d for all scans together), %s s timeout",
+             DIRECT_CONCURRENCY, DIRECT_CONCURRENCY_TOTAL, show_number(DIRECT_TIMEOUT))
+    if API_DELAY < 0.2:
+        log.warning("API_DELAY is %s: below 0.2, mcstatus.io rate-limits the bot, which makes scans slower, not faster",
+                    show_number(API_DELAY))
+    # Each ping in flight holds a socket, and with the VPN a connection to the pinger as well
+    wanted = 2 * min(DIRECT_CONCURRENCY_TOTAL, MAX_CONCURRENT_SCANS * DIRECT_CONCURRENCY) + 1024
+    limits = pinger.raise_file_limit(wanted)
+    if limits and limits[0] < wanted:
+        log.warning("Only %d files can be open at once, and these settings need about %d: pings will fail and count "
+                    "as offline. Raise the limit (ulimits in docker-compose.yml, LimitNOFILE in systemd) or lower "
+                    "DIRECT_CONCURRENCY", limits[0], wanted)
+
 async def main():
     discord.utils.setup_logging(root=True)
+    check_settings()
     try:
         await choose_dns_transport(DNS_TRANSPORT)
     except DnsUnavailable as e:

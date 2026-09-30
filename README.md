@@ -48,7 +48,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 ## Features
 
 - **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
-- **Fast scans:** pings servers directly, 50 at a time, and retries the ones that don't answer through `api.mcstatus.io`
+- **Fast scans:** pings servers directly, 300 at a time, and retries the ones that don't answer through `api.mcstatus.io`
 - **Skip the retry when it isn't worth it:** `/scan file:<.txt> api:off` counts only servers that answer a direct ping, which is much faster for long lists of mostly dead addresses (see [Skipping the API retry](#skipping-the-api-retry))
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
@@ -197,6 +197,12 @@ The log (`docker compose logs scanbot`, or the terminal without Docker) says whi
 [2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings work; scans use direct pings with API fallback.
 ```
 
+Before that, it shows the direct ping settings (see [Configuration](#configuration)):
+
+```
+[2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings: up to 300 per scan (600 for all scans together), 3 s timeout
+```
+
 or, if your network blocks Minecraft's port:
 
 ```
@@ -224,9 +230,9 @@ Progress and results are posted as normal messages in the channel, not as replie
 
 ### Skipping the API retry
 
-Servers that don't answer a direct ping are normally retried through mcstatus.io, at 5 a second for the whole bot. On a long list of mostly dead addresses, like a whole ISP's range, that retry is where nearly all the time goes: 5,000 IPs take about 5 minutes of direct pings plus about 17 minutes of API checks.
+Servers that don't answer a direct ping are normally retried through mcstatus.io, at 5 a second for the whole bot. On a long list of mostly dead addresses, like a whole ISP's range, that retry is where nearly all the time goes: 5,000 IPs take under a minute of direct pings plus about 17 minutes of API checks.
 
-With `api:off` (`!scan java off`), a server that doesn't answer a direct ping counts as offline and isn't retried, so the same list takes about 5 minutes. The start message says so, and the results say how many servers were left out.
+With `api:off` (`!scan java off`), a server that doesn't answer a direct ping counts as offline and isn't retried, so the same list takes about a minute. The start message says so, and the results say how many servers were left out.
 
 - **What you can miss:** servers that only answer through the API, for example hosts that route by hostname (Hypixel answers by name but not by IP), or servers that block your address but not mcstatus.io's.
 - **It needs direct pings.** If they don't work (your network blocks port 25565 and there's no VPN, or the VPN is down), the bot refuses `api:off`, because it would check nothing. Use the API then.
@@ -282,7 +288,7 @@ Then the results, sorted by player count. Example from a test run:
 
 **Time** is the whole scan. **Speed** is servers checked per second, timed only while pinging and asking the API, so looking up countries and sending the results don't slow it down. When both ran, it also shows each one's own rate:
 
-- **direct** is how fast your connection pings: about 16 a second (`DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT`) when most servers don't answer, faster when they do.
+- **direct** is how fast your connection pings: about 100 a second (`DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT`) when most servers don't answer, faster when they do.
 - **API** is at most 5 a second, shared by every scan running at the same time, so two scans that use the API show about 2.5 each. When direct pings are blocked, every server goes through the API and the line ends with `(API)`.
 
 If the results don't fit in one Discord message, you get the summary and the top 10 servers in chat, with the full list attached:
@@ -295,7 +301,7 @@ If the results don't fit in one Discord message, you get the summary and the top
 ```mermaid
 flowchart TD
     A[Bot starts] --> B{Direct ping to a probe<br/>server works?}
-    B -- yes --> C[Ping every server directly<br/>50 at a time, 3 s timeout]
+    B -- yes --> C[Ping every server directly<br/>300 at a time, 3 s timeout]
     B -- no --> D[Check via api.mcstatus.io<br/>5 per second]
     C -- no answer --> D
     C -- online --> E[Look up countries<br/>offline DB-IP database,<br/>ip-api.com for the rest]
@@ -303,7 +309,7 @@ flowchart TD
     E --> F[Post results]
 ```
 
-1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 30 minutes, and usually far less.
+1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 300 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 5 minutes. An IP address is pinged right away; for a hostname, the bot first looks for an SRV record that points the name at another host or port.
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 30,000 IPs take about 100 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
@@ -313,21 +319,33 @@ flowchart TD
 
 ## Configuration
 
-Settings are at the top of `bot.py`:
+These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_CONCURRENCY=100`). Run `docker compose up -d` afterwards to apply them. Without Docker, set them as environment variables, for the systemd service in `/etc/scanbot.env`. A value that isn't allowed stops the bot at startup with a message naming the setting and its range. An install made before these settings existed has a `docker-compose.yml` that doesn't pass them on: run the installer again, which updates the file.
 
-| Setting | Default | What it does |
+| Setting | Default | Allowed | What it does |
+| --- | --- | --- | --- |
+| `MAX_IPS_PER_SCAN` | `30000` | 1 to 1,000,000 | Largest list the bot accepts. The largest file it reads grows with it: 64 bytes per line, at least 2 MB |
+| `MAX_CONCURRENT_SCANS` | `5` | 1 to 50 | Scans running at the same time (one per person); more wait in a queue |
+| `DIRECT_CONCURRENCY` | `300` | 1 to 2,000 | Direct pings in flight at the same time, per scan |
+| `DIRECT_CONCURRENCY_TOTAL` | twice `DIRECT_CONCURRENCY` | 1 to 20,000 | Direct pings in flight for all scans together |
+| `DIRECT_TIMEOUT` | `3` | 0.5 to 10 | Seconds to wait for a server to answer a direct ping |
+| `API_DELAY` | `0.2` | 0.05 to 60 | Seconds between API requests (mcstatus.io allows 5/second), shared by all scans |
+| `GEO_DELAY` | `4` | 0 to 600 | Seconds between ip-api.com batches (15/minute allowed), shared by all scans |
+| `PROGRESS_INTERVAL` | `3` | 2 to 600 | Seconds between progress message updates |
+| `GEO_DB_MAX_AGE_DAYS` | `40` | 1 to 3,650 | Download a new country database when the current one is older than this (without Docker) |
+
+These are fixed in `bot.py`:
+
+| Setting | Value | What it does |
 | --- | --- | --- |
-| `MAX_IPS_PER_SCAN` | `30000` | Largest list the bot accepts |
-| `MAX_CONCURRENT_SCANS` | `5` | Scans running at the same time (one per person); more wait in a queue |
-| `DIRECT_CONCURRENCY` | `50` | Direct pings running at the same time, per scan |
-| `DIRECT_TIMEOUT` | `3` | Seconds to wait for a server to answer a direct ping |
-| `API_DELAY` | `0.2` | Seconds between API requests (mcstatus.io allows 5/second), shared by all scans |
-| `GEO_DELAY` | `4` | Seconds between ip-api.com batches (15/minute allowed), shared by all scans |
 | `PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `play.wynncraft.com` | Java servers pinged at startup to test direct pings; one answer is enough |
 | `BEDROCK_PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `geo.hivebedrock.network` | The same for Bedrock (UDP) |
-| `PROGRESS_INTERVAL` | `3` | Seconds between progress message updates |
 | `INLINE_LIMIT` | `1900` | Results longer than this many characters are sent as files |
-| `GEO_DB_MAX_AGE_DAYS` | `40` | Download a new country database when the current one is older than this (without Docker) |
+
+**Changing `DIRECT_CONCURRENCY`.** A ping to an address that doesn't answer waits out `DIRECT_TIMEOUT`. So on mostly dead ranges a scan checks about `DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT` addresses a second: 100 with the defaults.
+
+- **Open files:** every ping in flight holds an open file, two with the VPN. `docker-compose.yml` allows 65,536. The bot raises its own limit at startup as far as the system allows, and warns in the log when that isn't enough.
+- **Connection tracking:** every unanswered ping leaves an entry in the kernel's connection table for up to two minutes. If `dmesg` shows `nf_conntrack: table full, dropping packet`, lower `DIRECT_CONCURRENCY_TOTAL` or raise `net.netfilter.nf_conntrack_max`.
+- **Lost answers:** if scans find fewer servers after you raise it, your connection or the VPN drops pings at that rate. Go back down.
 
 The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
 
@@ -522,7 +540,7 @@ docker run --rm -v ./vpn:/gluetun:ro ghcr.io/thedyxer/scanbot python /app/vpn_se
 
 With Docker this is already handled: the bot restarts on crashes and at boot. Without Docker, a systemd service restarts the bot if it crashes and starts it at boot. It assumes the bot lives in `/opt/scanbot` and runs as a user called `scanbot`; adjust to taste.
 
-`/etc/scanbot.env` (readable only by root, `chmod 600`):
+`/etc/scanbot.env` (readable only by root, `chmod 600`). Settings from [Configuration](#configuration) go here too:
 
 ```ini
 DISCORD_TOKEN=your-bot-token
@@ -543,6 +561,8 @@ EnvironmentFile=/etc/scanbot.env
 ExecStart=/usr/bin/python3 /opt/scanbot/bot.py
 Restart=on-failure
 RestartSec=10
+# Every ping in flight holds an open file (see Configuration)
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -592,6 +612,10 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
 | Many known-online servers missing | mcstatus.io rate-limited the bot | Don't run other tools using the API from the same IP; leave `API_DELAY` at `0.2` or higher |
 | Results say `The bot is restarting`, or `your queued scan was cancelled because the bot is restarting` | The bot was stopped or updated while the scan ran or waited (Watchtower checks daily at 4 AM) | Start the scan again; the results show what was already found. Start very large scans outside the update time |
+| `Error: DIRECT_CONCURRENCY must be a whole number from 1 to 2,000, not '...'` at startup (or another setting) | A setting in `.env` isn't a number, or is out of range | Fix it or delete the line: an empty or missing value means the default. The message gives the allowed range |
+| Log says `Only N files can be open at once` | The system's open-file limit is lower than `DIRECT_CONCURRENCY` needs, so some pings fail and count as offline | Run the [installer](#one-line-installer) again (its `docker-compose.yml` raises the limit), add `LimitNOFILE=65536` to the systemd unit, or lower `DIRECT_CONCURRENCY` |
+| `dmesg` shows `nf_conntrack: table full, dropping packet`, or the bot loses Discord during big scans | Too many unanswered pings at once for the kernel's connection table | Lower `DIRECT_CONCURRENCY_TOTAL`, or raise `net.netfilter.nf_conntrack_max` |
+| Scans find fewer servers after raising `DIRECT_CONCURRENCY` | Your connection or the VPN drops pings at that rate | Lower it again (the default is 300) |
 | A scan ended without results when the bot was updated or restarted | `docker-compose.yml` is older than this version, so Docker gave the bot 10 seconds or less. A reboot can also cut it short | Run the [installer](#one-line-installer) again: it updates the file. By hand, add `stop_grace_period: 45s` and `init: true` to the `scanbot` service |
 
 ## Credits
