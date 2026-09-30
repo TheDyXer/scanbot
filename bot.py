@@ -8,6 +8,7 @@ import json
 # --- CONFIGURATION ---
 MC_API_URL = 'https://api.mcstatus.io/v2/status/java/'
 GEO_BATCH_URL = 'http://ip-api.com/batch' # Using batch endpoint
+MAX_IPS_PER_SCAN = 5000
 # ---------------------
 
 # Read token
@@ -123,8 +124,12 @@ async def check(ctx):
             await ctx.send("⚠️ File is empty.")
             return
 
-        start_time = time.time()
         total_ips = len(ips)
+        if total_ips > MAX_IPS_PER_SCAN:
+            await ctx.send(f"❌ Too many IPs. Maximum allowed per scan is {MAX_IPS_PER_SCAN}.")
+            return
+
+        start_time = time.time()
         await ctx.send(f"🚀 **Scan started** on {total_ips} IPs...")
         
         # 1. PHASE ONE: High-Speed Minecraft Scan
