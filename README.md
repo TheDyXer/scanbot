@@ -32,6 +32,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - [Keep it running without Docker (Linux)](#keep-it-running-without-docker-linux)
 - [Troubleshooting](#troubleshooting)
 - [Credits](#credits)
+- [License](#license)
 
 ## Features
 
@@ -351,3 +352,9 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 - [mcstatus.io](https://mcstatus.io): server status API (5 requests/second per IP)
 - [ip-api.com](https://ip-api.com): IP geolocation. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
 - [dnspython](https://www.dnspython.org) and [Quad9](https://quad9.net): encrypted DNS
+
+## License
+
+[MIT](LICENSE) © 2025-2026 TheDyXer
+
+You can use, change and share scanbot, including in your own projects, as long as you keep the copyright line and the [license text](LICENSE) with every copy or fork.
