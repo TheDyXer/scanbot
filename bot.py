@@ -19,6 +19,7 @@ import logging
 import maxminddb
 import os
 import re
+import signal
 import socket
 import sys
 import time
@@ -57,6 +58,7 @@ PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
 BEDROCK_PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'geo.hivebedrock.network')  # Same, over UDP
 PROGRESS_INTERVAL = 3     # Seconds between progress message updates
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
+SHUTDOWN_GRACE = 35       # Seconds running scans get to post what they found when the bot is stopped (Docker allows 45)
 # With the VPN, pings are sent by the pinger inside the VPN container; everything else uses this
 # machine's connection. Set by docker-compose.vpn.yml; empty means the bot pings servers itself.
 PINGER_URL = os.environ.get('PINGER_URL', '').strip().rstrip('/')
@@ -275,9 +277,13 @@ class Scan:
         self.turn = asyncio.Event()   # Set when a queued scan may start, or was cancelled
         self.running = False
         self.stopped_by = None        # Who used /stop on it, if anyone
+        self.stop_reason = None       # 'user' for /stop, 'restart' when the bot is shutting down
+        self.done = asyncio.Event()   # Set once it has finished, results posted, and been forgotten
 
 scans = {}  # User ID -> that user's scan, queued or running
 queue = []  # Scans waiting for a free slot, oldest first
+shutting_down = False  # Set by shutdown(): no new scans, and queued ones don't start
+shutdown_tasks = set()  # shutdown() runs started by a signal, kept so they aren't garbage collected
 
 def running_count():
     return sum(1 for s in scans.values() if s.running)
@@ -294,14 +300,18 @@ def claim_slot(scan):
     return len(queue)
 
 def start_queued():
-    """Hands free slots to queued scans, oldest first."""
+    """Hands free slots to queued scans, oldest first. Not while shutting down: they're being cancelled."""
+    if shutting_down:
+        return
     while queue and running_count() < MAX_CONCURRENT_SCANS:
         scan = queue.pop(0)
         scan.running = True
         scan.turn.set()
 
-def request_stop(scan, by=None):
+def request_stop(scan, by=None, reason='user'):
     scan.stopped_by = by
+    if scan.stop_reason != 'restart':  # Once the bot is shutting down, that's what the owner needs to hear
+        scan.stop_reason = reason
     scan.stop.set()
     if scan in queue:
         # Never started: take it out of the queue and wake it up so it can finish
@@ -316,6 +326,7 @@ def release(scan):
         queue.remove(scan)
     scan.running = False
     start_queued()
+    scan.done.set()
 
 class Pacer:
     """
@@ -641,6 +652,9 @@ async def update_presence():
     Shows how many scans are running and queued, and whether the VPN is down.
     Called when a scan starts or ends, and when the VPN goes down or comes back.
     """
+    if shutting_down:
+        await set_status("Restarting · back in a minute")
+        return
     running, waiting = running_count(), len(queue)
     if not running:
         text = "Idle | Waiting for IPs"
@@ -725,11 +739,17 @@ async def run_api(session, ips, results, state, retrying, edition='java', stop=N
             break
         tasks.append(asyncio.create_task(check(ip)))
 
+    # Wait for the last checks, but not after a stop: one check can take half a minute (timeouts and retries), and
+    # a stop for a restart has to post its results within SHUTDOWN_GRACE
+    finished = asyncio.gather(*tasks, return_exceptions=True)
+    stopped = asyncio.create_task(stop.wait())
+    await asyncio.wait((finished, stopped), return_when=asyncio.FIRST_COMPLETED)
+    stopped.cancel()
     if stop.is_set():
         # Cancel checks still in flight before the session closes
         for t in tasks:
             t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await finished
 
 def format_entry(r, locations, markdown=True):
     bold = (lambda s: f"**{s}**") if markdown else (lambda s: s)
@@ -862,7 +882,7 @@ def speed_text(direct, api):
     return text
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
-                       vpn_down=False, direct=None, api=None, not_retried=0):
+                       vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -886,6 +906,9 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
     if vpn_down:
         summary += "\n⚠️ The VPN was down: every server was checked through the API only"
+    if stopped and stop_reason == 'restart':
+        summary += ("\n🔄 The bot is restarting (usually for an update), so the rest of the list wasn't checked. "
+                    "Scan it again in a minute.")
 
     if not results:
         await send_channel(ctx, f"❌ No working servers found.\n{summary}")
@@ -1155,7 +1178,11 @@ async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock
                 api: Literal['on', 'off'] = 'on'):
     await ctx.defer()  # A slash command must be answered within 3 seconds
 
-    # No await between this check and registering the scan, so nobody can start two at once
+    # No await between these checks and registering the scan, so nobody can start two at once, and shutdown()
+    # sees every scan that got past the first one
+    if shutting_down:
+        await ctx.send("⏳ **The bot is restarting.** Try again in a minute.")
+        return
     if ctx.author.id in scans:
         await ctx.send("⏳ **You already have a scan running or queued.** Use `/stop` to stop it first.")
         return
@@ -1225,7 +1252,12 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
         # Stopped before it started. The owner's own /stop already said so; a moderator's reply
         # may be in another channel, so tell the owner here.
         stopped_by = scan.stopped_by
-        if not place:
+        if scan.stop_reason == 'restart':
+            note = (f"🛑 {ctx.author.mention}, your {'queued ' if place else ''}scan was cancelled because the bot "
+                    "is restarting. Start it again in a minute.")
+            # A queued scan's slash command reply may have stopped working (15 minutes)
+            await (send_channel(ctx, note) if place else ctx.send(note))
+        elif not place:
             await ctx.send("🛑 **Scan cancelled.**")
         elif stopped_by is not None and stopped_by.id != ctx.author.id:
             await send_channel(ctx, f"🛑 {ctx.author.mention}, your queued scan was cancelled by {stopped_by.mention}.")
@@ -1293,9 +1325,13 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
         updater.cancel()
 
     stopped = scan.stop.is_set()
+    stop_reason = scan.stop_reason if stopped else None
+    if stop_reason == 'restart':
+        head = "🛑 **Stopped:** the bot is restarting."
+    else:
+        head = "🛑 **Stopped.**" if stopped else "✅ **Done.**"
     try:
-        await progress.edit(content=("🛑 **Stopped.**" if stopped else "✅ **Done.**") +
-                            f" {owner} found {state['found']} online servers.")
+        await progress.edit(content=f"{head} {owner} found {state['found']} online servers.")
     except discord.HTTPException:
         pass
 
@@ -1304,7 +1340,52 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
     not_retried = len(retry) if not api_retry and not stopped else 0
     await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
                        blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
-                       direct=direct, api=api, not_retried=not_retried)
+                       direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason)
+
+async def shutdown(reason, grace=SHUTDOWN_GRACE, close=None):
+    """
+    Stops the bot cleanly on SIGTERM (Docker, Watchtower, systemd) or SIGINT (Ctrl+C). New scans are refused,
+    queued ones are cancelled and their owners told, and running ones stop the way /stop stops them: each posts
+    what it found so far. After at most `grace` seconds of that, the bot disconnects from Discord and main()
+    returns. A second signal disconnects at once. `close` is for tests; it defaults to bot.close.
+    """
+    global shutting_down
+    close = close or bot.close
+    if shutting_down:
+        log.warning("%s again: closing now", reason)
+        await close()
+        return
+    shutting_down = True
+    pending = list(scans.values())
+    log.warning("%s: shutting down. Stopping %d running and %d queued scan(s) first", reason,
+                sum(1 for s in pending if s.running), len(queue))
+    for scan in pending:
+        if not scan.stop.is_set():  # One its owner or a moderator already stopped keeps that reason
+            request_stop(scan, reason='restart')
+    await update_presence()
+    if pending:
+        try:
+            await asyncio.wait_for(asyncio.gather(*(s.done.wait() for s in pending)), timeout=grace)
+        except asyncio.TimeoutError:
+            late = ", ".join(str(s.owner.id) for s in pending if not s.done.is_set())
+            log.warning("Scans of user(s) %s didn't finish posting within %s s; closing anyway", late, grace)
+    await close()
+
+def install_signal_handlers(loop):
+    """
+    Makes SIGTERM and SIGINT run shutdown(). Without this, Docker's stop signal ends the bot mid-scan with no results.
+    Windows' event loop can't catch signals; there Ctrl+C stops the bot at once, as before.
+    """
+    def handle(sig):
+        task = loop.create_task(shutdown(sig.name))
+        shutdown_tasks.add(task)
+        task.add_done_callback(shutdown_tasks.discard)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, handle, sig)
+        except (NotImplementedError, RuntimeError):
+            log.debug("Can't catch %s on this platform", sig.name)
 
 async def main():
     discord.utils.setup_logging(root=True)
@@ -1318,6 +1399,7 @@ async def main():
     bot.http.connector = aiohttp.TCPConnector(limit=0, resolver=Quad9Resolver())
     try:
         async with bot:
+            install_signal_handlers(asyncio.get_running_loop())
             await bot.start(TOKEN)
     finally:
         if pinger_session is not None:

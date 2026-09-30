@@ -153,12 +153,13 @@ To uninstall, run `docker compose down --rmi all` and delete the folder.
 
 ### Automatic updates
 
-The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one. A scan that is running at that moment is ended, so start very large scans (a 30,000-IP scan can take well over an hour) outside that time.
+The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one. A scan that is running at that moment is stopped: it posts what it found so far, with a note that the bot is restarting, and the rest of the list isn't checked. Queued scans are cancelled and their owners told. So start very large scans (a 30,000-IP scan can take well over an hour) outside that time.
 
 - It only touches scanbot, never your other containers.
 - The time zone is `TZ` in `.env` (default `UTC`), for example `TZ=Europe/Budapest`. It's also the time zone of the bot's log.
 - The image is also rebuilt weekly for security fixes, so expect a restart about once a week even without new features.
 - Watchtower needs access to the Docker socket to restart the bot.
+- Docker gives the bot 45 seconds to post those results (`stop_grace_period` in `docker-compose.yml`), and so does this Watchtower. The same happens on `docker compose stop`, `restart` or `down`. If your own Watchtower updates scanbot instead, note that the original `containrrr/watchtower` waits only 10 seconds: start it with `--stop-timeout 45s`.
 - Watchtower updates the bot, not `docker-compose.yml`. When a new version needs a changed compose file (a new setting, for example), run the [installer](#one-line-installer) again: it updates the file for you.
 
 **Already run Watchtower on this machine?** Delete the `watchtower:` block from `docker-compose.yml`. The scanbot container has the `com.centurylinklabs.watchtower.enable=true` label, so your existing Watchtower updates it. Keeping both can make an older Watchtower stop the new one. When the installer updates `docker-compose.yml`, it leaves the block out again.
@@ -308,7 +309,7 @@ flowchart TD
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
    - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
 
-`/stop` works in every phase. Pings already in flight finish (at most 3 seconds), and nothing new starts.
+`/stop` works in every phase. Direct pings already in flight finish (at most 3 seconds), API checks in flight are dropped, and nothing new starts.
 
 ## Configuration
 
@@ -555,6 +556,8 @@ journalctl -u scanbot -f    # follow the log
 
 If you installed the packages in a virtual environment, point `ExecStart` at its Python, for example `/opt/scanbot/venv/bin/python`.
 
+`systemctl stop scanbot` and `systemctl restart scanbot` stop running scans the way an update does with Docker: each posts what it found so far before the bot exits, within about 35 seconds (systemd waits up to 90).
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -588,6 +591,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
 | Many known-online servers missing | mcstatus.io rate-limited the bot | Don't run other tools using the API from the same IP; leave `API_DELAY` at `0.2` or higher |
+| Results say `The bot is restarting`, or `your queued scan was cancelled because the bot is restarting` | The bot was stopped or updated while the scan ran or waited (Watchtower checks daily at 4 AM) | Start the scan again; the results show what was already found. Start very large scans outside the update time |
+| A scan ended without results when the bot was updated or restarted | `docker-compose.yml` is older than this version, so Docker gave the bot 10 seconds or less. A reboot can also cut it short | Run the [installer](#one-line-installer) again: it updates the file. By hand, add `stop_grace_period: 45s` and `init: true` to the `scanbot` service |
 
 ## Credits
 

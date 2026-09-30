@@ -9,6 +9,10 @@ services:
     restart: unless-stopped
     # Run as the owner of ./data so the bot can read token.txt (the installer sets these in .env)
     user: "${SCANBOT_UID:-1000}:${SCANBOT_GID:-1000}"
+    # When stopped or updated, the bot stops running scans and posts what they found so far.
+    # Docker waits this long for that before killing it (without this line, 10 seconds or less).
+    stop_grace_period: 45s
+    init: true  # Docker's tiny init runs as PID 1 and passes the stop signal on to the bot
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       # Set SLASH_ONLY=1 in .env to run without the Message Content intent (slash commands only)
