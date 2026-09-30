@@ -90,6 +90,8 @@ try:
     API_DELAY = env_float('API_DELAY', 0.2, 0.05, 60)  # mcstatus.io allows 5 requests/second per IP, shared by all scans
     GEO_DELAY = env_float('GEO_DELAY', 4, 0, 600)      # ip-api.com batch allows 15 requests/minute, shared by all scans
     PROGRESS_INTERVAL = env_int('PROGRESS_INTERVAL', 3, 2, 600)  # Seconds between progress message updates
+    # Without the VPN: seconds between new tries of direct pings while they don't work (the startup probe failed)
+    DIRECT_RECHECK = env_int('DIRECT_RECHECK', 300, 10, 86400)
 except ValueError as e:
     print(f"❌ Error: {e}")
     sys.exit(1)
@@ -103,6 +105,7 @@ UPLOAD_HEADROOM = 0.9            # The bot stays this far under it
 PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
 BEDROCK_PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'geo.hivebedrock.network')  # Same, over UDP
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
+GEO_DB_CHECK = 86400      # Seconds between checks of the country database's age while the bot runs
 SHUTDOWN_GRACE = 35       # Seconds running scans get to post what they found when the bot is stopped (Docker allows 45)
 # With the VPN, pings are sent by the pinger inside the VPN container; everything else uses this
 # machine's connection. Set by docker-compose.vpn.yml; empty means the bot pings servers itself.
@@ -249,6 +252,34 @@ def is_public_entry(entry):
     except ValueError:
         return not is_internal_name(host)
 
+def is_ip_literal(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+def valid_port(entry):
+    """False if the entry has a port outside 1-65535 (the file format allows up to 5 digits)."""
+    _, sep, port = entry.partition(':')
+    return not sep or 1 <= int(port) <= 65535
+
+def dedupe_key(entry, edition='java'):
+    """
+    What makes two lines of a list the same server. Case and a trailing dot don't matter, and the edition's default
+    port is the same as no port, except for a Java hostname: without a port, mcstatus looks up the name's SRV record,
+    which can point somewhere else than port 25565 of the same name. Bedrock has no SRV records.
+    """
+    host, sep, port = entry.partition(':')
+    host = host.lower().rstrip('.')
+    if not sep:
+        return host
+    port = int(port)
+    default = BEDROCK_PORT if edition == 'bedrock' else JAVA_PORT
+    if port == default and (edition == 'bedrock' or is_ip_literal(host)):
+        return host
+    return f"{host}:{port}"
+
 async def resolve_public_address(host):
     """
     Resolves a host through Quad9 and returns the address to connect to.
@@ -306,6 +337,8 @@ bot.direct_ok = None  # Set by the startup probe in on_ready
 bot.direct_ok_bedrock = None  # Same for Bedrock: it's UDP, so it can work when Java's TCP port is blocked
 bot.probed_at = 0.0  # With the VPN: when the probes last ran (time.monotonic)
 bot.vpn_switcher = None  # With Mullvad: moves the VPN off servers that are down (set in on_ready)
+bot.direct_watcher = None  # Without the VPN: tries direct pings again while they don't work (set in on_ready)
+bot.geo_watcher = None  # Keeps the country database up to date (set in on_ready)
 
 class Scan:
     """
@@ -391,9 +424,13 @@ api_pacer = Pacer()  # mcstatus.io
 geo_pacer = Pacer()  # ip-api.com
 
 def to_int(value):
+    """
+    A player count as a whole number, 0 if it's missing or not a number. Some servers send -1 to hide their counts;
+    that's shown as 0 too, so the server is listed with the empty ones instead of in no list at all.
+    """
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        return max(int(value), 0)
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 def make_result(ip, address, players, players_max, names, version, motd, edition='java'):
@@ -573,6 +610,14 @@ def parse_api_status(ip, data, edition='java'):
 
 geo_db = None  # Offline country database, opened by load_geo_db() at startup
 
+def api_session():
+    """
+    An HTTP session for the outside services (mcstatus.io, ip-api.com, DB-IP, Mullvad): lookups go to Quad9 like
+    everything else, and requests say what they come from (DB-IP rejects Python's default User-Agent).
+    """
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver()),
+                                 headers={'User-Agent': USER_AGENT})
+
 def geo_db_age_days():
     """Days since the database at GEO_DB_PATH was built, or None if it's missing or unreadable."""
     try:
@@ -588,8 +633,7 @@ async def update_geo_db():
     """
     today = datetime.date.today()
     last_month = today.replace(day=1) - datetime.timedelta(days=1)
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver()),
-                                     headers={'User-Agent': USER_AGENT}) as session:
+    async with api_session() as session:
         for month in (today.strftime('%Y-%m'), last_month.strftime('%Y-%m')):
             try:
                 async with session.get(GEO_DB_URL.format(month=month), timeout=aiohttp.ClientTimeout(total=120)) as resp:
@@ -618,13 +662,39 @@ async def load_geo_db():
         except OSError as e:
             # e.g. a read-only install folder; keep using the old database if there is one
             log.warning("Could not save the country database to %s: %s", GEO_DB_PATH, e)
-    geo_db = None
     try:
-        geo_db = maxminddb.open_database(GEO_DB_PATH)
-        built = datetime.datetime.fromtimestamp(geo_db.metadata().build_epoch, datetime.timezone.utc)
-        log.info("Country database loaded (DB-IP, built %s)", built.strftime('%Y-%m-%d'))
+        new = maxminddb.open_database(GEO_DB_PATH)
+        built = datetime.datetime.fromtimestamp(new.metadata().build_epoch, datetime.timezone.utc)
     except Exception as e:
-        log.warning("No country database (%s); flags come from ip-api.com only.", e)
+        if geo_db is None:
+            log.warning("No country database (%s); flags come from ip-api.com only.", e)
+        else:
+            log.warning("Couldn't open the new country database (%s); still using the old one.", e)
+        return
+    # Swap first, then close the old one, so scans looking up countries right now never find no database
+    old, geo_db = geo_db, new
+    if old is not None:
+        old.close()
+    log.info("Country database loaded (DB-IP, built %s)", built.strftime('%Y-%m-%d'))
+
+async def refresh_geo_db_if_old():
+    """Loads a new country database if the one on disk is older than GEO_DB_MAX_AGE_DAYS. True if it tried."""
+    age = geo_db_age_days()
+    if age is not None and age <= GEO_DB_MAX_AGE_DAYS:
+        return False
+    if not os.access(os.path.dirname(GEO_DB_PATH) or '.', os.W_OK):
+        return False  # Docker: the database is part of the image, which the weekly rebuild keeps fresh
+    await load_geo_db()
+    return True
+
+async def watch_geo_db():
+    """Checks the country database once a day, so a bot that runs for months still gets DB-IP's monthly updates."""
+    while True:
+        await asyncio.sleep(GEO_DB_CHECK)
+        try:
+            await refresh_geo_db_if_old()
+        except Exception:
+            log.exception("Checking the country database failed")
 
 def lookup_countries(ips):
     """
@@ -656,38 +726,48 @@ async def batch_get_locations(session, ips, stop=None):
     # Split into chunks of 100
     chunks = [ips[i:i + 100] for i in range(0, len(ips), 100)]
 
-    for chunk in chunks:
-        # Other scans may be using ip-api.com too, so wait for our turn
-        await geo_pacer.wait(GEO_DELAY)
-        if stop.is_set():
+    payloads = [[{"query": ip, "fields": "query,countryCode"} for ip in chunk] for chunk in chunks]
+    for payload in payloads:
+        # A rate limit, a server error or a network hiccup gets one more try; after that, those IPs get no flag
+        for attempt in range(2):
+            # Other scans may be using ip-api.com too, so wait for our turn
+            await geo_pacer.wait(GEO_DELAY)
+            if stop.is_set():
+                return locations
+            try:
+                async with session.post(GEO_BATCH_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        for entry in await resp.json():
+                            # Entry looks like: {"query": "1.2.3.4", "countryCode": "US"}
+                            if entry.get('query'):
+                                locations[entry['query']] = entry.get('countryCode')
+                        break
+                    problem = f"HTTP {resp.status}"
+                    retry = resp.status == 429 or resp.status >= 500
+            except Exception as e:
+                problem, retry = str(e) or type(e).__name__, True
+            if retry and attempt == 0:
+                log.info("Geolocation failed (%s); retrying once", problem)
+                continue
+            log.warning("Geolocation failed: %s", problem)
             break
-        try:
-            payload = [{"query": ip, "fields": "query,countryCode"} for ip in chunk]
-
-            async with session.post(GEO_BATCH_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    for entry in await resp.json():
-                        # Entry looks like: {"query": "1.2.3.4", "countryCode": "US"}
-                        if entry.get('query'):
-                            locations[entry['query']] = entry.get('countryCode')
-                else:
-                    log.warning("Geolocation returned HTTP %s", resp.status)
-        except Exception as e:
-            log.warning("Geolocation failed: %s", e)
 
     return locations
 
-def parse_ips(text):
+def parse_ips(text, edition='java'):
     """
     Returns (unique valid addresses in file order, invalid line count, duplicate count,
-    private or local address count). Blank lines and lines starting with # are ignored.
+    private or local address count). Blank lines and lines starting with # are ignored, ports must be 1-65535,
+    and of two lines for the same server (see dedupe_key) the first one is kept as it was written.
     """
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line and not line.startswith('#')]
-    valid = [line for line in lines if ADDRESS_RE.match(line)]
+    valid = [line for line in lines if ADDRESS_RE.match(line) and valid_port(line)]
     public = [line for line in valid if is_public_entry(line)]
-    unique = list(dict.fromkeys(public))
-    return unique, len(lines) - len(valid), len(public) - len(unique), len(valid) - len(public)
+    unique = {}
+    for line in public:
+        unique.setdefault(dedupe_key(line, edition), line)
+    return list(unique.values()), len(lines) - len(valid), len(public) - len(unique), len(valid) - len(public)
 
 async def set_status(text):
     try:
@@ -724,6 +804,8 @@ def progress_text(state):
 
 async def report_progress(message, state):
     """Edits the progress message every few seconds while a scan runs."""
+    if message is None:  # It couldn't be posted
+        return
     last = None
     while True:
         await asyncio.sleep(PROGRESS_INTERVAL)
@@ -828,7 +910,10 @@ def format_entry(r, locations, markdown=True):
     if markdown:
         names = discord.utils.escape_markdown(names)
 
-    text = f"{get_flag_emoji(locations.get(r['address']))} {bold(r['ip'])} | Players: {r['players']}/{r['max']} | Ver: {r['version']}"
+    ip, version = r['ip'], r['version']
+    if markdown:  # Both come from the list or the server, and names like play_server_1 would turn italic
+        ip, version = discord.utils.escape_markdown(ip), discord.utils.escape_markdown(version)
+    text = f"{get_flag_emoji(locations.get(r['address']))} {bold(ip)} | Players: {r['players']}/{r['max']} | Ver: {version}"
     if motd: text += f"\n   └ 📝 {motd}"
     if names: text += f"\n   └ 👤 {bold('Users:')} {names}"
     return text
@@ -930,7 +1015,12 @@ async def send_channel(ctx, *args, **kwargs):
     except discord.Forbidden:
         for file in kwargs.get('files', []):
             file.reset()  # The failed upload already read them to the end
-        return await ctx.send(*args, **kwargs)
+        try:
+            return await ctx.send(*args, **kwargs)
+        except discord.HTTPException as e:
+            log.warning("Couldn't post in %s, and the command's reply no longer works either (%s); message lost",
+                        getattr(ctx.channel, 'name', None) or 'a DM', e)
+            return None
 
 def speed_text(direct, api):
     """
@@ -952,14 +1042,17 @@ def speed_text(direct, api):
     return text
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
-                       vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None):
+                       vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None, error=False):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
     populated = sorted((r for r in results if r['players'] > 0), key=lambda r: r['players'], reverse=True)
     empty = [r for r in results if r['players'] == 0]
 
-    title = "🛑 **Scan stopped** — partial results" if stopped else "📊 **Scan Complete!**"
+    if error:
+        title = "⚠️ **Scan failed** — partial results"
+    else:
+        title = "🛑 **Scan stopped** — partial results" if stopped else "📊 **Scan Complete!**"
     if edition != 'java':
         title += f" ({EDITION_LABELS[edition]})"
     if owner:
@@ -976,6 +1069,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
     if vpn_down:
         summary += "\n⚠️ The VPN was down: every server was checked through the API only"
+    if error:
+        summary += "\n⚠️ The bot hit an error and stopped the scan early (details are in its log)."
     if stopped and stop_reason == 'restart':
         summary += ("\n🔄 The bot is restarting (usually for an update), so the rest of the list wasn't checked. "
                     "Scan it again in a minute.")
@@ -999,7 +1094,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         return
 
     # Too long for one message: summary + top servers in chat, everything in files
-    top = [f"{get_flag_emoji(locations.get(r['address']))} **{r['ip']}** | {r['players']}/{r['max']}"
+    top = [f"{get_flag_emoji(locations.get(r['address']))} **{discord.utils.escape_markdown(r['ip'])}** | "
+           f"{r['players']}/{r['max']}"
            for r in populated[:10]]
     message = summary
     if top:
@@ -1024,6 +1120,40 @@ async def probe_direct(edition='java'):
 
     return any(await asyncio.gather(*(probe(server) for server in servers)))
 
+def every(seconds):
+    """'every 5 minutes', 'every 90 seconds'."""
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return "every minute" if minutes == 1 else f"every {minutes} minutes"
+    return f"every {seconds} seconds"
+
+async def recheck_direct():
+    """
+    Without the VPN: probes the editions whose direct pings don't work, and switches each one back on when it answers
+    (the network was down when the bot started, a firewall rule changed). Returns the editions that work now.
+    """
+    failed = [edition for edition, ok in (('java', bot.direct_ok), ('bedrock', bot.direct_ok_bedrock)) if not ok]
+    answered = await asyncio.gather(*(probe_direct(edition) for edition in failed))
+    bot.probed_at = time.monotonic()
+    working = [edition for edition, ok in zip(failed, answered) if ok]
+    for edition in working:
+        if edition == 'java':
+            bot.direct_ok = True
+            log.info("Direct pings work now; scans use direct pings with API fallback again.")
+        else:
+            bot.direct_ok_bedrock = True
+            log.info("Direct Bedrock (UDP) pings work now; Bedrock scans use direct pings with API fallback again.")
+    return working
+
+async def watch_direct():
+    """Without the VPN: tries direct pings again every DIRECT_RECHECK seconds until both editions work."""
+    while not (bot.direct_ok and bot.direct_ok_bedrock):
+        await asyncio.sleep(DIRECT_RECHECK)
+        try:
+            await recheck_direct()
+        except Exception:
+            log.exception("Checking direct pings again failed")
+
 async def check_vpn():
     """
     With the VPN: probes both editions through the pinger, and logs and shows it when
@@ -1042,8 +1172,7 @@ async def check_vpn():
 
 async def fetch_mullvad_relays():
     """Mullvad's WireGuard server list, over this machine's own connection like the other APIs."""
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver()),
-                                     headers={'User-Agent': USER_AGENT}) as session:
+    async with api_session() as session:
         async with session.get(vpn_switch.RELAYS_URL, timeout=aiohttp.ClientTimeout(total=15)) as response:
             response.raise_for_status()
             return await response.json()
@@ -1142,13 +1271,17 @@ async def on_ready():
         if bot.direct_ok:
             log.info("Direct pings work; scans use direct pings with API fallback.")
         else:
-            log.warning("Direct pings to %s all failed; scans use the mcstatus.io API only (5 checks/second).",
-                        ", ".join(PROBE_SERVERS))
+            log.warning("Direct pings to %s all failed; scans use the mcstatus.io API only (5 checks/second), "
+                        "trying again %s.", ", ".join(PROBE_SERVERS), every(DIRECT_RECHECK))
         if bot.direct_ok_bedrock:
             log.info("Direct Bedrock (UDP) pings work; Bedrock scans use direct pings with API fallback.")
         else:
-            log.warning("Direct Bedrock pings to %s all failed; Bedrock scans use the mcstatus.io API only (5 checks/second).",
-                        ", ".join(BEDROCK_PROBE_SERVERS))
+            log.warning("Direct Bedrock pings to %s all failed; Bedrock scans use the mcstatus.io API only "
+                        "(5 checks/second), trying again %s.", ", ".join(BEDROCK_PROBE_SERVERS), every(DIRECT_RECHECK))
+        if not (bot.direct_ok and bot.direct_ok_bedrock):
+            bot.direct_watcher = asyncio.create_task(watch_direct())
+    if bot.geo_watcher is None:
+        bot.geo_watcher = asyncio.create_task(watch_geo_db())
     log.info("Logged in as %s", bot.user.name)
     await update_presence()
 
@@ -1278,16 +1411,21 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
         await ctx.send("❌ Must be a `.txt` file.")
         return
     if file.size > MAX_FILE_BYTES:
-        await ctx.send(f"❌ That file is too big ({file.size // 1000} KB). The limit is {MAX_FILE_BYTES // 1_000_000} MB; "
-                       f"a list of {MAX_IPS_PER_SCAN} servers is usually well under 1 MB.")
+        await ctx.send(f"❌ That file is too big ({file.size // 1000:,} KB). The limit is {MAX_FILE_BYTES // 1_000_000} MB.")
         return
 
     try:
         content = await file.read()
-        ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8-sig'))  # -sig: some editors add a BOM
-    except Exception as e:
-        await ctx.send(f"❌ Error reading file: {e}")
+    except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("Couldn't download %s from Discord: %s", file.filename, e)
+        await ctx.send("❌ Couldn't download the attachment from Discord. Please try again.")
         return
+    try:
+        text = content.decode('utf-8-sig')  # -sig: some editors add a BOM
+    except UnicodeDecodeError:
+        await ctx.send("❌ The file isn't UTF-8 text. Save it as plain UTF-8 text, one server per line.")
+        return
+    ips, invalid, duplicates, blocked = parse_ips(text, edition)
 
     if not ips:
         note = f" ({blocked} private or local address(es) are never scanned)" if blocked else ""
@@ -1365,9 +1503,11 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
     results = {}
     locations = {}
     direct = api = None  # (servers checked, seconds) for each phase that ran, for the speed line
+    retry = []
+    error = False
 
     try:
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
+        async with api_session() as session:
             # 1. Direct pings, many at once
             if direct_ok:
                 began = time.monotonic()
@@ -1391,26 +1531,34 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
                 state.update(phase="Resolving locations", done=len(locations), total=len(addresses))
                 locations.update(await batch_get_locations(session, unknown, stop=scan.stop))
                 state['done'] = len(addresses)
+    except Exception:
+        # Exception, not BaseException: cancelling the task (the bot shutting down hard) must still cancel it
+        error = True
+        log.exception("Scan by %s failed while %s (%d/%d); posting the %d server(s) found so far",
+                      ctx.author, state['phase'].lower(), state['done'], state['total'], len(results))
     finally:
         updater.cancel()
 
-    stopped = scan.stop.is_set()
-    stop_reason = scan.stop_reason if stopped else None
-    if stop_reason == 'restart':
+    stopped = scan.stop.is_set() or error
+    stop_reason = scan.stop_reason if scan.stop.is_set() else None
+    if error:
+        head = "⚠️ **Error:** the scan stopped early."
+    elif stop_reason == 'restart':
         head = "🛑 **Stopped:** the bot is restarting."
     else:
         head = "🛑 **Stopped.**" if stopped else "✅ **Done.**"
-    try:
-        await progress.edit(content=f"{head} {owner} found {state['found']} online servers.")
-    except discord.HTTPException:
-        pass
+    if progress is not None:
+        try:
+            await progress.edit(content=f"{head} {owner} found {state['found']} online servers.")
+        except discord.HTTPException:
+            pass
 
     # With api:off, the servers that didn't answer a direct ping are offline as far as this scan knows. (A stopped
     # scan doesn't know how many never got pinged, so it says nothing.)
     not_retried = len(retry) if not api_retry and not stopped else 0
     await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
                        blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
-                       direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason)
+                       direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason, error=error)
 
 async def shutdown(reason, grace=SHUTDOWN_GRACE, close=None):
     """
