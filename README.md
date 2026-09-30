@@ -12,7 +12,17 @@ On any Linux machine with Docker, run this in the folder where you want the bot 
 curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash
 ```
 
-It asks for your bot token, starts the bot, and keeps it updated automatically. Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
+It asks for your bot token, starts the bot, and keeps it updated automatically.
+
+If it stops with `Your user can't talk to Docker` (Docker says "permission denied"), your account isn't allowed to use Docker. Run the same thing with `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | sudo bash
+```
+
+With `sudo`, the `scanbot` folder belongs to root and the bot runs as root, so later `docker compose` commands in that folder need `sudo` too (Docker needs root or the `docker` group, the same reason the first command failed). To avoid that, run `sudo usermod -aG docker $USER` once, log out and back in, and use the first command instead.
+
+Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
 
 First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores `!` commands. The slash commands (`/scan`) don't need it.
 
@@ -91,6 +101,12 @@ Needs Docker with the Compose plugin ([install Docker](https://docs.docker.com/e
 curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash
 ```
 
+If it says `Your user can't talk to Docker`, use the `sudo` version instead (see [the note in Quick start](#quick-start) about what that changes):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | sudo bash
+```
+
 The installer:
 
 1. Creates a `scanbot` folder with the compose file and a `data` folder next to it:
@@ -106,7 +122,7 @@ The installer:
 2. Asks for your bot token (hidden while you type) and saves it to `data/token.txt`, readable only by you.
 3. Starts the bot, waits until it has logged in to Discord, and tells you if the token was rejected.
 
-Running it again is safe: it keeps your files and pulls the latest version. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. To use a different folder name, set `SCANBOT_DIR`.
+Running it again is safe: it keeps your files and pulls the latest version. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. With `sudo`, just answer the prompt: a token written on `sudo`'s command line would show up in `ps` and in sudo's log. To use a different folder name, set `SCANBOT_DIR` (with sudo: `… | sudo SCANBOT_DIR=name bash`).
 
 ### Docker Compose by hand
 
@@ -389,6 +405,8 @@ The installer asks on the first install. To add, change or remove the VPN later,
 curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash -s -- --vpn
 ```
 
+If you installed with `sudo`, run it with `sudo` too: `curl -fsSL … | sudo bash -s -- --vpn`.
+
 - **Mullvad:** on [mullvad.net → WireGuard configuration](https://mullvad.net/en/account/wireguard-config), generate a key and download a config file. The installer asks for its `PrivateKey` and `Address` lines.
 - **Proton VPN:** on [account.proton.me → WireGuard](https://account.proton.me/u/0/vpn/WireGuard), create a configuration (a free server if you're on the free plan). The installer asks for its `PrivateKey`.
 - **Cloudflare WARP:** nothing to do. The installer registers a free, anonymous WARP device with [wgcf](https://github.com/ViRb3/wgcf).
@@ -543,6 +561,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Bot is online but ignores `!scan` | Message Content Intent is off | Use `/scan`, which doesn't need it, or turn the intent on in the Developer Portal → **Bot** → **Privileged Gateway Intents** and restart the bot |
 | `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 3 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
 | `PrivilegedIntentsRequired` at startup | `SLASH_ONLY` is off but the Message Content Intent isn't enabled | Enable the intent, or set `SLASH_ONLY=1` |
+| Installer says `Your user can't talk to Docker` (or Docker says "permission denied") | Your account isn't in the `docker` group | Run the installer with `sudo` (the `sudo bash` command in [Quick start](#quick-start)), or run `sudo usermod -aG docker $USER`, log out and back in, and run it without `sudo` |
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
