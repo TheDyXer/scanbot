@@ -139,16 +139,26 @@ fi
 
 # --- VPN ---
 disable_vpn() {
-  # Drop the override from .env first, so "up --remove-orphans" below removes gluetun
+  # Drop the override from .env first, so "up --remove-orphans" below removes gluetun and the pinger
   env_unset COMPOSE_FILE; env_unset VPN_PROVIDER; env_unset VPN_LOCATION
   ok "No VPN: the bot uses this machine's connection"
 }
 
-enable_vpn() {  # enable_vpn "<provider label>" "<location label>"
-  if [ ! -f docker-compose.vpn.yml ]; then
-    curl -fsSL "${RAW}/docker-compose.vpn.yml" -o docker-compose.vpn.yml \
-      || die "Couldn't download docker-compose.vpn.yml from ${RAW}"
+# docker-compose.vpn.yml belongs to the installer, so it's replaced on every run: older versions sent
+# all of the bot's traffic through the VPN. A changed copy is kept as docker-compose.vpn.yml.bak.
+fetch_vpn_compose() {
+  local tmp; tmp="$(mktemp)"
+  curl -fsSL "${RAW}/docker-compose.vpn.yml" -o "${tmp}" \
+    || { rm -f "${tmp}"; die "Couldn't download docker-compose.vpn.yml from ${RAW}"; }
+  if [ -f docker-compose.vpn.yml ] && ! cmp -s "${tmp}" docker-compose.vpn.yml; then
+    cp docker-compose.vpn.yml docker-compose.vpn.yml.bak
+    ok "Updated docker-compose.vpn.yml (your old one is docker-compose.vpn.yml.bak)"
   fi
+  cat "${tmp}" > docker-compose.vpn.yml; rm -f "${tmp}"
+}
+
+enable_vpn() {  # enable_vpn "<provider label>" "<location label>"
+  fetch_vpn_compose
   env_set COMPOSE_FILE "${VPN_COMPOSE_FILE}"
   env_set VPN_PROVIDER "\"$1\""
   env_set VPN_LOCATION "\"$2\""
@@ -295,6 +305,7 @@ EOF
     *) die "Unknown SCANBOT_VPN value: ${choice} (use none, mullvad, protonvpn or warp)" ;;
   esac
 elif vpn_enabled; then
+  fetch_vpn_compose
   ok "Keeping your VPN: $(env_get VPN_PROVIDER | tr -d '"'), $(env_get VPN_LOCATION | tr -d '"')"
 fi
 
@@ -308,17 +319,19 @@ if ! pull_output=$(docker compose pull 2>&1); then
   die "docker compose pull failed."
 fi
 
-if vpn_enabled; then info "Starting the VPN and the bot (the bot waits until the VPN is connected)..."; fi
+if vpn_enabled; then info "Starting the VPN, its pinger and the bot..."; fi
+vpn_failed=""
 if ! docker compose up -d --remove-orphans; then
-  if vpn_enabled; then
-    warn "The VPN didn't connect. Last gluetun log lines:"
-    docker compose logs --tail 15 gluetun 2>&1 || true
-    die "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
-  fi
-  die "docker compose up failed."
+  if ! vpn_enabled; then die "docker compose up failed."; fi
+  # The bot doesn't wait for the VPN: it runs anyway and checks servers through the API until the VPN is up
+  vpn_failed="yes"
+  warn "The VPN didn't connect. Last gluetun log lines:"
+  docker compose logs --tail 15 gluetun 2>&1 || true
+  warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
+  warn "Until then the bot still runs, and checks every server through the API only."
 fi
 
-if vpn_enabled; then
+if vpn_enabled && [ -z "${vpn_failed}" ]; then
   vpn_ip=""
   for _ in $(seq 1 20); do
     vpn_ip="$(docker compose logs gluetun 2>&1 | grep -oE "Public IP address is .*" | tail -n 1 || true)"
@@ -326,6 +339,16 @@ if vpn_enabled; then
     sleep 1
   done
   ok "VPN connected ($(env_get VPN_PROVIDER | tr -d '"'), $(env_get VPN_LOCATION | tr -d '"'))${vpn_ip:+. ${vpn_ip}}"
+  pinger_up=""
+  for _ in $(seq 1 20); do
+    if docker compose logs pinger 2>&1 | grep -q "Pinger listening"; then pinger_up="yes"; break; fi
+    sleep 1
+  done
+  if [ -n "${pinger_up}" ]; then
+    ok "Pinger ready: server pings go through the VPN; Discord, the APIs and DNS use this machine's connection"
+  else
+    warn "The pinger hasn't started yet. Check it with: docker compose logs pinger"
+  fi
 fi
 
 info "Waiting for the bot to log in..."
@@ -345,8 +368,9 @@ echo
 case "${status}" in
   ok)
     ok "Scanbot is running."
-    # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it)
-    printf '%s' "${logs}" | grep -oE "Direct (Bedrock (\(UDP\) )?)?pings? .*" | tail -n 2 | sed 's/^/    /' || true
+    # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it).
+    # With the VPN, one line says whether pings through it work.
+    printf '%s' "${logs}" | grep -oE "(Direct (Bedrock (\(UDP\) )?)?pings?|Pings through the VPN) .*" | tail -n 2 | sed 's/^/    /' || true
     ;;
   bad-token)
     # Stop it so it doesn't keep retrying a bad login (Discord blocks IPs that do that a lot)

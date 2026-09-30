@@ -1,8 +1,11 @@
-# VPN for scanbot: every connection the bot makes goes through gluetun, a VPN client
-# container. If the VPN drops, the bot goes offline instead of using your own connection.
+# VPN for scanbot's server pings. gluetun is a VPN client container; the pinger runs inside it and
+# sends every ping to the servers you scan. The bot itself stays on this machine's connection for
+# Discord, mcstatus.io, ip-api.com and DNS: their limits count per address, and VPN addresses are shared.
+# If the VPN drops, pings stop (they never use your own connection) and scans use the API until it's back.
 #
-# The installer sets this up (curl ... | bash -s -- --vpn). By hand: put gluetun's settings
-# in vpn.env next to this file (see README, "VPN"), then add this line to .env:
+# The installer sets this up and replaces this file on every run (curl ... | bash -s -- --vpn).
+# By hand: put gluetun's settings in vpn.env next to this file (see README, "VPN"), then add this
+# line to .env:
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.vpn.yml
 
 services:
@@ -16,8 +19,8 @@ services:
     env_file: vpn.env
     environment:
       TZ: ${TZ:-UTC}
-      # gluetun's own DNS; the bot resolves names through Quad9 itself, inside the tunnel
       DNS_UPSTREAM_RESOLVERS: quad9
+    # Never publish the pinger's port (8765) here: that would let anyone on your network use it
     volumes:
       # gluetun keeps its VPN server list here
       - ./vpn:/gluetun
@@ -30,13 +33,37 @@ services:
         max-size: 10m
         max-file: "3"
 
-  scanbot:
+  # Pings servers for the bot, from inside the VPN. It only accepts public IP addresses, and only
+  # the containers in this compose project can reach it (at gluetun:8765).
+  pinger:
+    image: ${SCANBOT_IMAGE:-ghcr.io/thedyxer/scanbot:latest}
+    restart: unless-stopped
+    command: ["python", "/app/pinger.py"]
     network_mode: service:gluetun
+    user: "${SCANBOT_UID:-1000}:${SCANBOT_GID:-1000}"
     depends_on:
       gluetun:
         condition: service_healthy
         restart: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: scanbot
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  scanbot:
     environment:
+      # Pings go to the pinger in the VPN; everything else uses this machine's connection
+      PINGER_URL: http://gluetun:8765
       # Shown by the bot; set by the installer
       VPN_PROVIDER: ${VPN_PROVIDER:-}
       VPN_LOCATION: ${VPN_LOCATION:-}
