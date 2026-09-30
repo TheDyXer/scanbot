@@ -385,6 +385,8 @@ fi
 
 if vpn_enabled; then info "Starting the VPN, its pinger and the bot..."; fi
 vpn_failed=""
+# A gluetun that's already running must restart to read a new server-switching key; a new one reads it anyway
+gluetun_running="$(docker compose ps -q --status running gluetun 2>/dev/null || true)"
 if ! docker compose up -d --remove-orphans; then
   if ! vpn_enabled; then die "docker compose up failed."; fi
   # The bot doesn't wait for the VPN: it runs anyway and checks servers through the API until the VPN is up
@@ -393,7 +395,7 @@ if ! docker compose up -d --remove-orphans; then
   docker compose logs --tail 15 gluetun 2>&1 || true
   warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
   warn "Until then the bot still runs, and checks every server through the API only."
-elif vpn_enabled && [ -n "${GLUETUN_RESTART}" ]; then
+elif vpn_enabled && [ -n "${GLUETUN_RESTART}" ] && [ -n "${gluetun_running}" ]; then
   # gluetun reads vpn/auth/config.toml only when it starts (the pinger restarts with it)
   info "Restarting the VPN so it picks up the server-switching key..."
   docker compose restart gluetun >/dev/null 2>&1 || warn "Couldn't restart gluetun. Run: docker compose restart gluetun"
