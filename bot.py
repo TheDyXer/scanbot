@@ -8,6 +8,7 @@ import json
 # --- CONFIGURATION ---
 MC_API_URL = 'https://api.mcstatus.io/v2/status/java/'
 GEO_BATCH_URL = 'http://ip-api.com/batch' # Using batch endpoint
+MAX_IPS_PER_SCAN = 5000
 # ---------------------
 
 # Read token
@@ -46,7 +47,7 @@ async def check_server(session, ip):
                         "ip": ip,
                         "data": data
                     }
-    except:
+    except Exception:
         pass
     return None
 
@@ -121,7 +122,7 @@ async def help(ctx):
         value="Displays this help message.",
         inline=False
     )
-    embed.set_footer(text="Attach a .txt file with IPs (one per line) to use !scan.")
+    embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use !scan.")
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -135,14 +136,12 @@ async def stop(ctx):
 
 @bot.command(aliases=['scan'])
 async def check(ctx):
-    # Try to acquire the lock non-blocking to give immediate "busy" response
-    try:
-        await asyncio.wait_for(scan_lock.acquire(), timeout=0)
-    except asyncio.TimeoutError:
+    # No await between this check and acquiring the lock, so two commands can't both get past it
+    if scan_lock.locked():
         await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
         return
 
-    try:
+    async with scan_lock:
         bot.stop_scan_event.clear()  # Reset the stop event at the start of scan
         
         # --- File Input ---
@@ -166,8 +165,12 @@ async def check(ctx):
             await ctx.send("⚠️ File is empty.")
             return
 
-        start_time = time.time()
         total_ips = len(ips)
+        if total_ips > MAX_IPS_PER_SCAN:
+            await ctx.send(f"❌ Too many IPs. Maximum allowed per scan is {MAX_IPS_PER_SCAN}.")
+            return
+
+        start_time = time.time()
         await ctx.send(f"🚀 **Scan started** on {total_ips} IPs...")
         
         # 1. PHASE ONE: High-Speed Minecraft Scan
@@ -178,7 +181,11 @@ async def check(ctx):
             for index, ip in enumerate(ips):
                 # Check for stop request
                 if bot.stop_scan_event.is_set():
-                    await ctx.send("🛑 **Scan stopped by user.**")
+                    # Cancel checks already in flight before the session closes
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await ctx.send(f"🛑 **Scan stopped by user** after {index}/{total_ips} IPs.")
                     await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
                     return
                 
@@ -287,7 +294,5 @@ async def check(ctx):
                 await ctx.send(chunk + footer)
 
         await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
-    finally:
-        scan_lock.release()
 
 bot.run(TOKEN)
