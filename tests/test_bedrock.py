@@ -272,7 +272,7 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
 
     def attachment(self):
-        return types.SimpleNamespace(filename='ips.txt', read=mock.AsyncMock(return_value=b'8.8.8.8\n1.1.1.1\n'))
+        return types.SimpleNamespace(filename='ips.txt', size=20, read=mock.AsyncMock(return_value=b'8.8.8.8\n1.1.1.1\n'))
 
     async def test_default_scan_is_java(self):
         await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment())
