@@ -1,5 +1,6 @@
 .git
 .github
+tests/
 __pycache__
 *.pyc
 token.txt

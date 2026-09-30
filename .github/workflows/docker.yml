@@ -1,4 +1,4 @@
-name: Docker image
+name: CI
 
 on:
   push:
@@ -11,15 +11,67 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: docker-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13'] # The oldest version the README promises, and the one in the image
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # PINGER_URL and DNS_TRANSPORT stay unset: the tests expect the bot's defaults
+      - run: python -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck install.sh
+        run: shellcheck install.sh
+
+      # A CR makes bash fail with "$'\r': command not found" when the installer is piped from curl
+      - name: install.sh has LF line endings
+        run: |
+          if grep -q $'\r' install.sh; then
+            echo "::error file=install.sh::install.sh has CRLF line endings"
+            exit 1
+          fi
+
+      - name: Python files compile
+        run: python3 -m compileall -q bot.py pinger.py vpn_select.py vpn_switch.py tests
+
+      - name: Compose files are valid
+        run: |
+          docker compose -f docker-compose.yml config -q
+          # The VPN combination, with throwaway values for what the installer normally writes
+          printf '%s\n' 'COMPOSE_FILE=docker-compose.yml:docker-compose.vpn.yml' 'SCANBOT_UID=1000' \
+            'SCANBOT_GID=1000' 'TZ=UTC' 'GLUETUN_API_KEY=x' 'VPN_FALLBACK_CITIES="A,B"' > .env
+          touch vpn.env
+          docker compose config -q
+
+  build:
+    needs: [test, lint] # Also on the weekly rebuild: new dependency releases must pass the tests first
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
 
