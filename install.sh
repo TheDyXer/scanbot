@@ -76,6 +76,7 @@ KNOWN_COMPOSE_DIGESTS="
 e5015f8c2b2928c0a4e708d45520a4f178692785ffdd874afd3a9b054ec1bead
 3812215fcebc935031097339a51d82cdf908a2ba30e0deb521c9e7ece791a3a7
 6bd7892bcb419d4b4819ee314e4fd6824196d6024d84e11849df3f4719fe833c
+0b22fe255c0cbea678237e24bc995ee6751fb2a2df1494829a1fa165c1239eee
 "
 
 # The compose file without the watchtower block (from its comment to the next service or top-level
