@@ -16,6 +16,9 @@ from unittest import mock
 os.environ.setdefault('DISCORD_TOKEN', 'test-token')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import discord  # noqa: E402
+from discord.ext import commands  # noqa: E402
+
 import bot as scanbot  # noqa: E402
 
 
@@ -152,6 +155,22 @@ class ScanFlowTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertTrue(any('Scan Complete' in t for t in texts(a.channel.send)))
 
+    async def test_a_moderator_cancelling_a_queued_scan_tells_its_owner(self):
+        a, b, moderator = make_ctx(1), make_ctx(2), make_ctx(9, moderator=True)
+        with mock.patch.object(scanbot, 'MAX_CONCURRENT_SCANS', 1):
+            first = asyncio.create_task(self.scan(a, attachment()))
+            await until(lambda: scanbot.running_count() == 1)
+            queued = asyncio.create_task(self.scan(b, attachment()))
+            await until(lambda: len(scanbot.queue) == 1)
+
+            await self.stop(moderator, None, person(2))
+            await asyncio.wait_for(queued, 1)
+            # The moderator's reply may be in another channel, so the owner hears it where they're waiting
+            self.assertTrue(any('<@2>' in t and 'cancelled by <@9>' in t for t in texts(b.channel.send)))
+
+            self.gate.set()
+            await first
+
     async def test_stop_only_stops_your_own_scan(self):
         a, b = make_ctx(1), make_ctx(2)
         tasks = [asyncio.create_task(self.scan(ctx, attachment())) for ctx in (a, b)]
@@ -225,6 +244,34 @@ class ModeratorStopTests(unittest.IsolatedAsyncioTestCase):
         ctx = make_ctx(1, moderator=False)
         await self.stop(ctx, None, person(1))
         self.assertEqual(self.stopped(), [1])
+
+
+class StopArgumentTests(unittest.IsolatedAsyncioTestCase):
+    """!stop takes "all" or a mention; /stop has an `all` choice and a `user` picker."""
+
+    async def parse(self, content, mentions=()):
+        msg = mock.MagicMock(attachments=[], mentions=list(mentions), content=content, guild=None)
+        view = commands.view.StringView(content)
+        ctx = commands.Context(message=msg, bot=scanbot.bot, view=view, prefix='!')
+        view.skip_string('!')
+        name = view.get_word()
+        view.skip_ws()
+        ctx.invoked_with, ctx.command = name, scanbot.bot.get_command(name)
+        await ctx.command._parse_arguments(ctx)
+        return ctx.args[1:]  # after ctx
+
+    async def test_prefix_stop_takes_all_or_a_mention(self):
+        user = discord.Object(id=123456789012345678)  # Real IDs have 15-20 digits; shorter ones aren't recognised
+        self.assertEqual(await self.parse('!stop'), [None, None])
+        self.assertEqual(await self.parse('!stop all'), ['all', None])
+        self.assertEqual(await self.parse('!stop <@123456789012345678>', [user]), [None, user])
+
+    def test_slash_stop_has_an_all_choice_and_a_user_option(self):
+        params = {p.display_name: p for p in scanbot.bot.tree.get_command('stop').parameters}
+        self.assertEqual(set(params), {'all', 'user'})
+        self.assertEqual([c.value for c in params['all'].choices], ['all'])
+        self.assertEqual(params['user'].type, discord.AppCommandOptionType.user)
+        self.assertFalse(any(p.required for p in params.values()))
 
 
 class SharedLimitTests(unittest.IsolatedAsyncioTestCase):

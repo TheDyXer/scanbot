@@ -192,6 +192,7 @@ class Scan:
         self.stop = asyncio.Event()
         self.turn = asyncio.Event()   # Set when a queued scan may start, or was cancelled
         self.running = False
+        self.stopped_by = None        # Who used /stop on it, if anyone
 
 scans = {}  # User ID -> that user's scan, queued or running
 queue = []  # Scans waiting for a free slot, oldest first
@@ -217,7 +218,8 @@ def start_queued():
         scan.running = True
         scan.turn.set()
 
-def request_stop(scan):
+def request_stop(scan, by=None):
+    scan.stopped_by = by
     scan.stop.set()
     if scan in queue:
         # Never started: take it out of the queue and wake it up so it can finish
@@ -771,7 +773,7 @@ async def stop(ctx, scope: Optional[Literal['all']] = None, user: Optional[disco
                            else "⚠️ **No scans are running in this server.**")
             return
         for scan in targets:
-            request_stop(scan)
+            request_stop(scan, by=ctx.author)
         owners = ", ".join(s.owner.mention for s in targets)
         await ctx.send(f"🛑 **Stopping {len(targets)} scan(s)** ({owners}). "
                        "Running scans stop shortly and post what they found so far.")
@@ -782,7 +784,7 @@ async def stop(ctx, scope: Optional[Literal['all']] = None, user: Optional[disco
         await ctx.send("⚠️ **You don't have a scan running.**")
         return
     started = scan.running
-    request_stop(scan)
+    request_stop(scan, by=ctx.author)
     if started:
         await ctx.send("🛑 **Stop requested.** Your scan will stop shortly and post what it found so far...")
     else:
@@ -843,9 +845,14 @@ async def run_scan(ctx, scan, file, edition):
         await update_presence()
         await scan.turn.wait()
     if scan.stop.is_set():
+        # Stopped before it started. The owner's own /stop already said so; a moderator's reply
+        # may be in another channel, so tell the owner here.
+        stopped_by = scan.stopped_by
         if not place:
             await ctx.send("🛑 **Scan cancelled.**")
-        return  # Stopped before it started; /stop already said so
+        elif stopped_by is not None and stopped_by.id != ctx.author.id:
+            await send_channel(ctx, f"🛑 {ctx.author.mention}, your queued scan was cancelled by {stopped_by.mention}.")
+        return
 
     start_time = time.time()
     owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
