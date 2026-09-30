@@ -39,6 +39,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 
 - **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
 - **Fast scans:** pings servers directly, 50 at a time, and retries the ones that don't answer through `api.mcstatus.io`
+- **Skip the retry when it isn't worth it:** `/scan file:<.txt> api:off` counts only servers that answer a direct ping, which is much faster for long lists of mostly dead addresses (see [Skipping the API retry](#skipping-the-api-retry))
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
 - **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
@@ -188,7 +189,7 @@ or, if your network blocks Minecraft's port:
 
 | Command | What it does |
 | --- | --- |
-| `/scan file:<.txt> [edition]` (or `!scan [edition]` + attached `.txt`) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file |
+| `/scan file:<.txt> [edition] [api]` (or `!scan [edition] [api]` + attached `.txt`) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file. `api` is `on` (the default) or `off`: [skip the API retry](#skipping-the-api-retry), as in `!scan java off` |
 | `/stop` (or `!stop`) | Stops your scan and posts what it found so far, or cancels it if it's still queued |
 | `/stop user:@name` (or `!stop @name`) | Moderators: stops that person's scan |
 | `/stop all:all` (or `!stop all`) | Moderators: stops every scan in this server |
@@ -202,6 +203,16 @@ Progress and results are posted as normal messages in the channel, not as replie
 - **When all 5 are busy,** a new scan waits in a queue and starts on its own when a slot frees up. The bot says where you are in line; `/stop` takes you out of it.
 - **Moderators** are people with the **Manage Messages** permission. They can stop someone else's scan, or every scan, in their own server. In DMs, everyone can only stop their own.
 - **Scans share the API limits.** mcstatus.io and ip-api.com count requests per bot, not per scan, so scans that use the API take turns. With direct pings working, that rarely matters: only the servers that didn't answer go through the API. When everything goes through the API, 5 checks per second are split between the running scans: two scans get about 2.5 each.
+
+### Skipping the API retry
+
+Servers that don't answer a direct ping are normally retried through mcstatus.io, at 5 a second for the whole bot. On a long list of mostly dead addresses, like a whole ISP's range, that retry is where nearly all the time goes: 5,000 IPs take about 5 minutes of direct pings plus about 17 minutes of API checks.
+
+With `api:off` (`!scan java off`), a server that doesn't answer a direct ping counts as offline and isn't retried, so the same list takes about 5 minutes. The start message says so, and the results say how many servers were left out.
+
+- **What you can miss:** servers that only answer through the API, for example hosts that route by hostname (Hypixel answers by name but not by IP), or servers that block your address but not mcstatus.io's.
+- **It needs direct pings.** If they don't work (your network blocks port 25565 and there's no VPN, or the VPN is down), the bot refuses `api:off`, because it would check nothing. Use the API then.
+- In `!scan` the edition comes first: `!scan bedrock off`. `!scan off` isn't understood.
 
 ### The IP list
 
@@ -541,6 +552,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
 | `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
+| `❌ api:off would check nothing` | Direct pings don't work: your network blocks port 25565, or the VPN is down | Scan with the API on, or fix the direct pings (see the row above and [VPN](#vpn)) |
 | `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
