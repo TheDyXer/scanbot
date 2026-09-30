@@ -43,6 +43,8 @@ class SwitcherTests(unittest.IsolatedAsyncioTestCase):
         self.gluetun_down = False
         self.fetches = 0
         self.api_down = False
+        self.reconnects = 0
+        self.reconnect_error = None
         self.clock = Clock()
 
         async def fetch():
@@ -57,7 +59,13 @@ class SwitcherTests(unittest.IsolatedAsyncioTestCase):
             self.pinned.append(hostname)
             return hostname not in self.unknown_to_gluetun
 
-        self.switcher = vpn_switch.MullvadSwitcher(['Belgrade', 'zagreb', 'Budapest'], fetch, set_server, clock=self.clock)
+        async def reconnect():
+            if self.reconnect_error:
+                raise self.reconnect_error
+            self.reconnects += 1
+
+        self.switcher = vpn_switch.MullvadSwitcher(['Belgrade', 'zagreb', 'Budapest'], fetch, set_server,
+                                                   reconnect=reconnect, clock=self.clock)
 
     def set_active(self, hostname, active):
         for r in self.relays:
@@ -69,7 +77,7 @@ class SwitcherTests(unittest.IsolatedAsyncioTestCase):
         return await self.switcher.tick(vpn_ok)
 
     async def test_starts_on_the_first_server_of_the_chosen_city(self):
-        self.assertFalse(await self.tick())  # Picking the first server isn't a switch
+        self.assertTrue(await self.tick())  # gluetun may reconnect for it: check again soon
         self.assertEqual(self.switcher.current, 'rs-beg-wg-101')
         self.assertEqual(self.pinned, ['rs-beg-wg-101'])
 
@@ -104,19 +112,64 @@ class SwitcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.switcher.current, 'rs-beg-wg-101')  # Frankfurt isn't one of the cities
         self.assertIn('No other Mullvad server', logs.output[0])
 
-    async def test_two_failed_checks_in_a_row_move_to_another_server(self):
+    async def test_first_failed_check_reconnects_the_second_moves_to_another_server(self):
+        await self.tick()
+        with self.assertLogs('scanbot.vpn', level='INFO') as logs:
+            self.assertTrue(await self.tick(vpn_ok=False, minutes=1))
+        self.assertEqual((self.switcher.current, self.reconnects), ('rs-beg-wg-101', 1))
+        self.assertIn('Reconnecting the VPN to rs-beg-wg-101', logs.output[0])
+        self.assertTrue(await self.tick(vpn_ok=False, minutes=1))
+        self.assertEqual((self.switcher.current, self.reconnects), ('rs-beg-wg-102', 1))
+
+    async def test_without_a_reconnect_the_first_failure_only_counts(self):
+        self.switcher.reconnect = None
         await self.tick()
         self.assertFalse(await self.tick(vpn_ok=False, minutes=1))
-        self.assertEqual(self.switcher.current, 'rs-beg-wg-101')
         self.assertTrue(await self.tick(vpn_ok=False, minutes=1))
+        self.assertEqual(self.switcher.current, 'rs-beg-wg-102')
+
+    async def test_no_other_server_left_means_reconnecting_the_same_one(self):
+        # gluetun doesn't restart the VPN by itself with switching on, so the bot has to keep trying
+        await self.tick()
+        for hostname in ('rs-beg-wg-102', 'hr-zag-wg-001', 'hr-zag-wg-002', 'hu-bud-wg-101'):
+            self.set_active(hostname, False)
+        await self.tick(vpn_ok=False, minutes=1)  # Reconnect
+        with self.assertLogs('scanbot.vpn', level='WARNING'):
+            self.assertTrue(await self.tick(vpn_ok=False, minutes=1))  # No other server: reconnect again
+        self.assertTrue(await self.tick(vpn_ok=False, minutes=1))
+        self.assertEqual((self.switcher.current, self.reconnects), ('rs-beg-wg-101', 3))
+
+    async def test_reconnects_are_logged_once_per_outage(self):
+        await self.tick()
+        for hostname in ('rs-beg-wg-102', 'hr-zag-wg-001', 'hr-zag-wg-002', 'hu-bud-wg-101'):
+            self.set_active(hostname, False)
+        with self.assertLogs('scanbot.vpn', level='INFO') as logs:
+            for _ in range(4):
+                await self.tick(vpn_ok=False, minutes=1)
+        self.assertEqual(sum('Reconnecting' in line for line in logs.output), 1)
+        await self.tick(vpn_ok=True, minutes=1)  # Back up
+        with self.assertLogs('scanbot.vpn', level='INFO') as logs:
+            await self.tick(vpn_ok=False, minutes=1)
+        self.assertIn('Reconnecting', logs.output[0])
+
+    async def test_a_key_that_cant_reconnect_is_reported_once_and_switching_still_works(self):
+        # A new bot image with an installer from before reconnects: gluetun answers 401
+        self.reconnect_error = PermissionError("gluetun doesn't let this key reconnect the VPN yet")
+        await self.tick()
+        with self.assertLogs('scanbot.vpn', level='WARNING') as logs:
+            self.assertFalse(await self.tick(vpn_ok=False, minutes=1))
+        self.assertIn("doesn't let this key reconnect", logs.output[0])
+        with self.assertLogs('scanbot.vpn', level='WARNING') as logs:
+            self.assertTrue(await self.tick(vpn_ok=False, minutes=1))  # The switch itself still works
+        self.assertFalse(any('reconnect' in line for line in logs.output))  # Not repeated
         self.assertEqual(self.switcher.current, 'rs-beg-wg-102')
 
     async def test_one_good_check_resets_the_count(self):
         await self.tick()
         await self.tick(vpn_ok=False, minutes=1)
         await self.tick(vpn_ok=True, minutes=1)
-        self.assertFalse(await self.tick(vpn_ok=False, minutes=1))
-        self.assertEqual(self.switcher.current, 'rs-beg-wg-101')
+        await self.tick(vpn_ok=False, minutes=1)  # Only a reconnect again, not a switch
+        self.assertEqual((self.switcher.current, self.reconnects), ('rs-beg-wg-101', 2))
 
     async def test_unreachable_server_waits_30_minutes_then_longer_each_time(self):
         await self.tick()
@@ -171,10 +224,10 @@ class SwitcherTests(unittest.IsolatedAsyncioTestCase):
         self.api_down = True
         with self.assertLogs('scanbot.vpn', level='WARNING'):
             for _ in range(4):
-                self.assertFalse(await self.tick(vpn_ok=False, minutes=1))
+                self.assertTrue(await self.tick(vpn_ok=False, minutes=1))  # Only reconnects
         self.assertEqual(self.switcher.current, 'rs-beg-wg-101')
-        self.assertEqual(self.switcher.fails, 0)
-        self.assertEqual(self.pinned[-1], 'rs-beg-wg-101')  # Still kept pinned
+        self.assertEqual((self.switcher.fails, self.reconnects), (0, 4))
+        self.assertEqual(self.pinned, ['rs-beg-wg-101'])  # Never moved
 
     async def test_the_list_is_fetched_at_most_every_5_minutes(self):
         await self.tick()
@@ -222,8 +275,12 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
             self.requests.append((request.headers.get('X-API-Key'), await request.json()))
             return web.Response(status=self.status, text='settings left unchanged' if self.status == 200 else 'nope')
 
+        async def status(request):
+            self.requests.append((request.headers.get('X-API-Key'), await request.json()))
+            return web.Response(status=self.status, text='ok' if self.status == 200 else 'nope')
+
         app = web.Application()
-        app.add_routes([web.put('/v1/vpn/settings', settings)])
+        app.add_routes([web.put('/v1/vpn/settings', settings), web.put('/v1/vpn/status', status)])
         self.server = TestServer(app)
         await self.server.start_server()
         self.addAsyncCleanup(self.server.close)
@@ -254,6 +311,16 @@ class ControlServerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PermissionError):
             await scanbot.set_vpn_server('rs-beg-wg-102')
 
+    async def test_reconnect_stops_then_starts_the_vpn(self):
+        await scanbot.reconnect_vpn()
+        self.assertEqual(self.requests, [('secret-key', {"status": "stopped"}), ('secret-key', {"status": "running"})])
+
+    async def test_a_key_without_reconnect_rights_stops_nothing(self):
+        self.status = 401  # Installer from before reconnects: the key may only change servers
+        with self.assertRaises(PermissionError):
+            await scanbot.reconnect_vpn()
+        self.assertEqual(len(self.requests), 1)  # "stopped" was refused, so "running" is never sent
+
 
 class SetupTests(unittest.IsolatedAsyncioTestCase):
     def env(self, **values):
@@ -276,6 +343,7 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs('scanbot', level='INFO'):
             switcher = self.make()
         self.assertEqual(switcher.cities, ['belgrade', 'zagreb'])
+        self.assertIs(switcher.reconnect, scanbot.reconnect_vpn)
 
     def test_off_for_other_providers_and_without_a_vpn(self):
         self.assertIsNone(self.make(VPN_PROVIDER='Proton VPN'))

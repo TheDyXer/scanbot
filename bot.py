@@ -61,7 +61,7 @@ INLINE_LIMIT = 1900       # Results longer than this are sent as files
 PINGER_URL = os.environ.get('PINGER_URL', '').strip().rstrip('/')
 VPN_CHECK_DOWN = 60       # With the VPN: seconds between checks while pings through it fail
 VPN_CHECK_UP = 300        # ... and while they work
-VPN_SWITCH_SETTLE = 30    # Seconds to let the VPN connect after moving to another server, before checking again
+VPN_SWITCH_SETTLE = 30    # Seconds to let the VPN connect after a reconnect or server change, before checking again
 # Mullvad server switching: gluetun's control server, and the cities to use, best first (set by the installer)
 GLUETUN_URL = os.environ.get('GLUETUN_URL', '').strip().rstrip('/')
 GLUETUN_API_KEY = os.environ.get('GLUETUN_API_KEY', '').strip()
@@ -887,6 +887,19 @@ async def set_vpn_server(hostname):
         response.raise_for_status()
         return True
 
+async def reconnect_vpn():
+    """
+    Makes gluetun connect to its Mullvad server again: stops the VPN, then starts it. With server
+    switching, gluetun doesn't do this by itself (HEALTH_RESTART_VPN=off, see vpn_switch.py).
+    """
+    for status in ("stopped", "running"):
+        async with get_pinger_session().put(f"{GLUETUN_URL}/v1/vpn/status", json={"status": status},
+                                            headers={"X-API-Key": GLUETUN_API_KEY},
+                                            timeout=aiohttp.ClientTimeout(total=60)) as response:
+            if response.status in (401, 403):
+                raise PermissionError("gluetun doesn't let this key reconnect the VPN yet. Run the installer again")
+            response.raise_for_status()
+
 def make_vpn_switcher():
     """The Mullvad server switcher, or None when the VPN isn't Mullvad or can't be controlled."""
     if not PINGER_URL or VPN_PROVIDER.lower() != 'mullvad':
@@ -902,18 +915,18 @@ def make_vpn_switcher():
         log.info("Mullvad server switching is off: no city to pick servers from (VPN_FALLBACK_CITIES).")
         return None
     log.info("Mullvad server switching is on. Cities, best first: %s", ", ".join(cities))
-    return vpn_switch.MullvadSwitcher(cities, fetch_mullvad_relays, set_vpn_server)
+    return vpn_switch.MullvadSwitcher(cities, fetch_mullvad_relays, set_vpn_server, reconnect=reconnect_vpn)
 
 async def switch_vpn_server():
     """
-    With Mullvad: moves the VPN to another server if the current one is listed as offline or doesn't
-    let pings through. Returns how many seconds to wait before the next VPN check.
+    With Mullvad: reconnects the VPN, or moves it to another server, if the current one is listed as
+    offline or doesn't let pings through. Returns how many seconds to wait before the next VPN check.
     """
     wait = VPN_CHECK_DOWN if vpn_down() else VPN_CHECK_UP
     if bot.vpn_switcher is not None:
         try:
             if await bot.vpn_switcher.tick(vpn_ok=not vpn_down()):
-                wait = VPN_SWITCH_SETTLE  # Check again soon, so scans use the new server quickly
+                wait = VPN_SWITCH_SETTLE  # Check again soon, so scans use the VPN again quickly
         except Exception:
             log.exception("Mullvad server switching failed")
     return wait

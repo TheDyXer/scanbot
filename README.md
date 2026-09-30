@@ -392,7 +392,7 @@ With Proton and WARP, the VPN then connects to any server in that city, and move
 With Mullvad, the bot keeps an eye on the server the VPN is using, and moves the VPN to another one when:
 
 - **Mullvad lists it as offline** on its [server list](https://mullvad.net/en/servers). The bot checks every 5 minutes.
-- **Or pings through it fail** on two checks in a row, about 1 to 6 minutes. This only counts while Mullvad's site answers: if your own internet is down, switching servers wouldn't help, so the bot waits.
+- **Or pings through it fail.** After the first failed check, the bot reconnects to the same server. If the next check fails too, about 1 to 6 minutes in, it moves on. That only counts while Mullvad's site answers: if your own internet is down, switching servers wouldn't help, so the bot just keeps reconnecting.
 
 **Where it switches to:**
 
@@ -411,10 +411,11 @@ Switched Mullvad server from rs-beg-wg-101 to rs-beg-wg-102: rs-beg-wg-101 is li
 **How it works:**
 
 - The bot tells gluetun which server to use through gluetun's control server, reachable only inside Docker at `gluetun:8000`.
-- The installer creates a key for it: `GLUETUN_API_KEY` in `.env`, and `vpn/auth/config.toml`. The key allows switching servers and nothing else. It can't read gluetun's settings, which include your WireGuard key.
+- The installer creates a key for it: `GLUETUN_API_KEY` in `.env`, and `vpn/auth/config.toml`. The key allows switching servers and reconnecting, nothing else. It can't read gluetun's settings, which include your WireGuard key.
+- **gluetun doesn't restart the VPN by itself** (`HEALTH_RESTART_VPN=off` in `vpn.env`); the bot reconnects it instead. In gluetun v3.41.3, a server change while gluetun checks its connection makes it restart in a loop ([qdm12/gluetun#3485](https://github.com/qdm12/gluetun/pull/3485), fixed after that release).
 - The server list comes from Mullvad's API, over your own connection like the other APIs.
 - **Trade-off:** the VPN stays on the one server the bot picked, instead of gluetun choosing any server in the city. If the bot is stopped, the VPN stays on its last server. If gluetun restarts, it uses `vpn.env`'s city until the bot picks a server again, within 5 minutes.
-- **Installed before this existed?** Run the installer again (no `--vpn` needed): it adds the key and the list of cities.
+- **Installed before this existed?** Run the installer again (no `--vpn` needed): it adds the key, the list of cities and `HEALTH_RESTART_VPN=off`.
 
 ### Set it up by hand
 
@@ -452,10 +453,12 @@ Switched Mullvad server from rs-beg-wg-101 to rs-beg-wg-102: rs-beg-wg-101 is li
      ```toml
      [[roles]]
      name = "scanbot"
-     routes = ["PUT /v1/vpn/settings", "GET /v1/vpn/status"]
+     routes = ["PUT /v1/vpn/settings", "PUT /v1/vpn/status", "GET /v1/vpn/status"]
      auth = "apikey"
      apikey = "<the same key>"
      ```
+
+   - Add `HEALTH_RESTART_VPN=off` to `vpn.env`, so only the bot restarts the VPN (see above).
 5. Run `docker compose up -d`.
 
 To find the fastest city yourself:
@@ -524,7 +527,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Log says `Mullvad server switching is off: there's no GLUETUN_API_KEY` | The install is older than server switching | Run the installer again |
 | Log says `gluetun refused the API key` | `GLUETUN_API_KEY` in `.env` and `vpn/auth/config.toml` don't match, or gluetun hasn't restarted since the file changed | Run the installer again, or `docker compose restart gluetun` |
 | Installer says `The VPN didn't connect` | Wrong key, or your network blocks the VPN's UDP port | Check the key in `vpn.env`, or run the installer again with `--vpn`. For a blocked port, add `WIREGUARD_ENDPOINT_PORT=53` (Mullvad also takes `123`) to `vpn.env`, then `docker compose up -d` |
-| `⚠️ The VPN is down: checking every server through the API only` | The VPN dropped or hasn't connected yet. Pings never use your own connection, so the scan uses the API | `docker compose logs gluetun`; it reconnects by itself, usually within seconds. The bot checks again every minute |
+| `⚠️ The VPN is down: checking every server through the API only` | The VPN dropped or hasn't connected yet. Pings never use your own connection, so the scan uses the API | `docker compose logs gluetun`; it reconnects by itself, usually within seconds. With Mullvad server switching, the bot reconnects it instead, within about a minute, and then tries other servers. The bot checks again every minute |
 | Bot's status says `· VPN down` | Same as above | Same as above |
 | WARP connects but every scan says the VPN is down | The packet size (MTU) is too big for your network | Lower `WIREGUARD_MTU=1280` to `1200` in `vpn.env`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
