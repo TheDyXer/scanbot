@@ -10,6 +10,7 @@ import datetime
 import dns.asyncresolver
 import dns.exception
 import dns.nameserver
+import dns.query
 import dns.resolver
 import gzip
 import io
@@ -68,13 +69,34 @@ VPN_FALLBACK_CITIES = os.environ.get('VPN_FALLBACK_CITIES', '').strip().strip('"
 # ---------------------
 
 log = logging.getLogger('scanbot')
+# DNS-over-HTTPS goes through httpx, which logs every request at INFO: one line per lookup
+for _name in ('httpx', 'httpcore'):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
-# --- DNS: every lookup goes to Quad9 over DNS-over-TLS (port 853) ---
+# --- DNS: every lookup goes to Quad9, over DNS-over-TLS (port 853) or, where that port is blocked, DNS-over-HTTPS ---
+QUAD9_ADDRESSES = ('9.9.9.9', '149.112.112.112')
+DNS_TRANSPORTS = ('auto', 'dot', 'doh')
+DNS_PROBE_HOST = 'discord.com'  # Looked up at startup to see which transport works
+DNS_PROBE_LIFETIME = 3          # Seconds a blocked transport gets before the next one is tried
+
+class DnsUnavailable(Exception):
+    """No Quad9 transport could answer, so the bot can't even reach Discord."""
+
+def parse_dns_transport(value):
+    value = (value or '').strip().lower() or 'auto'
+    if value not in DNS_TRANSPORTS:
+        raise ValueError(f"DNS_TRANSPORT must be one of {', '.join(DNS_TRANSPORTS)}, not {value!r}")
+    return value
+
+def quad9_nameservers(transport):
+    if transport == 'doh':
+        # The bootstrap address means dns.quad9.net itself is never looked up through the system resolver
+        return [dns.nameserver.DoHNameserver('https://dns.quad9.net/dns-query', bootstrap_address=address)
+                for address in QUAD9_ADDRESSES]
+    return [dns.nameserver.DoTNameserver(address, hostname='dns.quad9.net') for address in QUAD9_ADDRESSES]
+
 QUAD9 = dns.asyncresolver.Resolver(configure=False)
-QUAD9.nameservers = [
-    dns.nameserver.DoTNameserver('9.9.9.9', hostname='dns.quad9.net'),
-    dns.nameserver.DoTNameserver('149.112.112.112', hostname='dns.quad9.net'),
-]
+QUAD9.nameservers = quad9_nameservers('dot')
 QUAD9.lifetime = 5
 QUAD9.cache = dns.resolver.Cache()
 # mcstatus resolves server names and SRV records through dnspython's default resolver
@@ -97,6 +119,47 @@ class Quad9Resolver(AbstractResolver):
 
     async def close(self):
         pass
+
+DNS_LABELS = {'dot': 'Quad9 over TLS (port 853)', 'doh': 'Quad9 over HTTPS (port 443)'}
+
+try:
+    DNS_TRANSPORT = parse_dns_transport(os.environ.get('DNS_TRANSPORT', ''))
+except ValueError as e:
+    print(f"❌ Error: {e}")
+    sys.exit(1)
+
+async def probe_nameservers(nameservers):
+    """Looks up DNS_PROBE_HOST through just these nameservers, leaving QUAD9 alone. Raises a DNSException if none answers."""
+    resolver = dns.asyncresolver.Resolver(configure=False)
+    resolver.nameservers = nameservers
+    await resolver.resolve(DNS_PROBE_HOST, 'A', lifetime=DNS_PROBE_LIFETIME)
+
+async def choose_dns_transport(mode):
+    """
+    Points QUAD9 at the transport that works from this network. "auto" tries TLS, then HTTPS; "dot" and "doh"
+    try only that one. Raises DnsUnavailable, naming every failure, if none answers.
+    """
+    failures = []
+    for transport in ('dot', 'doh') if mode == 'auto' else (mode,):
+        nameservers = quad9_nameservers(transport)
+        if transport == 'doh' and not dns.query.have_doh:
+            # Without them dnspython tries HTTP/3 and every lookup fails with a baffling "not available"
+            failures.append(f"{DNS_LABELS[transport]}: the httpx and h2 packages are missing (pip install -r requirements.txt)")
+            continue
+        try:
+            await probe_nameservers(nameservers)
+        except (dns.exception.DNSException, OSError) as e:
+            failures.append(f"{DNS_LABELS[transport]}: {e}")
+            continue
+        QUAD9.nameservers = nameservers
+        if failures:
+            log.warning("%s; using %s instead.", failures[0], DNS_LABELS[transport])
+        else:
+            log.info("DNS goes through %s.", DNS_LABELS[transport])
+        return transport
+    hint = ("Is this machine (or, with Docker, its containers) cut off from the internet?" if mode == 'auto'
+            else f"DNS_TRANSPORT={mode} allows no fallback; set it to auto to try the other transport too.")
+    raise DnsUnavailable(f"DNS lookups failed, so the bot can't reach Discord. {'; '.join(failures)}. {hint}")
 
 # Read token: DISCORD_TOKEN environment variable first, then token.txt
 TOKEN = os.environ.get('DISCORD_TOKEN', '').strip()
@@ -1106,6 +1169,11 @@ async def run_scan(ctx, scan, file, edition):
 
 async def main():
     discord.utils.setup_logging(root=True)
+    try:
+        await choose_dns_transport(DNS_TRANSPORT)
+    except DnsUnavailable as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
     await load_geo_db()
     # discord.py only builds its own connector if none is set, so Discord traffic uses Quad9 too
     bot.http.connector = aiohttp.TCPConnector(limit=0, resolver=Quad9Resolver())

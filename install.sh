@@ -383,6 +383,33 @@ if ! pull_output=$(docker compose pull 2>&1); then
   die "docker compose pull failed."
 fi
 
+# --- DNS ---
+# The bot sends every lookup to Quad9 over TLS (port 853) and falls back to HTTPS (port 443) by itself.
+# Some networks block 853, so check from a container, the same way the bot goes out, and pin HTTPS
+# if so: that skips a failed try on every start. A DNS_TRANSPORT you set yourself is left alone.
+if [ -z "$(env_get DNS_TRANSPORT)" ]; then
+  dns_check='
+import socket, sys
+def reachable(port):
+    try:
+        socket.create_connection(("9.9.9.9", port), 5).close()
+        return True
+    except OSError:
+        return False
+sys.exit(0 if reachable(853) else 1 if reachable(443) else 2)
+'
+  dns_rc=0
+  docker run --rm --entrypoint python "${IMAGE}" -c "${dns_check}" >/dev/null 2>&1 || dns_rc=$?
+  case "${dns_rc}" in
+    0) ok "DNS-over-TLS (port 853) works from here" ;;
+    1)
+      env_set DNS_TRANSPORT doh
+      warn "Port 853 (DNS-over-TLS) is blocked here, so the bot sends its DNS to Quad9 over HTTPS (port 443) instead."
+      ;;
+    2) warn "A container can't reach Quad9 (9.9.9.9) on port 853 or 443. The bot will need Docker's internet access to work." ;;
+  esac
+fi
+
 if vpn_enabled; then info "Starting the VPN, its pinger and the bot..."; fi
 vpn_failed=""
 # A gluetun that's already running must restart to read a new server-switching key; a new one reads it anyway
@@ -449,6 +476,9 @@ case "${status}" in
     ;;
   error)
     docker compose stop scanbot >/dev/null 2>&1 || true
+    if printf '%s' "${logs}" | grep -q "DNS lookups failed"; then
+      die "The bot can't look up any names over TLS or HTTPS (see above), so its container probably has no internet access. Fix that, then: docker compose up -d"
+    fi
     die "The bot stopped with an error (see above). Fix it, then: docker compose up -d"
     ;;
   *)
