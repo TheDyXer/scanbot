@@ -168,7 +168,7 @@ The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchto
 
 ### Without Docker
 
-Requires **Python 3.10+**.
+Requires **Python 3.10+** (the tests run on 3.10 and 3.13 in CI).
 
 ```bash
 git clone https://github.com/TheDyXer/scanbot.git
