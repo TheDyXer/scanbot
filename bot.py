@@ -27,8 +27,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 scan_lock = asyncio.Lock()
+# stop_scan_event is created in on_ready to ensure it's bound to the running event loop
 
 async def check_server(session, ip):
     """
@@ -92,16 +93,58 @@ async def batch_get_locations(session, ips):
 
 @bot.event
 async def on_ready():
+    # Create the stop event here to ensure it's bound to the running event loop
+    bot.stop_scan_event = asyncio.Event()
     print(f'Logged in as {bot.user.name}')
     await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
 
+@bot.command()
+async def help(ctx):
+    """Displays a list of available commands."""
+    embed = discord.Embed(
+        title="📖 Scanbot Help",
+        description="Here are all available commands:",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="!check / !scan",
+        value="Scans a list of Minecraft server IPs from an attached `.txt` file.",
+        inline=False
+    )
+    embed.add_field(
+        name="!stop",
+        value="Stops the currently running scan.",
+        inline=False
+    )
+    embed.add_field(
+        name="!help",
+        value="Displays this help message.",
+        inline=False
+    )
+    embed.set_footer(text="Attach a .txt file with IPs (one per line) to use !scan.")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def stop(ctx):
+    """Stops the currently running scan."""
+    if scan_lock.locked():
+        bot.stop_scan_event.set()
+        await ctx.send("🛑 **Stop requested.** The scan will stop shortly...")
+    else:
+        await ctx.send("⚠️ **No scan is currently running.**")
+
 @bot.command(aliases=['scan'])
 async def check(ctx):
-    if scan_lock.locked():
+    # Try to acquire the lock non-blocking to give immediate "busy" response
+    try:
+        await asyncio.wait_for(scan_lock.acquire(), timeout=0)
+    except asyncio.TimeoutError:
         await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
         return
 
-    async with scan_lock:
+    try:
+        bot.stop_scan_event.clear()  # Reset the stop event at the start of scan
+        
         # --- File Input ---
         if not ctx.message.attachments:
             await ctx.send("❌ Please attach a `.txt` file.")
@@ -133,6 +176,12 @@ async def check(ctx):
         
         async with aiohttp.ClientSession() as session:
             for index, ip in enumerate(ips):
+                # Check for stop request
+                if bot.stop_scan_event.is_set():
+                    await ctx.send("🛑 **Scan stopped by user.**")
+                    await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
+                    return
+                
                 if index % 50 == 0:
                     await bot.change_presence(activity=discord.Game(name=f"Scanning {index}/{total_ips} ({ip})..."))
                 
@@ -238,5 +287,7 @@ async def check(ctx):
                 await ctx.send(chunk + footer)
 
         await bot.change_presence(activity=discord.Game(name="Idle | Waiting for IPs"))
+    finally:
+        scan_lock.release()
 
 bot.run(TOKEN)
