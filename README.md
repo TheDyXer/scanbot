@@ -43,6 +43,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
 - **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
+- **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
 - **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS
 - One scan at a time, up to 5,000 IPs per scan
@@ -199,6 +200,7 @@ play.example.com:25566
 
 - Up to **5,000** servers per scan
 - Duplicates and invalid lines are skipped, and the start message tells you how many
+- Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
 - IPv6 addresses aren't supported
 - Only the first attachment on the message is read
 
@@ -273,7 +275,7 @@ Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate
 
 ## DNS: Quad9 over TLS
 
-Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used.
+Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used, and direct pings connect to the address Quad9 returned.
 
 Check that port 853 works from the machine running the bot:
 
@@ -347,7 +349,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
 | `⏳ Bot is busy` | Another scan is running | Wait, or `!stop` it |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
-| Servers show 🏳️ instead of a flag | The IP isn't in the country database (for example a private `10.x` or `192.168.x` address) and ip-api.com didn't know it either, or was rate-limited | Normal for private addresses. For public ones, scan again in a minute |
+| `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
+| Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
 | Many known-online servers missing | mcstatus.io rate-limited the bot | Don't run other tools using the API from the same IP; leave `API_DELAY` at `0.2` or higher |
 

@@ -88,6 +88,54 @@ if not TOKEN:
 # host or IP, optionally with :port
 ADDRESS_RE = re.compile(r'^[A-Za-z0-9._-]+(:\d{1,5})?$')
 
+# Anyone in the channel can start a scan, so it must never reach the machine the bot runs on
+# or the network behind it. Only addresses on the public internet are pinged.
+INTERNAL_SUFFIXES = ('.localhost', '.local', '.lan', '.internal', '.home.arpa', '.localdomain')
+
+class BlockedAddress(Exception):
+    """The address is private or local, so it is never contacted."""
+
+def is_public_ip(ip):
+    return ip.is_global and not ip.is_multicast
+
+def is_internal_name(host):
+    host = host.lower().rstrip('.')
+    # Public names always contain a dot, so a bare name like "router" is a local one
+    return '.' not in host or host.endswith(INTERNAL_SUFFIXES)
+
+def is_public_entry(entry):
+    """Cheap check on a line from the file, before any lookups: host or IP, optionally with :port."""
+    host = entry.split(':', 1)[0]
+    try:
+        return is_public_ip(ipaddress.ip_address(host))
+    except ValueError:
+        return not is_internal_name(host)
+
+async def resolve_public_address(host):
+    """
+    Resolves a host through Quad9 and returns the address to connect to.
+    Returns None if the name doesn't resolve, raises BlockedAddress if it points at (or is)
+    something private. A failed lookup is never guessed at.
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if is_internal_name(host):
+            raise BlockedAddress(host)
+        try:
+            answer = await QUAD9.resolve(host, 'A', raise_on_no_answer=False)
+        except dns.exception.DNSException:
+            return None
+        addresses = [ipaddress.ip_address(record.address) for record in answer]
+        if not addresses:
+            return None
+        if not all(is_public_ip(a) for a in addresses):
+            raise BlockedAddress(host)
+        return addresses[0]
+    if not is_public_ip(ip):
+        raise BlockedAddress(host)
+    return ip
+
 def get_flag_emoji(country_code):
     if not country_code:
         return "🏳️"
@@ -124,20 +172,29 @@ def make_result(ip, address, players, players_max, names, version, motd):
 async def check_direct(ip):
     """
     Pings the server itself. Returns a result if it answers, None otherwise.
+    Raises BlockedAddress, without contacting anything, if the server is at a private or local address.
     """
+    if not is_public_entry(ip):
+        raise BlockedAddress(ip)
     try:
         server = await JavaServer.async_lookup(ip, timeout=DIRECT_TIMEOUT)
-        status = await server.async_status(tries=1)
     except Exception:
         return None
 
+    # The lookup follows SRV records, so check where the server really is. Then connect to that
+    # exact address: pinging by name would resolve it a second time, outside Quad9 and unchecked.
     try:
-        address = str(await server.address.async_resolve_ip())
+        address = await resolve_public_address(server.address.host)
+        if address is None:
+            return None
+        status = await JavaServer(str(address), server.address.port, timeout=DIRECT_TIMEOUT).async_status(tries=1)
+    except BlockedAddress:
+        raise
     except Exception:
-        address = None
+        return None
 
     names = [p.name for p in (status.players.sample or []) if p.name]
-    return make_result(ip, address, status.players.online, status.players.max,
+    return make_result(ip, str(address), status.players.online, status.players.max,
                        names, status.version.name, status.motd.to_plain())
 
 async def check_api(session, ip):
@@ -301,14 +358,15 @@ async def batch_get_locations(session, ips):
 
 def parse_ips(text):
     """
-    Returns (unique valid addresses in file order, invalid line count, duplicate count).
-    Blank lines and lines starting with # are ignored.
+    Returns (unique valid addresses in file order, invalid line count, duplicate count,
+    private or local address count). Blank lines and lines starting with # are ignored.
     """
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line and not line.startswith('#')]
     valid = [line for line in lines if ADDRESS_RE.match(line)]
-    unique = list(dict.fromkeys(valid))
-    return unique, len(lines) - len(valid), len(valid) - len(unique)
+    public = [line for line in valid if is_public_entry(line)]
+    unique = list(dict.fromkeys(public))
+    return unique, len(lines) - len(valid), len(public) - len(unique), len(valid) - len(public)
 
 async def set_status(text):
     try:
@@ -345,7 +403,13 @@ async def run_direct(ips, results, state):
         async with semaphore:
             if stop_scan_event.is_set():
                 return
-            result = await check_direct(ip)
+            try:
+                result = await check_direct(ip)
+            except BlockedAddress:
+                # Not pinged, and not passed on to the API either
+                state['done'] += 1
+                state['blocked'] += 1
+                return
         state['done'] += 1
         pinged.add(ip)
         if result:
@@ -417,7 +481,7 @@ def build_files(populated, empty, locations):
     table = discord.File(io.BytesIO(buffer.getvalue().encode('utf-8')), filename="scan_results.csv")
     return [txt, table]
 
-async def send_results(ctx, results, locations, stopped, total_ips, duration):
+async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -429,6 +493,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration):
                f"⏱️ **Time:** {minutes}m {seconds}s")
     if not stopped and duration > 0:
         summary += f"\n⚡ **Speed:** {total_ips / duration:.2f} IPs/sec"
+    if blocked:
+        summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
 
     if not results:
         await ctx.send(f"❌ No working servers found.\n{summary}")
@@ -461,7 +527,10 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration):
 async def on_ready():
     # on_ready runs again after reconnects; only probe once
     if bot.direct_ok is None:
-        bot.direct_ok = await check_direct(PROBE_SERVER) is not None
+        try:
+            bot.direct_ok = await check_direct(PROBE_SERVER) is not None
+        except BlockedAddress:
+            bot.direct_ok = False
         if bot.direct_ok:
             log.info("Direct pings work; scans use direct pings with API fallback.")
         else:
@@ -527,13 +596,14 @@ async def check(ctx):
 
         try:
             content = await attachment.read()
-            ips, invalid, duplicates = parse_ips(content.decode('utf-8'))
+            ips, invalid, duplicates, blocked = parse_ips(content.decode('utf-8'))
         except Exception as e:
             await ctx.send(f"❌ Error reading file: {e}")
             return
 
         if not ips:
-            await ctx.send("⚠️ No valid IPs in the file.")
+            note = f" ({blocked} private or local address(es) are never scanned)" if blocked else ""
+            await ctx.send(f"⚠️ No valid IPs in the file.{note}")
             return
 
         total_ips = len(ips)
@@ -543,13 +613,14 @@ async def check(ctx):
 
         notes = []
         if invalid: notes.append(f"skipped {invalid} invalid line(s)")
+        if blocked: notes.append(f"skipped {blocked} private or local address(es)")
         if duplicates: notes.append(f"removed {duplicates} duplicate(s)")
         extra = f" ({', '.join(notes)})" if notes else ""
 
         start_time = time.time()
         await ctx.send(f"🚀 **Scan started** on {total_ips} IPs{extra}...")
 
-        state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0}
+        state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0, "blocked": 0}
         progress = await ctx.send(progress_text(state))
         updater = asyncio.create_task(report_progress(progress, state))
         results = {}
@@ -587,7 +658,8 @@ async def check(ctx):
         except discord.HTTPException:
             pass
 
-        await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time)
+        await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
+                           blocked=state['blocked'])
 
 async def main():
     discord.utils.setup_logging(root=True)
