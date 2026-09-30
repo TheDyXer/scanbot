@@ -1,7 +1,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-from mcstatus import JavaServer
+from mcstatus import BedrockServer, JavaServer
 import aiohttp
 from aiohttp.abc import AbstractResolver
 import asyncio
@@ -21,9 +21,15 @@ import re
 import socket
 import sys
 import time
+from typing import Literal
 
 # --- CONFIGURATION ---
-MC_API_URL = 'https://api.mcstatus.io/v2/status/java/'
+MC_API_URLS = {
+    'java': 'https://api.mcstatus.io/v2/status/java/',
+    'bedrock': 'https://api.mcstatus.io/v2/status/bedrock/',
+}
+EDITION_LABELS = {'java': 'Java', 'bedrock': 'Bedrock'}
+BEDROCK_PORT = 19132      # Default port for Bedrock servers (Java's 25565 is handled by mcstatus)
 GEO_BATCH_URL = 'http://ip-api.com/batch' # Fallback for IPs the offline database doesn't know
 # Offline country database (DB-IP Lite, CC BY 4.0), next to bot.py unless GEO_DB_PATH is set
 GEO_DB_PATH = os.environ.get('GEO_DB_PATH') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dbip-country-lite.mmdb')
@@ -38,6 +44,7 @@ GEO_DELAY = 4             # ip-api.com batch allows 15 requests/minute
 # Pinged at startup to see if direct pings work from this network: one answer is enough. Direct pings
 # connect to the server's IP, so these must answer that way (Hypixel, for one, routes by hostname).
 PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
+BEDROCK_PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'geo.hivebedrock.network')  # Same, over UDP
 PROGRESS_INTERVAL = 3     # Seconds between progress message updates
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
 # ---------------------
@@ -173,6 +180,7 @@ bot = ScanBot(command_prefix=commands.when_mentioned if SLASH_ONLY else '!',
 scan_lock = asyncio.Lock()
 stop_scan_event = asyncio.Event()
 bot.direct_ok = None  # Set by the startup probe in on_ready
+bot.direct_ok_bedrock = None  # Same for Bedrock: it's UDP, so it can work when Java's TCP port is blocked
 
 def to_int(value):
     try:
@@ -180,9 +188,10 @@ def to_int(value):
     except (TypeError, ValueError):
         return 0
 
-def make_result(ip, address, players, players_max, names, version, motd):
+def make_result(ip, address, players, players_max, names, version, motd, edition='java'):
     return {
         "ip": ip,
+        "edition": EDITION_LABELS[edition],
         "address": address if isinstance(address, str) else None,  # Resolved IP, used for geolocation
         "players": to_int(players),
         "max": to_int(players_max),
@@ -219,13 +228,40 @@ async def check_direct(ip):
     return make_result(ip, str(address), status.players.online, status.players.max,
                        names, status.version.name, status.motd.to_plain())
 
-async def check_api(session, ip):
+def split_entry(entry, default_port):
+    """Splits "host" or "host:port" from the IP list."""
+    host, _, port = entry.partition(':')
+    return host, int(port) if port else default_port
+
+async def check_direct_bedrock(entry):
+    """
+    Pings a Bedrock server over UDP. Returns a result if it answers, None otherwise.
+    Raises BlockedAddress, without contacting anything, if the server is at a private or local address.
+    Bedrock has no SRV records and its ping doesn't carry a hostname, so pinging the checked IP loses nothing.
+    """
+    if not is_public_entry(entry):
+        raise BlockedAddress(entry)
+    try:
+        host, port = split_entry(entry, BEDROCK_PORT)
+        address = await resolve_public_address(host)
+        if address is None:
+            return None
+        status = await BedrockServer(str(address), port, timeout=DIRECT_TIMEOUT).async_status(tries=1)
+    except BlockedAddress:
+        raise
+    except Exception:
+        return None
+
+    return make_result(entry, str(address), status.players.online, status.players.max,
+                       [], status.version.name, status.motd.to_plain(), edition='bedrock')
+
+async def check_api(session, ip, edition='java'):
     """
     Asks mcstatus.io about the server. Returns a result if it's online, None otherwise.
     """
     for attempt in range(3):
         try:
-            async with session.get(f"{MC_API_URL}{ip}", timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get(f"{MC_API_URLS[edition]}{ip}", timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 429:
                     # Rate limited: wait and try again instead of calling the server offline
                     await asyncio.sleep(1 + attempt)
@@ -237,13 +273,13 @@ async def check_api(session, ip):
             return None
 
         try:
-            return parse_api_status(ip, data)
+            return parse_api_status(ip, data, edition)
         except Exception as e:
             log.warning("Unexpected mcstatus.io response for %s: %s", ip, e)
             return None
     return None
 
-def parse_api_status(ip, data):
+def parse_api_status(ip, data, edition='java'):
     """
     Turns an mcstatus.io response into a result, or None if the server is offline.
     Tolerates missing or oddly typed fields so one strange server can't break a scan.
@@ -263,14 +299,14 @@ def parse_api_status(ip, data):
 
     version = data.get('version')
     if isinstance(version, dict):
-        version = version.get('name_clean') or version.get('name_raw')
+        version = version.get('name_clean') or version.get('name_raw') or version.get('name')  # Bedrock only has "name"
     motd = data.get('motd')
     if isinstance(motd, dict):
         motd = motd.get('clean') or motd.get('raw')
 
     return make_result(ip, data.get('ip_address'), players.get('online'), players.get('max'), names,
                        version if isinstance(version, str) else None,
-                       motd if isinstance(motd, str) else None)
+                       motd if isinstance(motd, str) else None, edition)
 
 geo_db = None  # Offline country database, opened by load_geo_db() at startup
 
@@ -412,7 +448,7 @@ async def report_progress(message, state):
                 log.warning("Could not update progress message: %s", e)
             last = text
 
-async def run_direct(ips, results, state):
+async def run_direct(ips, results, state, edition='java'):
     """
     Pings every server directly, DIRECT_CONCURRENCY at a time.
     Returns the IPs that didn't answer, in file order.
@@ -420,13 +456,14 @@ async def run_direct(ips, results, state):
     state.update(phase="Pinging servers", done=0, total=len(ips))
     semaphore = asyncio.Semaphore(DIRECT_CONCURRENCY)
     pinged = set()
+    check_server = check_direct if edition == 'java' else check_direct_bedrock
 
     async def ping(ip):
         async with semaphore:
             if stop_scan_event.is_set():
                 return
             try:
-                result = await check_direct(ip)
+                result = await check_server(ip)
             except BlockedAddress:
                 # Not pinged, and not passed on to the API either
                 state['done'] += 1
@@ -441,7 +478,7 @@ async def run_direct(ips, results, state):
     await asyncio.gather(*(ping(ip) for ip in ips))
     return [ip for ip in ips if ip in pinged and ip not in results]
 
-async def run_api(session, ips, results, state, retrying):
+async def run_api(session, ips, results, state, retrying, edition='java'):
     """
     Checks servers through mcstatus.io, starting one request every API_DELAY seconds.
     """
@@ -449,7 +486,7 @@ async def run_api(session, ips, results, state, retrying):
     state.update(phase=phase, done=0, total=len(ips))
 
     async def check(ip):
-        result = await check_api(session, ip)
+        result = await check_api(session, ip, edition)
         state['done'] += 1
         if result:
             results[ip] = result
@@ -496,10 +533,10 @@ def build_files(populated, empty, locations):
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["ip", "resolved_ip", "country", "players_online", "players_max", "version", "motd", "players"])
+    writer.writerow(["ip", "resolved_ip", "country", "players_online", "players_max", "version", "motd", "players", "edition"])
     for r in populated + empty:
         writer.writerow([r['ip'], r['address'] or '', locations.get(r['address']) or '', r['players'],
-                         r['max'], r['version'], r['motd'], "; ".join(r['names'])])
+                         r['max'], r['version'], r['motd'], "; ".join(r['names']), r['edition']])
     table = discord.File(io.BytesIO(buffer.getvalue().encode('utf-8')), filename="scan_results.csv")
     return [txt, table]
 
@@ -514,7 +551,7 @@ async def send_channel(ctx, *args, **kwargs):
     except discord.Forbidden:
         return await ctx.send(*args, **kwargs)
 
-async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0):
+async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java'):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -522,6 +559,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     empty = [r for r in results if r['players'] == 0]
 
     title = "🛑 **Scan stopped** — partial results" if stopped else "📊 **Scan Complete!**"
+    if edition != 'java':
+        title += f" ({EDITION_LABELS[edition]})"
     summary = (f"{title}\n🟢 {len(populated)} with players · ⚪ {len(empty)} empty · 🔎 {total_ips} IPs\n"
                f"⏱️ **Time:** {minutes}m {seconds}s")
     if not stopped and duration > 0:
@@ -556,26 +595,33 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     message += "\n\n📎 Full results are in the attached files."
     await send_channel(ctx, message[:2000], files=build_files(populated, empty, locations))
 
-async def probe_direct():
-    """True if a direct ping to any of the PROBE_SERVERS gets an answer."""
+async def probe_direct(edition='java'):
+    """True if a direct ping to any of the probe servers gets an answer."""
+    servers, check_server = (PROBE_SERVERS, check_direct) if edition == 'java' else (BEDROCK_PROBE_SERVERS, check_direct_bedrock)
+
     async def probe(server):
         try:
-            return await check_direct(server) is not None
+            return await check_server(server) is not None
         except BlockedAddress:
             return False
 
-    return any(await asyncio.gather(*(probe(server) for server in PROBE_SERVERS)))
+    return any(await asyncio.gather(*(probe(server) for server in servers)))
 
 @bot.event
 async def on_ready():
     # on_ready runs again after reconnects; only probe once
     if bot.direct_ok is None:
-        bot.direct_ok = await probe_direct()
+        bot.direct_ok, bot.direct_ok_bedrock = await asyncio.gather(probe_direct('java'), probe_direct('bedrock'))
         if bot.direct_ok:
             log.info("Direct pings work; scans use direct pings with API fallback.")
         else:
             log.warning("Direct pings to %s all failed; scans use the mcstatus.io API only (5 checks/second).",
                         ", ".join(PROBE_SERVERS))
+        if bot.direct_ok_bedrock:
+            log.info("Direct Bedrock (UDP) pings work; Bedrock scans use direct pings with API fallback.")
+        else:
+            log.warning("Direct Bedrock pings to %s all failed; Bedrock scans use the mcstatus.io API only (5 checks/second).",
+                        ", ".join(BEDROCK_PROBE_SERVERS))
     log.info("Logged in as %s", bot.user.name)
     await set_status("Idle | Waiting for IPs")
 
@@ -595,8 +641,8 @@ async def help(ctx):
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="/scan file:<.txt>  (or !scan)",
-        value="Scans a list of Minecraft server IPs from a `.txt` file.",
+        name="/scan file:<.txt> [edition]  (or !scan [edition])",
+        value="Scans a list of Minecraft server IPs from a `.txt` file. `edition` is `java` (default) or `bedrock`.",
         inline=False
     )
     embed.add_field(
@@ -623,8 +669,9 @@ async def stop(ctx):
         await ctx.send("⚠️ **No scan is currently running.**")
 
 @bot.hybrid_command(name="scan", aliases=['check'], description="Check a list of Minecraft servers from a .txt file")
-@app_commands.describe(file="A .txt file with one IP or hostname per line")
-async def check(ctx, file: discord.Attachment):
+@app_commands.describe(file="A .txt file with one IP or hostname per line",
+                       edition="Minecraft edition of the servers in the file (default: java)")
+async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock'] = 'java'):
     # No await between this check and acquiring the lock, so two commands can't both get past it
     if scan_lock.locked():
         await ctx.send("⏳ **Bot is busy.** Another scan is currently in progress.")
@@ -663,7 +710,8 @@ async def check(ctx, file: discord.Attachment):
         extra = f" ({', '.join(notes)})" if notes else ""
 
         start_time = time.time()
-        await ctx.send(f"🚀 **Scan started** on {total_ips} IPs{extra}...")
+        label = "Bedrock " if edition == 'bedrock' else ""
+        await ctx.send(f"🚀 **Scan started** on {total_ips} {label}IPs{extra}...")
 
         state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0, "blocked": 0}
         progress = await send_channel(ctx, progress_text(state))
@@ -674,15 +722,16 @@ async def check(ctx, file: discord.Attachment):
         try:
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
                 # 1. Direct pings, many at once (skipped if the startup probe failed)
-                if bot.direct_ok:
+                direct_ok = bot.direct_ok if edition == 'java' else bot.direct_ok_bedrock
+                if direct_ok:
                     await set_status(f"Pinging {total_ips} servers...")
-                    retry = await run_direct(ips, results, state)
+                    retry = await run_direct(ips, results, state, edition)
                 else:
                     retry = ips
 
                 # 2. mcstatus.io API for everything that didn't answer, 5 per second
                 if retry and not stop_scan_event.is_set():
-                    await run_api(session, retry, results, state, retrying=bool(bot.direct_ok))
+                    await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition)
 
                 # 3. Geolocation: offline database first (instant), ip-api.com for the rest
                 addresses = sorted({r['address'] for r in results.values() if r['address']})
@@ -704,7 +753,7 @@ async def check(ctx, file: discord.Attachment):
             pass
 
         await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
-                           blocked=state['blocked'])
+                           blocked=state['blocked'], edition=edition)
 
 async def main():
     discord.utils.setup_logging(root=True)

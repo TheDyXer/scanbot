@@ -1,6 +1,6 @@
 # Scanbot
 
-A Discord bot that checks a list of Minecraft Java servers and tells you which ones are online, how many players they have, and where they are.
+A Discord bot that checks a list of Minecraft servers (Java or Bedrock Edition) and tells you which ones are online, how many players they have, and where they are.
 
 Drop a `.txt` file of IPs into Discord with `/scan` (or `!scan`), watch the progress message count up, and get the results in chat or as a `.txt` / `.csv` file.
 
@@ -36,6 +36,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 
 ## Features
 
+- **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
 - **Fast scans:** pings servers directly, 50 at a time, and retries the ones that don't answer through `api.mcstatus.io`
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
@@ -185,7 +186,7 @@ or, if your network blocks Minecraft's port:
 
 | Command | What it does |
 | --- | --- |
-| `/scan file:<.txt>` (or `!scan` + attached `.txt`) | Scans every server in the file |
+| `/scan file:<.txt> [edition]` (or `!scan [edition]` + attached `.txt`) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file |
 | `/stop` (or `!stop`) | Stops the running scan and posts what it found so far |
 | `/help` (or `!help`) | Lists the commands |
 
@@ -204,6 +205,7 @@ play.example.com:25566
 ```
 
 - Up to **5,000** servers per scan
+- Lines without a port use **25565** for Java and **19132** for Bedrock. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
 - IPv6 addresses aren't supported
@@ -250,7 +252,7 @@ flowchart TD
     E --> F[Post results]
 ```
 
-1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`). If any of them answers, scans ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
+1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
@@ -269,7 +271,8 @@ Settings are at the top of `bot.py`:
 | `DIRECT_TIMEOUT` | `3` | Seconds to wait for a server to answer a direct ping |
 | `API_DELAY` | `0.2` | Seconds between API requests (mcstatus.io allows 5/second) |
 | `GEO_DELAY` | `4` | Seconds between ip-api.com batches (15/minute allowed) |
-| `PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `play.wynncraft.com` | Servers pinged at startup to test direct pings; one answer is enough |
+| `PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `play.wynncraft.com` | Java servers pinged at startup to test direct pings; one answer is enough |
+| `BEDROCK_PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `geo.hivebedrock.network` | The same for Bedrock (UDP) |
 | `PROGRESS_INTERVAL` | `3` | Seconds between progress message updates |
 | `INLINE_LIMIT` | `1900` | Results longer than this many characters are sent as files |
 | `GEO_DB_MAX_AGE_DAYS` | `40` | Download a new country database when the current one is older than this (without Docker) |
@@ -353,6 +356,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
+| `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second) |
 | `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
 | Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |

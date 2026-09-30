@@ -35,9 +35,9 @@ class RegistrationTests(unittest.TestCase):
                 self.assertIsNotNone(scanbot.bot.get_command(name))
         self.assertIs(scanbot.bot.get_command('check'), scanbot.bot.get_command('scan'))
 
-    def test_scan_takes_one_required_attachment(self):
+    def test_scan_takes_a_required_attachment_first(self):
         params = scanbot.bot.tree.get_command('scan').parameters
-        self.assertEqual([p.name for p in params], ['file'])
+        self.assertEqual([p.name for p in params], ['file', 'edition'])
         self.assertEqual(params[0].type, discord.AppCommandOptionType.attachment)
         self.assertTrue(params[0].required)
 
@@ -101,7 +101,7 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.channel.send = mock.AsyncMock(return_value=self.progress)
         self.scan = scanbot.bot.get_command('scan').callback
 
-        async def fake_api(session, ip):
+        async def fake_api(session, ip, edition='java'):
             return scanbot.make_result(ip, ip, 3, 20, ['Steve'], '1.21', 'hello')
 
         patches = [
