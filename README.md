@@ -12,6 +12,8 @@ On any Linux machine with Docker, run this in the folder where you want the bot 
 curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash
 ```
 
+It asks for your bot token, starts the bot, and keeps it updated automatically.
+
 If it stops with `Your user can't talk to Docker` (Docker says "permission denied"), your account isn't allowed to use Docker. Run the same thing with `sudo`:
 
 ```bash
@@ -20,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | 
 
 With `sudo`, the `scanbot` folder belongs to root and the bot runs as root, so later `docker compose` commands in that folder need `sudo` too (Docker needs root or the `docker` group, the same reason the first command failed). To avoid that, run `sudo usermod -aG docker $USER` once, log out and back in, and use the first command instead.
 
-It asks for your bot token, starts the bot, and keeps it updated automatically. Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
+Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
 
 First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores `!` commands. The slash commands (`/scan`) don't need it.
 
@@ -120,7 +122,7 @@ The installer:
 2. Asks for your bot token (hidden while you type) and saves it to `data/token.txt`, readable only by you.
 3. Starts the bot, waits until it has logged in to Discord, and tells you if the token was rejected.
 
-Running it again is safe: it keeps your files and pulls the latest version. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`, or with sudo `curl -fsSL … | sudo DISCORD_TOKEN=your-token bash` (the variable goes after `sudo`; `sudo` drops variables set before it). To use a different folder name, set `SCANBOT_DIR` the same way.
+Running it again is safe: it keeps your files and pulls the latest version. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. With `sudo`, just answer the prompt: a token written on `sudo`'s command line would show up in `ps` and in sudo's log. To use a different folder name, set `SCANBOT_DIR` (with sudo: `… | sudo SCANBOT_DIR=name bash`).
 
 ### Docker Compose by hand
 
