@@ -18,12 +18,34 @@ from mcstatus import BedrockServer, JavaServer
 PINGER_PORT = 8765
 EDITIONS = ('java', 'bedrock')
 MAX_TIMEOUT = 10  # Seconds; the bot asks for its DIRECT_TIMEOUT
+BACKLOG = 1024    # Connections waiting to be accepted: the bot opens up to DIRECT_CONCURRENCY_TOTAL at once
+OPEN_FILES = 65536  # Open-file limit the pinger asks for: every ping in flight holds two sockets
 
 log = logging.getLogger('scanbot.pinger')
 
 
 def is_public_ip(ip):
     return ip.is_global and not ip.is_multicast
+
+
+def raise_file_limit(wanted):
+    """
+    Raises this process's open-file limit to `wanted`, or as far as the hard limit allows. Every ping in flight
+    holds a socket. Returns (limit now, hard limit), or None where there is no such limit (Windows).
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if soft != resource.RLIM_INFINITY and target > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+        except (ValueError, OSError):
+            pass
+    return soft, hard
 
 
 async def ping(ip, port, edition, timeout):
@@ -87,6 +109,8 @@ def make_app():
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)-8s %(name)s %(message)s')
     port = int(os.environ.get('PINGER_PORT', PINGER_PORT))
-    log.info("Pinger listening on :%d (pings leave through the VPN)", port)
+    limits = raise_file_limit(OPEN_FILES)
+    log.info("Pinger listening on :%d (pings leave through the VPN), %s files can be open at once", port,
+             limits[0] if limits else "any number of")
     # No access log: a scan sends thousands of requests
-    web.run_app(make_app(), port=port, print=None, access_log=None)
+    web.run_app(make_app(), port=port, print=None, access_log=None, backlog=BACKLOG)

@@ -47,6 +47,11 @@ services:
     command: ["python", "/app/pinger.py"]
     network_mode: service:gluetun
     user: "${SCANBOT_UID:-1000}:${SCANBOT_GID:-1000}"
+    # Every ping in flight holds two sockets: the bot's request and the connection to the server
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # Started as soon as gluetun runs, not only once the VPN is up: otherwise a VPN that doesn't
     # connect at first leaves the pinger never started. Nothing leaks meanwhile: gluetun's firewall
     # blocks all traffic but the VPN's until the VPN is up.

@@ -13,6 +13,11 @@ services:
     # Docker waits this long for that before killing it (without this line, 10 seconds or less).
     stop_grace_period: 45s
     init: true  # Docker's tiny init runs as PID 1 and passes the stop signal on to the bot
+    # Every ping in flight holds a socket (see DIRECT_CONCURRENCY below)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       # Set SLASH_ONLY=1 in .env to run without the Message Content intent (slash commands only)
@@ -21,6 +26,16 @@ services:
       DNS_TRANSPORT: ${DNS_TRANSPORT:-}
       # Time zone of the times in the bot's log (TZ in .env, default UTC)
       TZ: ${TZ:-UTC}
+      # Scan limits and speed: set these in .env (README, "Configuration"). Empty means the default.
+      MAX_IPS_PER_SCAN: ${MAX_IPS_PER_SCAN:-}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-}
+      DIRECT_CONCURRENCY: ${DIRECT_CONCURRENCY:-}
+      DIRECT_CONCURRENCY_TOTAL: ${DIRECT_CONCURRENCY_TOTAL:-}
+      DIRECT_TIMEOUT: ${DIRECT_TIMEOUT:-}
+      API_DELAY: ${API_DELAY:-}
+      GEO_DELAY: ${GEO_DELAY:-}
+      PROGRESS_INTERVAL: ${PROGRESS_INTERVAL:-}
+      GEO_DB_MAX_AGE_DAYS: ${GEO_DB_MAX_AGE_DAYS:-}
     volumes:
       - ./data:/data:ro
     labels:
