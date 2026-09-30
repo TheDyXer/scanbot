@@ -1,0 +1,42 @@
+# VPN for scanbot: every connection the bot makes goes through gluetun, a VPN client
+# container. If the VPN drops, the bot goes offline instead of using your own connection.
+#
+# The installer sets this up (curl ... | bash -s -- --vpn). By hand: put gluetun's settings
+# in vpn.env next to this file (see README, "VPN"), then add this line to .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.vpn.yml
+
+services:
+  gluetun:
+    image: ${GLUETUN_IMAGE:-qmcgaw/gluetun:v3}
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file: vpn.env
+    environment:
+      TZ: ${TZ:-UTC}
+      # gluetun's own DNS; the bot resolves names through Quad9 itself, inside the tunnel
+      DNS_UPSTREAM_RESOLVERS: quad9
+    volumes:
+      # gluetun keeps its VPN server list here
+      - ./vpn:/gluetun
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: scanbot
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  scanbot:
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      # Shown by the bot; set by the installer
+      VPN_PROVIDER: ${VPN_PROVIDER:-}
+      VPN_LOCATION: ${VPN_LOCATION:-}

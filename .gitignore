@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 *.mmdb
 *.mmdb.tmp
+vpn.env
+vpn/
