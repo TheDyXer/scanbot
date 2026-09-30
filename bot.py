@@ -5,13 +5,16 @@ import aiohttp
 from aiohttp.abc import AbstractResolver
 import asyncio
 import csv
+import datetime
 import dns.asyncresolver
 import dns.exception
 import dns.nameserver
 import dns.resolver
+import gzip
 import io
 import ipaddress
 import logging
+import maxminddb
 import os
 import re
 import socket
@@ -20,7 +23,12 @@ import time
 
 # --- CONFIGURATION ---
 MC_API_URL = 'https://api.mcstatus.io/v2/status/java/'
-GEO_BATCH_URL = 'http://ip-api.com/batch' # Using batch endpoint
+GEO_BATCH_URL = 'http://ip-api.com/batch' # Fallback for IPs the offline database doesn't know
+# Offline country database (DB-IP Lite, CC BY 4.0), next to bot.py unless GEO_DB_PATH is set
+GEO_DB_PATH = os.environ.get('GEO_DB_PATH') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dbip-country-lite.mmdb')
+GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
+USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
+GEO_DB_MAX_AGE_DAYS = 40  # DB-IP publishes a new database every month
 MAX_IPS_PER_SCAN = 5000
 DIRECT_CONCURRENCY = 50   # Direct pings running at the same time
 DIRECT_TIMEOUT = 3        # Seconds to wait for a server to answer a direct ping
@@ -184,6 +192,78 @@ def parse_api_status(ip, data):
     return make_result(ip, data.get('ip_address'), players.get('online'), players.get('max'), names,
                        version if isinstance(version, str) else None,
                        motd if isinstance(motd, str) else None)
+
+geo_db = None  # Offline country database, opened by load_geo_db() at startup
+
+def geo_db_age_days():
+    """Days since the database at GEO_DB_PATH was built, or None if it's missing or unreadable."""
+    try:
+        with maxminddb.open_database(GEO_DB_PATH) as db:
+            return (time.time() - db.metadata().build_epoch) / 86400
+    except Exception:
+        return None
+
+async def update_geo_db():
+    """
+    Downloads this month's DB-IP country database to GEO_DB_PATH, or last month's
+    if this month's isn't published yet. Returns True if it saved one.
+    """
+    today = datetime.date.today()
+    last_month = today.replace(day=1) - datetime.timedelta(days=1)
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver()),
+                                     headers={'User-Agent': USER_AGENT}) as session:
+        for month in (today.strftime('%Y-%m'), last_month.strftime('%Y-%m')):
+            try:
+                async with session.get(GEO_DB_URL.format(month=month), timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = gzip.decompress(await resp.read())
+            except Exception as e:
+                log.warning("Country database download failed: %s", e)
+                continue
+            # Write next to the old file, then swap, so a failed write never leaves half a database
+            tmp_path = GEO_DB_PATH + '.tmp'
+            with open(tmp_path, 'wb') as f:
+                f.write(data)
+            os.replace(tmp_path, GEO_DB_PATH)
+            log.info("Downloaded the DB-IP country database for %s", month)
+            return True
+    return False
+
+async def load_geo_db():
+    """Opens the offline country database, downloading or refreshing it first if needed."""
+    global geo_db
+    age = geo_db_age_days()
+    if age is None or age > GEO_DB_MAX_AGE_DAYS:
+        try:
+            await update_geo_db()
+        except OSError as e:
+            # e.g. a read-only install folder; keep using the old database if there is one
+            log.warning("Could not save the country database to %s: %s", GEO_DB_PATH, e)
+    geo_db = None
+    try:
+        geo_db = maxminddb.open_database(GEO_DB_PATH)
+        built = datetime.datetime.fromtimestamp(geo_db.metadata().build_epoch, datetime.timezone.utc)
+        log.info("Country database loaded (DB-IP, built %s)", built.strftime('%Y-%m-%d'))
+    except Exception as e:
+        log.warning("No country database (%s); flags come from ip-api.com only.", e)
+
+def lookup_countries(ips):
+    """
+    Looks up countries in the offline database. Returns {ip: country code} for the IPs it knows.
+    """
+    found = {}
+    if geo_db is None:
+        return found
+    for ip in ips:
+        try:
+            record = geo_db.get(ip)
+        except ValueError:  # Not an IP address
+            continue
+        code = ((record or {}).get('country') or {}).get('iso_code')
+        if code:
+            found[ip] = code
+    return found
 
 async def batch_get_locations(session, ips):
     """
@@ -412,7 +492,8 @@ async def help(ctx):
         value="Displays this help message.",
         inline=False
     )
-    embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use !scan.")
+    embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use !scan.\n"
+                          "Country flags: IP Geolocation by DB-IP (db-ip.com)")
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -487,12 +568,14 @@ async def check(ctx):
                 if retry and not stop_scan_event.is_set():
                     await run_api(session, retry, results, state, retrying=bool(bot.direct_ok))
 
-                # 3. Batch geolocation
+                # 3. Geolocation: offline database first (instant), ip-api.com for the rest
                 addresses = sorted({r['address'] for r in results.values() if r['address']})
-                if addresses and not stop_scan_event.is_set():
-                    state.update(phase="Resolving locations", done=0, total=len(addresses))
+                locations = lookup_countries(addresses)
+                unknown = [a for a in addresses if a not in locations]
+                if unknown and not stop_scan_event.is_set():
+                    state.update(phase="Resolving locations", done=len(locations), total=len(addresses))
                     await set_status("Resolving locations...")
-                    locations = await batch_get_locations(session, addresses)
+                    locations.update(await batch_get_locations(session, unknown))
                     state['done'] = len(addresses)
         finally:
             updater.cancel()
@@ -508,6 +591,7 @@ async def check(ctx):
 
 async def main():
     discord.utils.setup_logging(root=True)
+    await load_geo_db()
     # discord.py only builds its own connector if none is set, so Discord traffic uses Quad9 too
     bot.http.connector = aiohttp.TCPConnector(limit=0, resolver=Quad9Resolver())
     async with bot:

@@ -35,6 +35,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Changes monthly, so the build refreshes the country database layer instead of reusing the cache
+      - id: month
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
       - id: meta
         uses: docker/metadata-action@v6
         with:
@@ -49,6 +53,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          build-args: DBIP_MONTH=${{ steps.month.outputs.month }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
