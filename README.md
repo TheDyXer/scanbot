@@ -155,7 +155,7 @@ If the results don't fit in one Discord message, you get the summary and the top
 flowchart TD
     A[Bot starts] --> B{Direct ping to<br/>mc.hypixel.net works?}
     B -- yes --> C[Ping every server directly<br/>50 at a time, 3 s timeout]
-    B -- no --> D[Check every server via<br/>api.mcstatus.io, 5 per second]
+    B -- no --> D[Check via api.mcstatus.io<br/>5 per second]
     C -- no answer --> D
     C -- online --> E[Look up countries<br/>ip-api.com, 100 per batch]
     D -- online --> E
