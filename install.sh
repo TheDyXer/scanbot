@@ -4,7 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash
 #
 # Creates ./scanbot with docker-compose.yml and data/token.txt, then starts the bot.
-# Running it again is safe: it keeps your files and pulls the latest image.
+# Running it again is safe: it keeps your files and pulls the latest image. It also updates
+# docker-compose.yml, unless you changed it (the old one is kept as docker-compose.yml.bak).
 #
 # Options (after "bash -s --" when piping from curl):
 #   --vpn           set up, change or remove the VPN (asked automatically on the first install)
@@ -64,6 +65,76 @@ env_unset() {
 env_get() { grep -m1 "^$1=" .env 2>/dev/null | cut -d= -f2- || true; }
 vpn_enabled() { grep -q "^COMPOSE_FILE=.*docker-compose.vpn.yml" .env 2>/dev/null; }
 
+# --- docker-compose.yml ---
+# Every run brings docker-compose.yml up to date, but only if you haven't changed it. .env keeps the
+# digest of the copy the installer last wrote (SCANBOT_COMPOSE_DIGEST); for installs made before that,
+# these are the digests of every docker-compose.yml ever published. Deleting the watchtower block (see
+# the README, "Automatic updates") isn't a change, and neither are blank lines or trailing spaces.
+# Changing docker-compose.yml means adding its digest here: tests/test_installer.py checks that.
+KNOWN_COMPOSE_DIGESTS="
+6f16e74d995836bad8f870db1f873966bec5d86503f6d1b74a7bb87ae662e3ec
+e5015f8c2b2928c0a4e708d45520a4f178692785ffdd874afd3a9b054ec1bead
+3812215fcebc935031097339a51d82cdf908a2ba30e0deb521c9e7ece791a3a7
+6bd7892bcb419d4b4819ee314e4fd6824196d6024d84e11849df3f4719fe833c
+"
+
+# The compose file without the watchtower block (from its comment to the next service or top-level
+# key, or to the end) and without blank lines at the end
+drop_watchtower() {
+  awk '/^  # Automatic updates:/ || /^  watchtower:/ { skip = 1; next }
+       skip && (/^[A-Za-z]/ || /^  [A-Za-z]/) { skip = 0 }
+       !skip { line[++n] = $0 }
+       END { while (n > 0 && line[n] ~ /^[ \t\r]*$/) n--; for (i = 1; i <= n; i++) print line[i] }' "$1"
+}
+
+sha256_of_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+
+# What decides whether docker-compose.yml was changed: everything but the watchtower block, blank lines,
+# trailing spaces and Windows line endings
+compose_digest() {
+  drop_watchtower "$1" | tr -d '\r' | awk 'NF { sub(/[ \t]+$/, ""); print }' | sha256_of_stdin
+}
+
+known_compose_digest() { printf '%s\n' "${KNOWN_COMPOSE_DIGESTS}" | grep -qx "$1"; }
+
+fetch_compose() {
+  local tmp new old
+  tmp="$(mktemp)"
+  curl -fsSL "${RAW}/docker-compose.yml" -o "${tmp}" \
+    || { rm -f "${tmp}"; die "Couldn't download docker-compose.yml from ${RAW}"; }
+  new="$(compose_digest "${tmp}")"
+  if [ ! -f docker-compose.yml ]; then
+    cat "${tmp}" > docker-compose.yml
+    ok "Downloaded docker-compose.yml"
+  else
+    old="$(compose_digest docker-compose.yml)"
+    if [ "${old}" = "${new}" ]; then
+      ok "docker-compose.yml is up to date"
+    elif [ "${old}" = "$(env_get SCANBOT_COMPOSE_DIGEST)" ] || known_compose_digest "${old}"; then
+      cp docker-compose.yml docker-compose.yml.bak
+      if grep -q '^  watchtower:' docker-compose.yml; then
+        cat "${tmp}" > docker-compose.yml
+        ok "Updated docker-compose.yml (your old one is docker-compose.yml.bak)"
+      else
+        drop_watchtower "${tmp}" > docker-compose.yml
+        ok "Updated docker-compose.yml, still without the watchtower block (your old one is docker-compose.yml.bak)"
+      fi
+    else
+      rm -f "${tmp}"
+      warn "docker-compose.yml was changed by hand, so it's kept as it is. There's a newer one at ${RAW}/docker-compose.yml"
+      warn "To use it: mv docker-compose.yml docker-compose.yml.bak, run this installer again, then redo your changes."
+      return 0
+    fi
+  fi
+  rm -f "${tmp}"
+  env_set SCANBOT_COMPOSE_DIGEST "${new}"
+}
+
+# tests/test_installer.py sources this file for the functions above; nothing below runs then
+if (return 0 2>/dev/null); then return 0; fi
+
 VPN_SETUP=""
 for arg in "$@"; do
   case "${arg}" in
@@ -93,14 +164,6 @@ mkdir -p "${DIR}/data"
 cd "${DIR}"
 info "Installing into $(pwd)"
 
-if [ -f docker-compose.yml ]; then
-  ok "Keeping your existing docker-compose.yml"
-else
-  curl -fsSL "${RAW}/docker-compose.yml" -o docker-compose.yml \
-    || die "Couldn't download docker-compose.yml from ${RAW}"
-  ok "Downloaded docker-compose.yml"
-fi
-
 if [ -f .env ]; then
   ok "Keeping your existing .env"
 else
@@ -108,13 +171,14 @@ else
     echo "# Scanbot settings (read by docker compose)"
     echo "SCANBOT_UID=$(id -u)"
     echo "SCANBOT_GID=$(id -g)"
-    echo "# Time zone for the daily 4 AM update check, e.g. Europe/Budapest"
+    echo "# Time zone for the bot's log and the daily 4 AM update check, e.g. Europe/Budapest"
     echo "TZ=UTC"
     if [ -n "${SCANBOT_IMAGE:-}" ]; then echo "SCANBOT_IMAGE=${SCANBOT_IMAGE}"; fi
   } > .env
   ok "Created .env"
   VPN_SETUP="${VPN_SETUP:-yes}"  # First install: ask about the VPN too
 fi
+fetch_compose  # After .env, which keeps its digest
 IMAGE="$(env_get SCANBOT_IMAGE)"; IMAGE="${IMAGE:-ghcr.io/thedyxer/scanbot:latest}"
 GLUETUN_IMAGE="$(env_get GLUETUN_IMAGE)"; GLUETUN_IMAGE="${GLUETUN_IMAGE:-qmcgaw/gluetun:v3}"
 

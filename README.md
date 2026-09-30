@@ -122,7 +122,7 @@ The installer:
 2. Asks for your bot token (hidden while you type) and saves it to `data/token.txt`, readable only by you.
 3. Starts the bot, waits until it has logged in to Discord, and tells you if the token was rejected.
 
-Running it again is safe: it keeps your files and pulls the latest version. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. With `sudo`, just answer the prompt: a token written on `sudo`'s command line would show up in `ps` and in sudo's log. To use a different folder name, set `SCANBOT_DIR` (with sudo: `… | sudo SCANBOT_DIR=name bash`).
+Running it again is safe: it keeps your files and pulls the latest version. It also brings `docker-compose.yml` up to date, unless you changed it: the old copy is kept as `docker-compose.yml.bak`, and a file you edited is left alone (the installer tells you a newer one exists). Deleting the `watchtower:` block, as described in [Automatic updates](#automatic-updates), doesn't count as a change: the updated file leaves it out too. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. With `sudo`, just answer the prompt: a token written on `sudo`'s command line would show up in `ps` and in sudo's log. To use a different folder name, set `SCANBOT_DIR` (with sudo: `… | sudo SCANBOT_DIR=name bash`).
 
 ### Docker Compose by hand
 
@@ -156,11 +156,12 @@ To uninstall, run `docker compose down --rmi all` and delete the folder.
 The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one. A scan that is running at that moment is ended, so start very large scans (a 30,000-IP scan can take well over an hour) outside that time.
 
 - It only touches scanbot, never your other containers.
-- The time zone is `TZ` in `.env` (default `UTC`), for example `TZ=Europe/Budapest`.
+- The time zone is `TZ` in `.env` (default `UTC`), for example `TZ=Europe/Budapest`. It's also the time zone of the bot's log.
 - The image is also rebuilt weekly for security fixes, so expect a restart about once a week even without new features.
 - Watchtower needs access to the Docker socket to restart the bot.
+- Watchtower updates the bot, not `docker-compose.yml`. When a new version needs a changed compose file (a new setting, for example), run the [installer](#one-line-installer) again: it updates the file for you.
 
-**Already run Watchtower on this machine?** Delete the `watchtower:` block from `docker-compose.yml`. The scanbot container has the `com.centurylinklabs.watchtower.enable=true` label, so your existing Watchtower updates it. Keeping both can make an older Watchtower stop the new one.
+**Already run Watchtower on this machine?** Delete the `watchtower:` block from `docker-compose.yml`. The scanbot container has the `com.centurylinklabs.watchtower.enable=true` label, so your existing Watchtower updates it. Keeping both can make an older Watchtower stop the new one. When the installer updates `docker-compose.yml`, it leaves the block out again.
 
 **Don't want automatic updates?** Delete the `watchtower:` block and update with `docker compose pull && docker compose up -d` when you like.
 
@@ -329,7 +330,7 @@ Settings are at the top of `bot.py`:
 
 The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
 
-Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file. An install made before this setting existed keeps its own `docker-compose.yml`, which doesn't pass it on: add `SLASH_ONLY: ${SLASH_ONLY:-}` under `environment:` there, or delete `docker-compose.yml` and run the installer again.
+Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file. An install made before this setting existed has a `docker-compose.yml` that doesn't pass it on: run the installer again, which updates the file. If you changed the file yourself, the installer leaves it alone: add `SLASH_ONLY: ${SLASH_ONLY:-}` under `environment:` instead.
 
 Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate-limited, which makes scans slower, not faster.
 
@@ -352,7 +353,7 @@ The installer checks port 853 from a container. If it's blocked, it writes `DNS_
 | `dot` | Only TLS; the bot stops if port 853 is blocked |
 | `doh` | Only HTTPS |
 
-With Docker Compose, put it in the `.env` file. An install made before this setting existed keeps its own `docker-compose.yml`, which doesn't pass it on: add `DNS_TRANSPORT: ${DNS_TRANSPORT:-}` under `environment:` there, or delete `docker-compose.yml` and run the installer again. `auto` needs no setting.
+With Docker Compose, put it in the `.env` file. An install made before this setting existed has a `docker-compose.yml` that doesn't pass it on: run the installer again, which updates the file. If you changed the file yourself, the installer leaves it alone: add `DNS_TRANSPORT: ${DNS_TRANSPORT:-}` under `environment:` instead. `auto` needs no setting.
 
 To check port 853 from the machine running the bot:
 
@@ -562,6 +563,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 3 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
 | `PrivilegedIntentsRequired` at startup | `SLASH_ONLY` is off but the Message Content Intent isn't enabled | Enable the intent, or set `SLASH_ONLY=1` |
 | Installer says `Your user can't talk to Docker` (or Docker says "permission denied") | Your account isn't in the `docker` group | Run the installer with `sudo` (the `sudo bash` command in [Quick start](#quick-start)), or run `sudo usermod -aG docker $USER`, log out and back in, and run it without `sudo` |
+| Installer says `docker-compose.yml was changed by hand, so it's kept as it is` | You edited `docker-compose.yml`, and a newer one has been published since | Keep yours, or take the new one: `mv docker-compose.yml docker-compose.yml.bak`, run the installer again, then copy your changes over from the `.bak` |
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
