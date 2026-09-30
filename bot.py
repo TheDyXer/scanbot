@@ -721,8 +721,27 @@ async def send_channel(ctx, *args, **kwargs):
             file.reset()  # The failed upload already read them to the end
         return await ctx.send(*args, **kwargs)
 
+def speed_text(direct, api):
+    """
+    The results' speed line: servers checked per second, timed only while pinging and asking the API.
+    Geolocation, the VPN check and sending messages aren't part of it, and when both phases ran, each one's
+    own rate is shown too (the API phase is capped at 5 a second, shared by all scans, so it sets the pace).
+    `direct` and `api` are (servers checked, seconds) for a phase that ran, None for one that didn't.
+    Returns '' when there's nothing to show.
+    """
+    ran = {name: phase for name, phase in (('direct', direct), ('API', api)) if phase and phase[1] > 0}
+    if not ran:
+        return ''
+    checked = next(iter(ran.values()))[0]  # Every server goes through the first phase that ran
+    text = f"⚡ **Speed:** {checked / sum(seconds for _, seconds in ran.values()):.2f} IPs/sec"
+    if len(ran) == 2:
+        text += " (" + " · ".join(f"{name} {count / seconds:.2f}/s" for name, (count, seconds) in ran.items()) + ")"
+    elif 'API' in ran:
+        text += " (API)"
+    return text
+
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
-                       vpn_down=False):
+                       vpn_down=False, direct=None, api=None):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -736,8 +755,9 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         title += f" · {owner}"  # Several people may be scanning in the same channel
     summary = (f"{title}\n🟢 {len(populated)} with players · ⚪ {len(empty)} empty · 🔎 {total_ips} IPs\n"
                f"⏱️ **Time:** {minutes}m {seconds}s")
-    if not stopped and duration > 0:
-        summary += f"\n⚡ **Speed:** {total_ips / duration:.2f} IPs/sec"
+    speed = speed_text(direct, api)
+    if speed and not stopped:
+        summary += f"\n{speed}"
     if blocked:
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
     if vpn_down:
@@ -1047,7 +1067,7 @@ async def run_scan(ctx, scan, file, edition):
             await send_channel(ctx, f"🛑 {ctx.author.mention}, your queued scan was cancelled by {stopped_by.mention}.")
         return
 
-    start_time = time.time()
+    start_time = time.monotonic()  # Not time.time(): a clock adjustment mid-scan must not change the duration
     # Direct pings, unless the startup probe failed. With the VPN, pings only ever go through it:
     # while it's down, every server is checked through the API instead.
     direct_ok = await direct_pings_work(edition)
@@ -1069,19 +1089,24 @@ async def run_scan(ctx, scan, file, edition):
     updater = asyncio.create_task(report_progress(progress, state))
     results = {}
     locations = {}
+    direct = api = None  # (servers checked, seconds) for each phase that ran, for the speed line
 
     try:
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver())) as session:
             # 1. Direct pings, many at once
             if direct_ok:
+                began = time.monotonic()
                 retry = await run_direct(ips, results, state, edition, stop=scan.stop)
+                direct = (len(ips) - state['blocked'], time.monotonic() - began)
             else:
                 retry = ips
 
             # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans
             if retry and not scan.stop.is_set():
+                began = time.monotonic()
                 await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition,
                               stop=scan.stop, vpn_down=no_vpn)
+                api = (len(retry), time.monotonic() - began)
 
             # 3. Geolocation: offline database first (instant), ip-api.com for the rest
             addresses = sorted({r['address'] for r in results.values() if r['address']})
@@ -1101,8 +1126,9 @@ async def run_scan(ctx, scan, file, edition):
     except discord.HTTPException:
         pass
 
-    await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.time() - start_time,
-                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn)
+    await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
+                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
+                       direct=direct, api=api)
 
 async def main():
     discord.utils.setup_logging(root=True)

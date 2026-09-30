@@ -243,13 +243,18 @@ Then the results, sorted by player count. Example from a test run:
 📊 Scan Complete! · @Steve
 🟢 2 with players · ⚪ 1 empty · 🔎 4 IPs
 ⏱️ Time: 0m 4s
-⚡ Speed: 0.82 IPs/sec
+⚡ Speed: 1.00 IPs/sec (direct 1.33/s · API 2.00/s)
 
 🟢 Servers with Players (2):
 🇨🇦 mc.hypixel.net | Players: 21893/200000 | Ver: Requires MC 1.8 / 1.21
    └ 📝 Hypixel Network [1.8/26.3]  SKYBLOCK 0.27.1 TORRHUS & SAFARI
 …
 ```
+
+**Time** is the whole scan. **Speed** is servers checked per second, timed only while pinging and asking the API, so looking up countries and sending the results don't slow it down. When both ran, it also shows each one's own rate:
+
+- **direct** is how fast your connection pings: at most about 16 a second (`DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT`) when most servers don't answer.
+- **API** is at most 5 a second, shared by every scan running at the same time, so two scans that use the API show about 2.5 each. When direct pings are blocked, every server goes through the API and the line ends with `(API)`.
 
 If the results don't fit in one Discord message, you get the summary and the top 10 servers in chat, with the full list attached:
 
