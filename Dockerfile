@@ -42,7 +42,7 @@ else:
     raise SystemExit("Could not download the DB-IP country database")
 EOF
 
-COPY bot.py pinger.py vpn_select.py ./
+COPY bot.py pinger.py vpn_select.py vpn_switch.py ./
 
 # The bot reads token.txt from its working directory, so mount the folder
 # holding token.txt at /data

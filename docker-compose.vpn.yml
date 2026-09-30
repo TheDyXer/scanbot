@@ -20,9 +20,13 @@ services:
     environment:
       TZ: ${TZ:-UTC}
       DNS_UPSTREAM_RESOLVERS: quad9
-    # Never publish the pinger's port (8765) here: that would let anyone on your network use it
+      # The bot asks gluetun's control server to change Mullvad servers every few minutes
+      HTTP_CONTROL_SERVER_LOG: "off"
+    # Never publish the pinger's port (8765) or gluetun's control server (8000) here:
+    # that would let anyone on your network use them
     volumes:
-      # gluetun keeps its VPN server list here
+      # gluetun keeps its VPN server list here. With Mullvad, vpn/auth/config.toml (made by the
+      # installer) lets the bot switch servers with GLUETUN_API_KEY, and nothing else.
       - ./vpn:/gluetun
     labels:
       com.centurylinklabs.watchtower.enable: "true"
@@ -64,6 +68,10 @@ services:
     environment:
       # Pings go to the pinger in the VPN; everything else uses this machine's connection
       PINGER_URL: http://gluetun:8765
-      # Shown by the bot; set by the installer
+      # Set by the installer
       VPN_PROVIDER: ${VPN_PROVIDER:-}
       VPN_LOCATION: ${VPN_LOCATION:-}
+      # Mullvad only: switch to another server when the current one is down
+      GLUETUN_URL: http://gluetun:8000
+      GLUETUN_API_KEY: ${GLUETUN_API_KEY:-}
+      VPN_FALLBACK_CITIES: ${VPN_FALLBACK_CITIES:-}
