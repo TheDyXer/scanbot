@@ -207,6 +207,17 @@ class OutputTests(unittest.TestCase):
         self.assertEqual([r[-1] for r in rows[1:]], ['Java', 'Bedrock'])
 
 
+class EditionErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mistyped_edition_gets_a_helpful_reply(self):
+        ctx = mock.MagicMock(send=mock.AsyncMock())
+        error = commands.BadLiteralArgument(mock.MagicMock(), ('java', 'bedrock'), [], 'bedorck')
+        with self.assertNoLogs('scanbot', level='ERROR'):
+            await scanbot.bot.on_command_error(ctx, error)
+        message = ctx.send.await_args.args[0]
+        self.assertIn('bedrock', message)
+        self.assertIn('java', message)
+
+
 class EditionOptionTests(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_offers_the_two_editions(self):
         params = {p.name: p for p in scanbot.bot.tree.get_command('scan').parameters}

@@ -629,6 +629,8 @@ async def on_ready():
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredAttachment):
         await ctx.send("❌ Please attach a `.txt` file.")
+    elif isinstance(error, commands.BadLiteralArgument):
+        await ctx.send("❌ The edition must be `java` or `bedrock`, for example `!scan bedrock`.")
     elif not isinstance(error, commands.CommandNotFound):
         log.error("Command %s failed", ctx.command, exc_info=error)
 
