@@ -1,8 +1,8 @@
 # Scanbot
 
-A Discord bot that checks a list of Minecraft Java servers and tells you which ones are online, how many players they have, and where they are.
+A Discord bot that checks a list of Minecraft servers (Java or Bedrock Edition) and tells you which ones are online, how many players they have, and where they are.
 
-Drop a `.txt` file of IPs into Discord with `!scan`, watch the progress message count up, and get the results in chat or as a `.txt` / `.csv` file.
+Drop a `.txt` file of IPs into Discord with `/scan` (or `!scan`), watch the progress message count up, and get the results in chat or as a `.txt` / `.csv` file.
 
 ## Quick start
 
@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | 
 
 It asks for your bot token, starts the bot, and keeps it updated automatically. Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
 
-First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores commands.
+First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores `!` commands. The slash commands (`/scan`) don't need it.
 
 ## Contents
 
@@ -36,13 +36,16 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 
 ## Features
 
+- **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
 - **Fast scans:** pings servers directly, 50 at a time, and retries the ones that don't answer through `api.mcstatus.io`
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
-- **`!stop` at any point**, which posts what was found so far
+- **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
+- **`/stop` at any point**, which posts what was found so far
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
 - **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
+- **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
 - **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS
 - One scan at a time, up to 5,000 IPs per scan
@@ -53,7 +56,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
 2. Open **Bot**:
    - Click **Reset Token** and copy the token. You'll need it for `DISCORD_TOKEN`.
-   - Under **Privileged Gateway Intents**, turn on **Message Content Intent**. Without it the bot logs in but never sees `!scan`.
+   - Under **Privileged Gateway Intents**, turn on **Message Content Intent** if you want the `!` commands. Without it the bot logs in but never sees `!scan`. Slash commands don't need it: set `SLASH_ONLY=1` to run without that intent (see [Configuration](#configuration)).
 3. Invite the bot to your server. Replace `<CLIENT_ID>` with the **Application ID** from **General Information**:
 
    ```
@@ -70,6 +73,8 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
    | Attach Files | `scan_results.txt` / `.csv` |
 
 Commands also work in a direct message to the bot.
+
+The `bot` scope already includes `applications.commands`, so the slash commands appear once the bot has started and synced them. If `/scan` doesn't show up, wait a minute and restart Discord (Ctrl+R).
 
 ## Installation
 
@@ -174,16 +179,18 @@ The log (`docker compose logs scanbot`, or the terminal without Docker) says whi
 or, if your network blocks Minecraft's port:
 
 ```
-[2026-01-01 12:00:00] [WARNING ] scanbot: Direct ping to mc.hypixel.net failed; scans use the mcstatus.io API only (5 checks/second).
+[2026-01-01 12:00:00] [WARNING ] scanbot: Direct pings to demo.mcstatus.io, play.cubecraft.net, play.wynncraft.com all failed; scans use the mcstatus.io API only (5 checks/second).
 ```
 
 ## Usage
 
 | Command | What it does |
 | --- | --- |
-| `!scan` (or `!check`) + attached `.txt` | Scans every server in the file |
-| `!stop` | Stops the running scan and posts what it found so far |
-| `!help` | Lists the commands |
+| `/scan file:<.txt> [edition]` (or `!scan [edition]` + attached `.txt`) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file |
+| `/stop` (or `!stop`) | Stops the running scan and posts what it found so far |
+| `/help` (or `!help`) | Lists the commands |
+
+Progress and results are posted as normal messages in the channel, not as replies to the slash command: Discord stops accepting replies to a slash command after 15 minutes, and a big scan can take longer. The bot needs **Send Messages** in that channel, otherwise it falls back to replying.
 
 ### The IP list
 
@@ -197,8 +204,10 @@ play.example.com
 play.example.com:25566
 ```
 
-- Up to **5,000** servers per scan
+- Up to **5,000** servers per scan, in a file of at most 1 MB
+- Lines without a port use **25565** for Java and **19132** for Bedrock. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many
+- Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
 - IPv6 addresses aren't supported
 - Only the first attachment on the message is read
 
@@ -234,7 +243,7 @@ If the results don't fit in one Discord message, you get the summary and the top
 
 ```mermaid
 flowchart TD
-    A[Bot starts] --> B{Direct ping to<br/>mc.hypixel.net works?}
+    A[Bot starts] --> B{Direct ping to a probe<br/>server works?}
     B -- yes --> C[Ping every server directly<br/>50 at a time, 3 s timeout]
     B -- no --> D[Check via api.mcstatus.io<br/>5 per second]
     C -- no answer --> D
@@ -243,13 +252,13 @@ flowchart TD
     E --> F[Post results]
 ```
 
-1. **Direct pings.** When the bot starts it pings `mc.hypixel.net`. If that works, scans ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
+1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
    - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
 
-`!stop` works in every phase. Pings already in flight finish (at most 3 seconds), and nothing new starts.
+`/stop` works in every phase. Pings already in flight finish (at most 3 seconds), and nothing new starts.
 
 ## Configuration
 
@@ -262,18 +271,21 @@ Settings are at the top of `bot.py`:
 | `DIRECT_TIMEOUT` | `3` | Seconds to wait for a server to answer a direct ping |
 | `API_DELAY` | `0.2` | Seconds between API requests (mcstatus.io allows 5/second) |
 | `GEO_DELAY` | `4` | Seconds between ip-api.com batches (15/minute allowed) |
-| `PROBE_SERVER` | `mc.hypixel.net` | Server pinged at startup to test direct pings |
+| `PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `play.wynncraft.com` | Java servers pinged at startup to test direct pings; one answer is enough |
+| `BEDROCK_PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `geo.hivebedrock.network` | The same for Bedrock (UDP) |
 | `PROGRESS_INTERVAL` | `3` | Seconds between progress message updates |
 | `INLINE_LIMIT` | `1900` | Results longer than this many characters are sent as files |
 | `GEO_DB_MAX_AGE_DAYS` | `40` | Download a new country database when the current one is older than this (without Docker) |
 
 The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
 
+Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file. An install made before this setting existed keeps its own `docker-compose.yml`, which doesn't pass it on: add `SLASH_ONLY: ${SLASH_ONLY:-}` under `environment:` there, or delete `docker-compose.yml` and run the installer again.
+
 Lowering `API_DELAY` or `GEO_DELAY` below the services' limits gets the bot rate-limited, which makes scans slower, not faster.
 
 ## DNS: Quad9 over TLS
 
-Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used.
+Every hostname the bot looks up goes to [Quad9](https://quad9.net) over DNS-over-TLS (port 853), with 9.9.9.9 as primary and 149.112.112.112 as backup. That includes Discord, the APIs, and the servers in your list. Your system DNS isn't used, and direct pings connect to the address Quad9 returned.
 
 Check that port 853 works from the machine running the bot:
 
@@ -337,17 +349,21 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Bot is online but ignores `!scan` | Message Content Intent is off | Turn it on in the Developer Portal → **Bot** → **Privileged Gateway Intents**, then restart the bot |
+| Bot is online but ignores `!scan` | Message Content Intent is off | Use `/scan`, which doesn't need it, or turn the intent on in the Developer Portal → **Bot** → **Privileged Gateway Intents** and restart the bot |
+| `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 3 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
+| `PrivilegedIntentsRequired` at startup | `SLASH_ONLY` is off but the Message Content Intent isn't enabled | Enable the intent, or set `SLASH_ONLY=1` |
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
-| `Direct ping to mc.hypixel.net failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
+| `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second) |
+| `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
 | Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
-| `⏳ Bot is busy` | Another scan is running | Wait, or `!stop` it |
+| `⏳ Bot is busy` | Another scan is running | Wait, or `/stop` it |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
-| Servers show 🏳️ instead of a flag | The IP isn't in the country database (for example a private `10.x` or `192.168.x` address) and ip-api.com didn't know it either, or was rate-limited | Normal for private addresses. For public ones, scan again in a minute |
+| `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
+| Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
 | Many known-online servers missing | mcstatus.io rate-limited the bot | Don't run other tools using the API from the same IP; leave `API_DELAY` at `0.2` or higher |
 

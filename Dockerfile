@@ -2,7 +2,7 @@
 FROM python:3.13-slim
 
 LABEL org.opencontainers.image.source="https://github.com/TheDyXer/scanbot" \
-      org.opencontainers.image.description="Discord bot that scans lists of Minecraft Java servers" \
+      org.opencontainers.image.description="Discord bot that scans lists of Minecraft Java and Bedrock servers" \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONUNBUFFERED=1 \
