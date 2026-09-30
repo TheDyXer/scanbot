@@ -6,11 +6,13 @@ Drop a `.txt` file of IPs into Discord with `!scan`, watch the progress message 
 
 ## Quick start
 
+On any Linux machine with Docker, run this in the folder where you want the bot to live:
+
 ```bash
-pip install -r requirements.txt
-export DISCORD_TOKEN="your-bot-token"   # PowerShell: $env:DISCORD_TOKEN = "your-bot-token"
-python bot.py
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash
 ```
+
+It asks for your bot token, starts the bot, and keeps it updated automatically. Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
 
 First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores commands.
 
@@ -19,11 +21,15 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - [Features](#features)
 - [Discord bot setup](#discord-bot-setup)
 - [Installation](#installation)
+  - [One-line installer](#one-line-installer)
+  - [Docker Compose by hand](#docker-compose-by-hand)
+  - [Automatic updates](#automatic-updates)
+  - [Without Docker](#without-docker)
 - [Usage](#usage)
 - [How scanning works](#how-scanning-works)
 - [Configuration](#configuration)
 - [DNS: Quad9 over TLS](#dns-quad9-over-tls)
-- [Keep it running (Linux)](#keep-it-running-linux)
+- [Keep it running without Docker (Linux)](#keep-it-running-without-docker-linux)
 - [Troubleshooting](#troubleshooting)
 - [Credits](#credits)
 
@@ -39,6 +45,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
 - **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS
 - One scan at a time, up to 5,000 IPs per scan
+- **Docker image** for `amd64` and `arm64`, a one-line installer, and automatic daily updates
 
 ## Discord bot setup
 
@@ -65,6 +72,75 @@ Commands also work in a direct message to the bot.
 
 ## Installation
 
+Docker is the easiest way: one command installs the bot, and it updates itself. The image runs on `amd64` and `arm64` (for example a Raspberry Pi 4 or 5).
+
+### One-line installer
+
+Needs Docker with the Compose plugin ([install Docker](https://docs.docker.com/engine/install/)). Run this in the folder where you want the bot to live:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash
+```
+
+The installer:
+
+1. Creates a `scanbot` folder with the compose file and a `data` folder next to it:
+
+   ```text
+   scanbot/
+   ├── docker-compose.yml
+   ├── .env              # settings: user ID, time zone
+   └── data/
+       └── token.txt     # your bot token
+   ```
+
+2. Asks for your bot token (hidden while you type) and saves it to `data/token.txt`, readable only by you.
+3. Starts the bot, waits until it has logged in to Discord, and tells you if the token was rejected.
+
+Running it again is safe: it keeps your files and pulls the latest version. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. To use a different folder name, set `SCANBOT_DIR`.
+
+### Docker Compose by hand
+
+This works everywhere Docker does, including Docker Desktop on Windows and macOS:
+
+1. Make a folder and download [`docker-compose.yml`](docker-compose.yml) into it.
+2. Create a `data` folder next to it and put your token in `data/token.txt`.
+3. Start it:
+
+   ```bash
+   docker compose up -d
+   ```
+
+Instead of `token.txt` you can set `DISCORD_TOKEN=your-token` in a `.env` file next to `docker-compose.yml`.
+
+On Linux the bot runs as user `1000` by default. If your user ID is different (check with `id -u`), add `SCANBOT_UID=<your uid>` and `SCANBOT_GID=<your gid>` to `.env`, or the bot can't read `token.txt`. The installer does this for you.
+
+Everyday commands, run in the folder with `docker-compose.yml`:
+
+| Command | What it does |
+| --- | --- |
+| `docker compose logs -f scanbot` | Follow the bot's log |
+| `docker compose restart scanbot` | Restart the bot, for example after changing the token |
+| `docker compose pull && docker compose up -d` | Update now |
+| `docker compose down` | Stop the bot |
+
+To uninstall, run `docker compose down --rmi all` and delete the folder.
+
+### Automatic updates
+
+The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one.
+
+- It only touches scanbot, never your other containers.
+- The time zone is `TZ` in `.env` (default `UTC`), for example `TZ=Europe/Budapest`.
+- The image is also rebuilt weekly for security fixes, so expect a restart about once a week even without new features.
+- Watchtower needs access to the Docker socket to restart the bot.
+
+**Already run Watchtower on this machine?** Delete the `watchtower:` block from `docker-compose.yml`. The scanbot container has the `com.centurylinklabs.watchtower.enable=true` label, so your existing Watchtower updates it. Keeping both can make an older Watchtower stop the new one.
+
+**Don't want automatic updates?** Delete the `watchtower:` block and update with `docker compose pull && docker compose up -d` when you like.
+
+### Without Docker
+
 Requires **Python 3.10+**.
 
 ```bash
@@ -84,7 +160,11 @@ Then run:
 python bot.py
 ```
 
-The startup log says which scan mode you're in:
+To keep it running and start it at boot, see [Keep it running without Docker](#keep-it-running-without-docker-linux).
+
+### Startup log
+
+The log (`docker compose logs scanbot`, or the terminal without Docker) says which scan mode you're in:
 
 ```
 [2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings work; scans use direct pings with API fallback.
@@ -207,9 +287,11 @@ On Windows: `Test-NetConnection 9.9.9.9 -Port 853` should show `TcpTestSucceeded
    dns.nameserver.DoHNameserver('https://dns.quad9.net/dns-query', bootstrap_address='9.9.9.9'),
    ```
 
-## Keep it running (Linux)
+With Docker, that means building your own image: make the change in a clone, add `httpx` to `requirements.txt`, run `docker build -t scanbot-doh .`, set `SCANBOT_IMAGE=scanbot-doh` in `.env`, and delete the `watchtower:` block (it can only update published images).
 
-A systemd service restarts the bot if it crashes and starts it at boot. It assumes the bot lives in `/opt/scanbot` and runs as a user called `scanbot`; adjust to taste.
+## Keep it running without Docker (Linux)
+
+With Docker this is already handled: the bot restarts on crashes and at boot. Without Docker, a systemd service restarts the bot if it crashes and starts it at boot. It assumes the bot lives in `/opt/scanbot` and runs as a user called `scanbot`; adjust to taste.
 
 `/etc/scanbot.env` (readable only by root, `chmod 600`):
 
@@ -250,6 +332,10 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Bot is online but ignores `!scan` | Message Content Intent is off | Turn it on in the Developer Portal → **Bot** → **Privileged Gateway Intents**, then restart the bot |
+| Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
+| `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
+| `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
+| Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
 | `Direct ping to mc.hypixel.net failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
 | Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
