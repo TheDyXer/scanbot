@@ -96,12 +96,18 @@ scan_lock = asyncio.Lock()
 stop_scan_event = asyncio.Event()
 bot.direct_ok = None  # Set by the startup probe in on_ready
 
+def to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
 def make_result(ip, address, players, players_max, names, version, motd):
     return {
         "ip": ip,
-        "address": address,  # Resolved IP, used for geolocation
-        "players": players or 0,
-        "max": players_max or 0,
+        "address": address if isinstance(address, str) else None,  # Resolved IP, used for geolocation
+        "players": to_int(players),
+        "max": to_int(players_max),
         "names": names,
         "version": version or 'Unknown',
         "motd": (motd or '').strip().replace('\n', '  '),
@@ -143,15 +149,41 @@ async def check_api(session, ip):
         except Exception:
             return None
 
-        if not data.get('online', False):
+        try:
+            return parse_api_status(ip, data)
+        except Exception as e:
+            log.warning("Unexpected mcstatus.io response for %s: %s", ip, e)
             return None
-
-        players = data.get('players') or {}
-        names = [p.get('name_clean') or p.get('name') for p in players.get('list') or []]
-        return make_result(ip, data.get('ip_address'), players.get('online'), players.get('max'),
-                           [n for n in names if n], (data.get('version') or {}).get('name_clean'),
-                           (data.get('motd') or {}).get('clean'))
     return None
+
+def parse_api_status(ip, data):
+    """
+    Turns an mcstatus.io response into a result, or None if the server is offline.
+    Tolerates missing or oddly typed fields so one strange server can't break a scan.
+    """
+    if not isinstance(data, dict) or not data.get('online', False):
+        return None
+
+    players = data.get('players')
+    if not isinstance(players, dict):
+        players = {}
+    names = []
+    for p in players.get('list') or []:
+        if isinstance(p, dict):
+            p = p.get('name_clean') or p.get('name')
+        if isinstance(p, str) and p:
+            names.append(p)
+
+    version = data.get('version')
+    if isinstance(version, dict):
+        version = version.get('name_clean') or version.get('name_raw')
+    motd = data.get('motd')
+    if isinstance(motd, dict):
+        motd = motd.get('clean') or motd.get('raw')
+
+    return make_result(ip, data.get('ip_address'), players.get('online'), players.get('max'), names,
+                       version if isinstance(version, str) else None,
+                       motd if isinstance(motd, str) else None)
 
 async def batch_get_locations(session, ips):
     """
