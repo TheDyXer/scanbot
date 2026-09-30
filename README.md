@@ -29,6 +29,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - [How scanning works](#how-scanning-works)
 - [Configuration](#configuration)
 - [DNS: Quad9 over TLS](#dns-quad9-over-tls)
+- [VPN](#vpn)
 - [Keep it running without Docker (Linux)](#keep-it-running-without-docker-linux)
 - [Troubleshooting](#troubleshooting)
 - [Credits](#credits)
@@ -324,6 +325,93 @@ On Windows: `Test-NetConnection 9.9.9.9 -Port 853` should show `TcpTestSucceeded
 
 With Docker, that means building your own image: make the change in a clone, add `httpx` to `requirements.txt`, run `docker build -t scanbot-doh .`, set `SCANBOT_IMAGE=scanbot-doh` in `.env`, and delete the `watchtower:` block (it can only update published images).
 
+## VPN
+
+With Docker, the bot can send all its traffic through a VPN: Discord, the APIs, and every server it scans. That's useful for two reasons:
+
+- **Privacy:** scans come from the VPN's address, not yours.
+- **Blocked port:** if your router or ISP blocks Minecraft's port 25565, the tunnel gets around it and the fast direct pings work again.
+
+It uses [gluetun](https://github.com/qdm12/gluetun), a VPN client container; the bot shares its network. **If the VPN drops, the bot goes offline until it reconnects.** It never falls back to your own connection.
+
+### Providers
+
+| | Mullvad | Proton VPN | Cloudflare WARP |
+| --- | --- | --- | --- |
+| Cost | Paid | Free plan or paid | Free |
+| Setup | Paste the key from a WireGuard config | Paste the key from a WireGuard config | Automatic |
+| Location | Fastest city, tested when you set it up | Fastest city (free plan: 19 cities) | Nearest Cloudflare site, automatically |
+| Hides your country | Yes | Yes | No: WARP exits in your own country |
+| Terms | No rule against scanning | Forbid "attempting to access, probe, or connect to computing devices without proper authorization"; big scans of other people's servers may count | Cloudflare's WARP terms |
+
+Proton also has virtual locations: a city in the list can be hosted in another country, so the fastest one can be an unexpected place. Just pick another from the list.
+
+### Set it up
+
+The installer asks on the first install. To add, change or remove the VPN later, run it with `--vpn`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash -s -- --vpn
+```
+
+- **Mullvad:** on [mullvad.net → WireGuard configuration](https://mullvad.net/en/account/wireguard-config), generate a key and download a config file. The installer asks for its `PrivateKey` and `Address` lines.
+- **Proton VPN:** on [account.proton.me → WireGuard](https://account.proton.me/u/0/vpn/WireGuard), create a configuration (a free server if you're on the free plan). The installer asks for its `PrivateKey`.
+- **Cloudflare WARP:** nothing to do. The installer registers a free, anonymous WARP device with [wgcf](https://github.com/ViRb3/wgcf).
+
+Running `--vpn` again with the same provider tests the cities again; press Enter to keep your key.
+
+### How the fastest location is picked
+
+The installer pings two servers in every city your provider has, from your machine and outside the VPN. That takes a few seconds. Then it lists the five fastest:
+
+```text
+Fastest Mullvad locations from here:
+  1) Belgrade, Serbia                   8 ms
+  2) Zagreb, Croatia                    21 ms
+  3) Bratislava, Slovakia               22 ms
+Choose [1-5] (Enter = 1):
+```
+
+The VPN then connects to any server in that city, and moves to another one there if a server fails.
+
+### Set it up by hand
+
+1. Download [`docker-compose.vpn.yml`](docker-compose.vpn.yml) next to `docker-compose.yml`.
+2. Create `vpn.env` next to it, readable only by you (`chmod 600 vpn.env`), with gluetun's settings. For example:
+
+   ```ini
+   # Mullvad
+   VPN_SERVICE_PROVIDER=mullvad
+   VPN_TYPE=wireguard
+   WIREGUARD_PRIVATE_KEY=<PrivateKey from your config>
+   WIREGUARD_ADDRESSES=<IPv4 Address from your config, like 10.64.12.34/32>
+   SERVER_CITIES=Belgrade
+   ```
+
+   For Proton, use `VPN_SERVICE_PROVIDER=protonvpn`, leave out `WIREGUARD_ADDRESSES`, and add `FREE_ONLY=on` on the free plan. See gluetun's [Mullvad](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/mullvad.md), [Proton](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/protonvpn.md) and [custom WireGuard](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/custom.md) pages for every option.
+3. Add this line to `.env`:
+
+   ```ini
+   COMPOSE_FILE=docker-compose.yml:docker-compose.vpn.yml
+   ```
+
+   On Windows, use `;` between the file names and also add `COMPOSE_PATH_SEPARATOR=;`.
+4. Run `docker compose up -d`.
+
+To find the fastest city yourself:
+
+```bash
+docker run --rm -v ./vpn:/gluetun qmcgaw/gluetun:v3 format-servers -mullvad > /dev/null
+docker run --rm -v ./vpn:/gluetun:ro ghcr.io/thedyxer/scanbot python /app/vpn_select.py --provider mullvad
+```
+
+### Good to know
+
+- **Updates:** Watchtower also updates gluetun, and restarts the bot along with it.
+- **What gets extra access:** gluetun needs the `NET_ADMIN` capability and `/dev/net/tun` to create the tunnel. The WARP keys come from wgcf, a third-party open-source tool; the installer pins version 2.3.0 and checks its SHA-256 before running it.
+- **Some servers ignore VPN addresses.** Hypixel, for example, doesn't answer Mullvad's.
+- **mcstatus.io's limit is per address.** Its limit of 5 requests per second is per IP address, and a VPN address is shared with other people, so the API fallback can be rate-limited sooner.
+
 ## Keep it running without Docker (Linux)
 
 With Docker this is already handled: the bot restarts on crashes and at boot. Without Docker, a systemd service restarts the bot if it crashes and starts it at boot. It assumes the bot lives in `/opt/scanbot` and runs as a user called `scanbot`; adjust to taste.
@@ -372,6 +460,9 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
+| Installer says `The VPN didn't connect` | Wrong key, or your network blocks the VPN's UDP port | Check the key in `vpn.env`, or run the installer again with `--vpn`. For a blocked port, add `WIREGUARD_ENDPOINT_PORT=53` (Mullvad also takes `123`) to `vpn.env`, then `docker compose up -d` |
+| Bot went offline while using a VPN | The VPN dropped, and the bot waits for it instead of using your connection | `docker compose logs gluetun`; it reconnects by itself, usually within seconds |
+| WARP connects but the bot can't reach anything | The packet size (MTU) is too big for your network | Lower `WIREGUARD_MTU=1280` to `1200` in `vpn.env`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
 | `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second) |
 | `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
@@ -394,6 +485,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 - [IP Geolocation by DB-IP](https://db-ip.com): the offline country database (DB-IP Lite), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 - [ip-api.com](https://ip-api.com): fallback IP geolocation. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
 - [dnspython](https://www.dnspython.org) and [Quad9](https://quad9.net): encrypted DNS
+- [gluetun](https://github.com/qdm12/gluetun): VPN client container, and its server lists
+- [wgcf](https://github.com/ViRb3/wgcf): Cloudflare WARP keys
 
 ## License
 
