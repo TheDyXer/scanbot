@@ -1,0 +1,10 @@
+.git
+.github
+__pycache__
+*.pyc
+token.txt
+data/
+.env
+docker-compose.yml
+install.sh
+README.md

@@ -1,0 +1,43 @@
+# Scanbot
+# 1. Put your Discord bot token in ./data/token.txt (or set DISCORD_TOKEN in .env)
+# 2. docker compose up -d
+# Logs: docker compose logs -f scanbot
+
+services:
+  scanbot:
+    image: ${SCANBOT_IMAGE:-ghcr.io/thedyxer/scanbot:latest}
+    restart: unless-stopped
+    # Run as the owner of ./data so the bot can read token.txt (the installer sets these in .env)
+    user: "${SCANBOT_UID:-1000}:${SCANBOT_GID:-1000}"
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+    volumes:
+      - ./data:/data:ro
+    labels:
+      # Picked up by the watchtower service below, or by a Watchtower you already run
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: scanbot
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  # Automatic updates: checks for a new scanbot image daily at 4 AM (TZ in .env, default UTC)
+  # and only ever touches scanbot. Already run Watchtower on this host? Delete this block;
+  # the labels above let your existing one update scanbot instead.
+  watchtower:
+    image: nickfedor/watchtower:latest
+    restart: unless-stopped
+    command: --scope scanbot --label-enable --include-restarting --cleanup --schedule "0 0 4 * * *"
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      com.centurylinklabs.watchtower.scope: scanbot
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

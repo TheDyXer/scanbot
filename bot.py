@@ -69,8 +69,13 @@ if not TOKEN:
         with open('token.txt', 'r') as f:
             TOKEN = f.read().strip()
     except FileNotFoundError:
-        print("❌ Error: set DISCORD_TOKEN or create token.txt.")
+        pass
+    except OSError as e:
+        print(f"❌ Error: can't read {os.path.abspath('token.txt')}: {e}")
         sys.exit(1)
+if not TOKEN:
+    print(f"❌ Error: no Discord token. Set DISCORD_TOKEN or put the token in {os.path.abspath('token.txt')}.")
+    sys.exit(1)
 
 # host or IP, optionally with :port
 ADDRESS_RE = re.compile(r'^[A-Za-z0-9._-]+(:\d{1,5})?$')
