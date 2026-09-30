@@ -253,7 +253,7 @@ Then the results, sorted by player count. Example from a test run:
 
 **Time** is the whole scan. **Speed** is servers checked per second, timed only while pinging and asking the API, so looking up countries and sending the results don't slow it down. When both ran, it also shows each one's own rate:
 
-- **direct** is how fast your connection pings: at most about 16 a second (`DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT`) when most servers don't answer.
+- **direct** is how fast your connection pings: about 16 a second (`DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT`) when most servers don't answer, faster when they do.
 - **API** is at most 5 a second, shared by every scan running at the same time, so two scans that use the API show about 2.5 each. When direct pings are blocked, every server goes through the API and the line ends with `(API)`.
 
 If the results don't fit in one Discord message, you get the summary and the top 10 servers in chat, with the full list attached:
