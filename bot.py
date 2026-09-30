@@ -34,7 +34,9 @@ DIRECT_CONCURRENCY = 50   # Direct pings running at the same time
 DIRECT_TIMEOUT = 3        # Seconds to wait for a server to answer a direct ping
 API_DELAY = 0.2           # mcstatus.io allows 5 requests/second per client IP
 GEO_DELAY = 4             # ip-api.com batch allows 15 requests/minute
-PROBE_SERVER = 'mc.hypixel.net'  # Pinged at startup to see if direct pings work from this network
+# Pinged at startup to see if direct pings work from this network: one answer is enough. Direct pings
+# connect to the server's IP, so these must answer that way (Hypixel, for one, routes by hostname).
+PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'play.wynncraft.com')
 PROGRESS_INTERVAL = 3     # Seconds between progress message updates
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
 # ---------------------
@@ -523,18 +525,26 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     message += "\n\n📎 Full results are in the attached files."
     await ctx.send(message[:2000], files=build_files(populated, empty, locations))
 
+async def probe_direct():
+    """True if a direct ping to any of the PROBE_SERVERS gets an answer."""
+    async def probe(server):
+        try:
+            return await check_direct(server) is not None
+        except BlockedAddress:
+            return False
+
+    return any(await asyncio.gather(*(probe(server) for server in PROBE_SERVERS)))
+
 @bot.event
 async def on_ready():
     # on_ready runs again after reconnects; only probe once
     if bot.direct_ok is None:
-        try:
-            bot.direct_ok = await check_direct(PROBE_SERVER) is not None
-        except BlockedAddress:
-            bot.direct_ok = False
+        bot.direct_ok = await probe_direct()
         if bot.direct_ok:
             log.info("Direct pings work; scans use direct pings with API fallback.")
         else:
-            log.warning("Direct ping to %s failed; scans use the mcstatus.io API only (5 checks/second).", PROBE_SERVER)
+            log.warning("Direct pings to %s all failed; scans use the mcstatus.io API only (5 checks/second).",
+                        ", ".join(PROBE_SERVERS))
     log.info("Logged in as %s", bot.user.name)
     await set_status("Idle | Waiting for IPs")
 

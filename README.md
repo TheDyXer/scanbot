@@ -175,7 +175,7 @@ The log (`docker compose logs scanbot`, or the terminal without Docker) says whi
 or, if your network blocks Minecraft's port:
 
 ```
-[2026-01-01 12:00:00] [WARNING ] scanbot: Direct ping to mc.hypixel.net failed; scans use the mcstatus.io API only (5 checks/second).
+[2026-01-01 12:00:00] [WARNING ] scanbot: Direct pings to demo.mcstatus.io, play.cubecraft.net, play.wynncraft.com all failed; scans use the mcstatus.io API only (5 checks/second).
 ```
 
 ## Usage
@@ -236,7 +236,7 @@ If the results don't fit in one Discord message, you get the summary and the top
 
 ```mermaid
 flowchart TD
-    A[Bot starts] --> B{Direct ping to<br/>mc.hypixel.net works?}
+    A[Bot starts] --> B{Direct ping to a probe<br/>server works?}
     B -- yes --> C[Ping every server directly<br/>50 at a time, 3 s timeout]
     B -- no --> D[Check via api.mcstatus.io<br/>5 per second]
     C -- no answer --> D
@@ -245,7 +245,7 @@ flowchart TD
     E --> F[Post results]
 ```
 
-1. **Direct pings.** When the bot starts it pings `mc.hypixel.net`. If that works, scans ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
+1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`). If any of them answers, scans ping each server directly, 50 at a time, waiting up to 3 seconds each. That covers 5,000 IPs in at most about 5 minutes.
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 5,000 IPs take about 17 minutes.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
@@ -264,7 +264,7 @@ Settings are at the top of `bot.py`:
 | `DIRECT_TIMEOUT` | `3` | Seconds to wait for a server to answer a direct ping |
 | `API_DELAY` | `0.2` | Seconds between API requests (mcstatus.io allows 5/second) |
 | `GEO_DELAY` | `4` | Seconds between ip-api.com batches (15/minute allowed) |
-| `PROBE_SERVER` | `mc.hypixel.net` | Server pinged at startup to test direct pings |
+| `PROBE_SERVERS` | `demo.mcstatus.io`, `play.cubecraft.net`, `play.wynncraft.com` | Servers pinged at startup to test direct pings; one answer is enough |
 | `PROGRESS_INTERVAL` | `3` | Seconds between progress message updates |
 | `INLINE_LIMIT` | `1900` | Results longer than this many characters are sent as files |
 | `GEO_DB_MAX_AGE_DAYS` | `40` | Download a new country database when the current one is older than this (without Docker) |
@@ -344,7 +344,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
-| `Direct ping to mc.hypixel.net failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
+| `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
 | Bot fails to log in with a DNS error | Port 853 (DNS-over-TLS) is blocked | [Switch to DNS-over-HTTPS](#dns-quad9-over-tls) |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
 | `⏳ Bot is busy` | Another scan is running | Wait, or `!stop` it |
