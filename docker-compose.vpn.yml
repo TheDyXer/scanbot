@@ -2,6 +2,8 @@
 # sends every ping to the servers you scan. The bot itself stays on this machine's connection for
 # Discord, mcstatus.io, ip-api.com and DNS: their limits count per address, and VPN addresses are shared.
 # If the VPN drops, pings stop (they never use your own connection) and scans use the API until it's back.
+# With Mullvad server switching, the bot reconnects and switches servers itself, so vpn.env also has
+# HEALTH_RESTART_VPN=off (gluetun v3.41.3 restarts in a loop otherwise: qdm12/gluetun#3485).
 #
 # The installer sets this up and replaces this file on every run (curl ... | bash -s -- --vpn).
 # By hand: put gluetun's settings in vpn.env next to this file (see README, "VPN"), then add this
@@ -45,9 +47,12 @@ services:
     command: ["python", "/app/pinger.py"]
     network_mode: service:gluetun
     user: "${SCANBOT_UID:-1000}:${SCANBOT_GID:-1000}"
+    # Started as soon as gluetun runs, not only once the VPN is up: otherwise a VPN that doesn't
+    # connect at first leaves the pinger never started. Nothing leaks meanwhile: gluetun's firewall
+    # blocks all traffic but the VPN's until the VPN is up.
     depends_on:
       gluetun:
-        condition: service_healthy
+        condition: service_started
         restart: true
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3)"]

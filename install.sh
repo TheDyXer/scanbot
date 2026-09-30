@@ -201,7 +201,19 @@ pick_city() {  # pick_city <provider> <on|off free only> <label>; sets PICK_COUN
 # The bot moves the VPN to another Mullvad server when the current one is down: first the other
 # servers in the chosen city, then the next-fastest cities (VPN_FALLBACK_CITIES). It tells gluetun
 # through gluetun's control server, with a key that allows exactly that (vpn/auth/config.toml).
+# gluetun mustn't also restart the VPN by itself then: in v3.41.3, a server change during its connection
+# check makes it restart in a loop (qdm12/gluetun#3485). So HEALTH_RESTART_VPN=off, and the bot reconnects.
 GLUETUN_RESTART=""
+set_self_restart() {  # set_self_restart on|off: whether gluetun restarts the VPN by itself (vpn.env)
+  [ -f vpn.env ] || return 0
+  local tmp; tmp="$(mktemp)"
+  grep -v -e '^HEALTH_RESTART_VPN=' -e '^# The bot reconnects the VPN itself' vpn.env > "${tmp}" || true
+  if [ "$1" = off ]; then
+    { echo "# The bot reconnects the VPN itself (see docker-compose.vpn.yml)"; echo "HEALTH_RESTART_VPN=off"; } >> "${tmp}"
+  fi
+  cat "${tmp}" > vpn.env; rm -f "${tmp}"  # cat keeps vpn.env's permissions (600)
+}
+
 set_fallback_cities() {  # set_fallback_cities <chosen city>; uses RANKED
   local cities
   cities="$( { printf '%s\n' "$1"; printf '%s\n' "${RANKED}" | cut -f3; } | awk 'NF && !seen[$0]++' | head -n 10 | paste -sd, -)"
@@ -222,7 +234,7 @@ setup_mullvad_switch() {
     echo "# Written by install.sh: lets the scanbot bot switch Mullvad servers, and nothing else"
     echo "[[roles]]"
     echo 'name = "scanbot"'
-    echo 'routes = ["PUT /v1/vpn/settings", "GET /v1/vpn/status"]'
+    echo 'routes = ["PUT /v1/vpn/settings", "PUT /v1/vpn/status", "GET /v1/vpn/status"]'
     echo 'auth = "apikey"'
     echo "apikey = \"${key}\""
   } > "${tmp}"
@@ -232,11 +244,13 @@ setup_mullvad_switch() {
     GLUETUN_RESTART="yes"  # gluetun reads it only when it starts
   fi
   rm -f "${tmp}"
+  set_self_restart off
 }
 
 clear_mullvad_switch() {
   env_unset VPN_FALLBACK_CITIES; env_unset GLUETUN_API_KEY
   if [ -f vpn/auth/config.toml ]; then rm -f vpn/auth/config.toml; GLUETUN_RESTART="yes"; fi
+  set_self_restart on
 }
 
 setup_provider() {  # setup_provider mullvad|protonvpn
@@ -387,18 +401,33 @@ if vpn_enabled; then info "Starting the VPN, its pinger and the bot..."; fi
 vpn_failed=""
 # A gluetun that's already running must restart to read a new server-switching key; a new one reads it anyway
 gluetun_running="$(docker compose ps -q --status running gluetun 2>/dev/null || true)"
-if ! docker compose up -d --remove-orphans; then
-  if ! vpn_enabled; then die "docker compose up failed."; fi
-  # The bot doesn't wait for the VPN: it runs anyway and checks servers through the API until the VPN is up
-  vpn_failed="yes"
-  warn "The VPN didn't connect. Last gluetun log lines:"
-  docker compose logs --tail 15 gluetun 2>&1 || true
-  warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
-  warn "Until then the bot still runs, and checks every server through the API only."
-elif vpn_enabled && [ -n "${GLUETUN_RESTART}" ] && [ -n "${gluetun_running}" ]; then
-  # gluetun reads vpn/auth/config.toml only when it starts (the pinger restarts with it)
-  info "Restarting the VPN so it picks up the server-switching key..."
-  docker compose restart gluetun >/dev/null 2>&1 || warn "Couldn't restart gluetun. Run: docker compose restart gluetun"
+docker compose up -d --remove-orphans || die "docker compose up failed."
+if vpn_enabled; then
+  if [ -n "${GLUETUN_RESTART}" ] && [ -n "${gluetun_running}" ] \
+     && [ "$(docker compose ps -q gluetun 2>/dev/null || true)" = "${gluetun_running}" ]; then
+    # Still the same gluetun, so it hasn't read vpn/auth/config.toml yet (the pinger restarts with it)
+    info "Restarting the VPN so it picks up the server-switching key..."
+    docker compose restart gluetun >/dev/null 2>&1 || warn "Couldn't restart gluetun. Run: docker compose restart gluetun"
+  fi
+  # The bot doesn't wait for the VPN: it runs anyway and checks servers through the API until the VPN is up.
+  # gluetun checks its connection every 5 s, so a working VPN is healthy within about 15 s.
+  vpn_health=""
+  for _ in $(seq 1 60); do
+    vpn_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+      "$(docker compose ps -q gluetun 2>/dev/null)" 2>/dev/null || true)"
+    if [ "${vpn_health}" = healthy ] || [ "${vpn_health}" = unhealthy ]; then break; fi
+    sleep 1
+  done
+  if [ "${vpn_health}" != healthy ]; then
+    vpn_failed="yes"
+    warn "The VPN didn't connect. Last gluetun log lines:"
+    docker compose logs --tail 15 gluetun 2>&1 || true
+    warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
+    if [ -n "$(env_get GLUETUN_API_KEY)" ]; then
+      warn "With Mullvad, the bot also keeps trying: it reconnects, then moves to other servers."
+    fi
+    warn "Until then the bot still runs, and checks every server through the API only."
+  fi
 fi
 
 if vpn_enabled && [ -z "${vpn_failed}" ]; then
@@ -438,9 +467,21 @@ echo
 case "${status}" in
   ok)
     ok "Scanbot is running."
-    # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it).
-    # With the VPN, one line says whether pings through it work.
-    printf '%s' "${logs}" | grep -oE "(Direct (Bedrock (\(UDP\) )?)?pings?|Pings through the VPN) .*" | tail -n 2 | sed 's/^/    /' || true
+    if vpn_enabled; then
+      # The bot's first check can run before the VPN is up; with a working VPN, wait for the next one
+      if [ -z "${vpn_failed}" ] && ! printf '%s' "${logs}" | grep -q "Pings through the VPN work"; then
+        info "Waiting for the bot's first ping through the VPN..."
+        for _ in $(seq 1 60); do
+          logs="$(docker compose logs scanbot 2>&1 || true)"
+          if printf '%s' "${logs}" | grep -q "Pings through the VPN work"; then break; fi
+          sleep 1
+        done
+      fi
+      printf '%s' "${logs}" | grep -oE "Pings through the VPN .*" | tail -n 1 | sed 's/^/    /' || true
+    else
+      # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it)
+      printf '%s' "${logs}" | grep -oE "Direct (Bedrock (\(UDP\) )?)?pings? .*" | tail -n 2 | sed 's/^/    /' || true
+    fi
     ;;
   bad-token)
     # Stop it so it doesn't keep retrying a bad login (Discord blocks IPs that do that a lot)

@@ -6,6 +6,11 @@ server to use through gluetun's control server.
 The order to try servers in: the servers in the city picked at setup, then the next-fastest cities
 from the installer's ping test (VPN_FALLBACK_CITIES). Once a better server has been up for a while,
 the VPN moves back to it.
+
+When a check fails, the bot first reconnects to the same server, and moves on if the next check
+fails too. gluetun doesn't restart the VPN by itself here (HEALTH_RESTART_VPN=off in vpn.env):
+in gluetun v3.41.3, a server change during its connection check makes it restart in a loop
+(qdm12/gluetun#3485), and the bot changes servers.
 """
 import logging
 import time
@@ -21,16 +26,18 @@ STABLE_BEFORE_RETURN = 30 * 60 # Seconds a better server must be listed as up be
 
 
 class MullvadSwitcher:
-    def __init__(self, cities, fetch_relays, set_server, clock=time.monotonic):
+    def __init__(self, cities, fetch_relays, set_server, reconnect=None, clock=time.monotonic):
         """
         cities: city names in the order to use them; the one picked at setup first.
         fetch_relays(): coroutine returning Mullvad's WireGuard server list (RELAYS_URL). Raises on failure.
         set_server(hostname): coroutine that makes gluetun use that server. Returns False if gluetun
             doesn't know the server (its built-in list can be older than Mullvad's); raises on other errors.
+        reconnect(): coroutine that makes gluetun connect to its server again. Raises on failure.
         """
         self.cities = [c.strip().lower() for c in cities if c and c.strip()]
         self.fetch_relays = fetch_relays
         self.set_server = set_server
+        self.reconnect = reconnect
         self.clock = clock
         self.current = None       # The server gluetun was last told to use
         self.fails = 0            # VPN checks in a row that failed on the current server
@@ -41,6 +48,8 @@ class MullvadSwitcher:
         self._relays = None
         self._fetched_at = None
         self._no_server_logged = False
+        self._reconnect_logged = False  # Reconnects are logged once per outage
+        self._reconnect_error = None
 
     async def relays(self, fresh=False):
         """Mullvad's server list, at most RELAYS_MAX_AGE old (or fetched now). None if it can't be fetched."""
@@ -70,7 +79,8 @@ class MullvadSwitcher:
     async def tick(self, vpn_ok):
         """
         Call after each VPN check with whether pings through the VPN worked.
-        Returns True if the VPN was moved to another server.
+        Returns True if gluetun was told to reconnect or to use another server, so the bot should
+        check again soon.
         """
         now = self.clock()
         # After a failed check, only judge the server if Mullvad's site answers right now: if this
@@ -79,6 +89,8 @@ class MullvadSwitcher:
         if relays is None:
             # Can't see Mullvad's list, maybe because this machine's own internet is down:
             # don't judge any server, just keep gluetun on the current one
+            if self.current and not vpn_ok:
+                return await self._reconnect("Mullvad's server list can't be fetched either")
             if self.current:
                 await self._pin(self.current)
             return False
@@ -112,6 +124,7 @@ class MullvadSwitcher:
                 targets = [h for h in ordered if usable(h)]
         else:
             self.fails = 0
+            self._reconnect_logged = False
             self.strikes.pop(self.current, None)
             current_rank = rank.get(self.current, len(ordered))
             better = [h for h in ordered[:current_rank]
@@ -120,6 +133,8 @@ class MullvadSwitcher:
                 reason, targets = f"back to {better[0]}, which has been up for a while", better
 
         if reason is None:
+            if not vpn_ok:
+                return await self._reconnect("pings through it failed")  # First failure: same server again
             await self._pin(self.current, quiet=True)  # A no-op for gluetun unless it restarted and forgot
             return False
         if not targets:
@@ -127,6 +142,8 @@ class MullvadSwitcher:
                 log.warning("No other Mullvad server in %s is available (%s); staying on %s",
                             ", ".join(c.title() for c in self.cities), reason, self.current or "gluetun's choice")
                 self._no_server_logged = True
+            if self.current and not vpn_ok:
+                return await self._reconnect("pings through it failed, and there's no other server to use")
             if self.current:
                 await self._pin(self.current, quiet=True)
             return False
@@ -142,8 +159,26 @@ class MullvadSwitcher:
                     log.info("Using Mullvad server %s", hostname)
                 else:
                     log.warning("Switched Mullvad server from %s to %s: %s", old, hostname, reason)
-                return old is not None
+                return True
+        if self.current and not vpn_ok:
+            return await self._reconnect("pings through it failed, and gluetun knows no other server")
         return False
+
+    async def _reconnect(self, why):
+        """Makes gluetun connect to its server again. Returns True if it was asked to."""
+        if self.reconnect is None:
+            return False
+        try:
+            await self.reconnect()
+        except Exception as e:
+            if str(e) != self._reconnect_error:  # Once per kind of error, not every minute
+                log.warning("Could not reconnect the VPN: %s", e)
+                self._reconnect_error = str(e)
+            return False
+        self._reconnect_error = None
+        (log.debug if self._reconnect_logged else log.info)("Reconnecting the VPN to %s: %s", self.current, why)
+        self._reconnect_logged = True
+        return True
 
     async def _pin(self, hostname, quiet=False):
         """Tells gluetun to use hostname. Returns 'ok', 'unknown' (gluetun doesn't know it) or 'error'."""
