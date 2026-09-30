@@ -55,12 +55,12 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
 - **Several people can scan at once:** up to 5 scans run side by side, one per person, and more wait in a queue
 - **`/stop` at any point**, which posts what was found so far. It stops your own scan; moderators can stop anyone's
-- **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs aren't sent to a third party
+- **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs stay on your machine (only the few the database doesn't know are looked up at ip-api.com)
 - **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message. A huge scan's files are split to fit Discord's upload limit and arrive as several messages
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
 - **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
-- **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS
+- **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS, or DNS-over-HTTPS where port 853 is blocked
 - Up to 30,000 IPs per scan
 - **Docker image** for `amd64` and `arm64`, a one-line installer, and automatic daily updates
 
@@ -213,7 +213,7 @@ or, if your network blocks Minecraft's port:
 
 | Command | What it does |
 | --- | --- |
-| `/scan file:<.txt> [edition] [api]` (or `!scan [edition] [api]` + attached `.txt`) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file. `api` is `on` (the default) or `off`: [skip the API retry](#skipping-the-api-retry), as in `!scan java off` |
+| `/scan file:<.txt> [edition] [api]` (or `!scan [edition] [api]` + attached `.txt`; `!check` works too) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file. `api` is `on` (the default) or `off`: [skip the API retry](#skipping-the-api-retry), as in `!scan java off` |
 | `/stop` (or `!stop`) | Stops your scan and posts what it found so far, or cancels it if it's still queued |
 | `/stop user:@name` (or `!stop @name`) | Moderators: stops that person's scan |
 | `/stop all:all` (or `!stop all`) | Moderators: stops every scan in this server |
@@ -251,8 +251,8 @@ play.example.com:25566
 ```
 
 - Up to **30,000** servers per scan, in a file of at most 2 MB
-- Lines without a port use **25565** for Java and **19132** for Bedrock. One file holds one edition: pick it with `edition`
-- Duplicates and invalid lines are skipped, and the start message tells you how many
+- Lines without a port use **25565** for Java and **19132** for Bedrock, and ports go from 1 to 65535. One file holds one edition: pick it with `edition`
+- Duplicates and invalid lines are skipped, and the start message tells you how many. Case and a trailing dot don't matter, and `1.2.3.4` is the same server as `1.2.3.4:25565`. A Java hostname with and without `:25565` counts as two servers, because without a port the bot follows the name's SRV record, which can point somewhere else
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
 - IPv6 addresses aren't supported
 - Only the first attachment on the message is read
@@ -294,7 +294,7 @@ Then the results, sorted by player count. Example from a test run:
 If the results don't fit in one Discord message, you get the summary and the top 10 servers in chat, with the full list attached:
 
 - `scan_results.txt`: the same report as plain text
-- `scan_results.csv`: one row per online server with the columns `ip, resolved_ip, country, players_online, players_max, version, motd, players`
+- `scan_results.csv`: one row per online server with the columns `ip, resolved_ip, country, players_online, players_max, version, motd, players, edition`. `players_online` is the number of players; `players` lists the names the server shows, separated by `; `
 
 ## How scanning works
 
@@ -309,11 +309,11 @@ flowchart TD
     E --> F[Post results]
 ```
 
-1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 300 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 5 minutes. An IP address is pinged right away; for a hostname, the bot first looks for an SRV record that points the name at another host or port.
+1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 300 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 5 minutes. An IP address is pinged right away; for a hostname, the bot first looks for an SRV record that points the name at another host or port. If no probe answers, the bot tries again every 5 minutes (`DIRECT_RECHECK`) and switches direct pings on as soon as one does. (With the [VPN](#vpn), the VPN checks do this instead.)
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 30,000 IPs take about 100 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
 3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
-   - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start, and again when it's more than 40 days old.
+   - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start. It checks the database's age once a day, and downloads a new one when it's more than 40 days old.
 
 `/stop` works in every phase. Direct pings already in flight finish (at most 3 seconds), API checks in flight are dropped, and nothing new starts.
 
@@ -332,6 +332,7 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 | `GEO_DELAY` | `4` | 0 to 600 | Seconds between ip-api.com batches (15/minute allowed), shared by all scans |
 | `PROGRESS_INTERVAL` | `3` | 2 to 600 | Seconds between progress message updates |
 | `GEO_DB_MAX_AGE_DAYS` | `40` | 1 to 3,650 | Download a new country database when the current one is older than this (without Docker) |
+| `DIRECT_RECHECK` | `300` | 10 to 86,400 | Without the VPN: seconds between new tries of direct pings while they don't work |
 
 These are fixed in `bot.py`:
 
@@ -597,8 +598,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Bot's status says `· VPN down` | Same as above | Same as above |
 | WARP connects but every scan says the VPN is down | The packet size (MTU) is too big for your network | Lower `WIREGUARD_MTU=1280` to `1200` in `vpn.env`, then `docker compose up -d` |
 | Bot doesn't update itself | The `watchtower:` block was removed, or another Watchtower stopped it | `docker compose logs watchtower`; see [Automatic updates](#automatic-updates) |
-| `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second) |
-| `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second). Run the bot on another network for full speed |
+| `Direct Bedrock pings to ... all failed` at startup | Your network blocks outbound UDP | Nothing to fix: Bedrock scans use the API instead (5 servers/second). The bot tries direct pings again every 5 minutes |
+| `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second), and the bot tries direct pings again every 5 minutes. Run the bot on another network for full speed |
 | `DNS lookups failed, so the bot can't reach Discord` | Neither TLS (853) nor HTTPS (443) reaches Quad9: the machine or its containers have no internet | Fix the connection (the message shows both reasons), then `docker compose up -d`; see [DNS](#dns-quad9-over-tls) |
 | `Quad9 over TLS (port 853) ...; using Quad9 over HTTPS` in the log | Port 853 is blocked on your network | Nothing to fix: the bot switched to HTTPS by itself. Set `DNS_TRANSPORT=doh` to skip the failed try on every start |
 | `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |

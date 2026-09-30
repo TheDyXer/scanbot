@@ -173,6 +173,28 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('2 IPs', start)
         self.assertNotIn('invalid', start)
 
+    async def test_a_file_that_is_not_utf8_gets_a_plain_answer(self):
+        await self.scan(self.ctx, self.attachment(data=b'\xff\xfe8\x00.\x008\x00'))  # UTF-16, as Notepad used to save
+        self.assertIn("isn't UTF-8 text", self.texts(self.ctx.send)[-1])
+        self.ctx.channel.send.assert_not_awaited()
+
+    async def test_a_failed_download_gets_a_plain_answer(self):
+        attachment = self.attachment()
+        attachment.read.side_effect = http_error(discord.NotFound, 404)
+        with self.assertLogs('scanbot', level='WARNING'):
+            await self.scan(self.ctx, attachment)
+        self.assertIn("Couldn't download the attachment", self.texts(self.ctx.send)[-1])
+        self.ctx.channel.send.assert_not_awaited()
+
+    async def test_a_scan_survives_losing_its_messages(self):
+        # No permission in the channel, and the slash command's reply stops working after the first message
+        self.ctx.channel.send.side_effect = http_error(discord.Forbidden, 403)
+        self.ctx.send.side_effect = [self.progress] + [http_error(discord.HTTPException, 401)] * 10
+        with self.assertLogs('scanbot', level='WARNING') as logs:
+            await self.scan(self.ctx, self.attachment())
+        self.assertIn('message lost', "\n".join(logs.output))
+        self.assertNotIn(self.ctx.author.id, scanbot.scans)
+
     async def test_a_second_scan_by_the_same_person_is_refused(self):
         scanbot.scans[self.ctx.author.id] = scanbot.Scan(self.ctx.author, None)
         self.addCleanup(scanbot.scans.clear)
@@ -198,6 +220,13 @@ class SendChannelTests(unittest.IsolatedAsyncioTestCase):
         ctx.channel.send = failing_channel_send
         await scanbot.send_channel(ctx, 'results', files=[file])
         self.assertEqual(position['at'], 0)
+
+    async def test_an_expired_reply_is_logged_not_raised(self):
+        ctx = mock.MagicMock(send=mock.AsyncMock(side_effect=http_error(discord.HTTPException, 401)))
+        ctx.channel.send = mock.AsyncMock(side_effect=http_error(discord.Forbidden, 403))
+        with self.assertLogs('scanbot', level='WARNING') as logs:
+            self.assertIsNone(await scanbot.send_channel(ctx, 'hello'))
+        self.assertIn('message lost', logs.output[0])
 
     async def test_plain_messages_still_fall_back(self):
         ctx = mock.MagicMock(send=mock.AsyncMock())
