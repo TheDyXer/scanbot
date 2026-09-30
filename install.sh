@@ -468,16 +468,18 @@ case "${status}" in
   ok)
     ok "Scanbot is running."
     if vpn_enabled; then
-      # The bot's first check can run before the VPN is up; with a working VPN, wait for the next one
-      if [ -z "${vpn_failed}" ] && ! printf '%s' "${logs}" | grep -q "Pings through the VPN work"; then
+      # The bot's first check can run before the VPN is up; with a working VPN, wait for the next one.
+      # Only its latest verdict counts: an older run of the bot may be in the log too.
+      vpn_verdict() { printf '%s' "${logs}" | grep -oE "Pings through the VPN .*" | tail -n 1 || true; }
+      if [ -z "${vpn_failed}" ] && ! vpn_verdict | grep -q "^Pings through the VPN work"; then
         info "Waiting for the bot's first ping through the VPN..."
         for _ in $(seq 1 60); do
           logs="$(docker compose logs scanbot 2>&1 || true)"
-          if printf '%s' "${logs}" | grep -q "Pings through the VPN work"; then break; fi
+          if vpn_verdict | grep -q "^Pings through the VPN work"; then break; fi
           sleep 1
         done
       fi
-      printf '%s' "${logs}" | grep -oE "Pings through the VPN .*" | tail -n 1 | sed 's/^/    /' || true
+      vpn_verdict | sed 's/^/    /'
     else
       # The startup probe's verdict(s): direct pings or API only, for Java (and Bedrock, if the bot has it)
       printf '%s' "${logs}" | grep -oE "Direct (Bedrock (\(UDP\) )?)?pings? .*" | tail -n 2 | sed 's/^/    /' || true
