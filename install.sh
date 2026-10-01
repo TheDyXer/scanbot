@@ -79,6 +79,7 @@ e5015f8c2b2928c0a4e708d45520a4f178692785ffdd874afd3a9b054ec1bead
 0b22fe255c0cbea678237e24bc995ee6751fb2a2df1494829a1fa165c1239eee
 b0180b6f8fd45dea4d20daddc100718404fc964cec9f3c73af37b04cfdf2204c
 f42480fb21fe2c911e7be3ded48ee8b8055e86b00349e1157daebafbb1b9de43
+70af29717480df28f808ad0d334b3fc9a65148a83e629d8d9988628a52586922
 "
 
 # The compose file without the watchtower block (from its comment to the next service or top-level

@@ -13,6 +13,7 @@ import dns.nameserver
 import dns.query
 import dns.resolver
 import gzip
+import html
 import io
 import ipaddress
 import json
@@ -61,11 +62,30 @@ def env_int(name, default, minimum, maximum):
 def env_float(name, default, minimum, maximum, why=''):
     return env_number(name, default, minimum, maximum, whole=False, why=why)
 
+def env_switch(name, default):
+    """On or off from the environment, or `default` when unset or empty. Raises ValueError for anything else."""
+    raw = os.environ.get(name, '').strip()
+    if not raw:
+        return default
+    if raw.lower() in ('1', 'true', 'yes', 'on'):
+        return True
+    if raw.lower() in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError(f"{name} must be on or off, not {raw!r}")
+
 # --- CONFIGURATION ---
 MC_API_URLS = {
     'java': 'https://api.mcstatus.io/v2/status/java/',
     'bedrock': 'https://api.mcstatus.io/v2/status/bedrock/',
 }
+# Second opinion for Java servers mcstatus.io can't check. (Its Bedrock checks miss servers that are online, so
+# Bedrock servers have no second opinion.) It rejects requests without a User-Agent.
+MCSRVSTAT_URL = 'https://api.mcsrvstat.us/3/'
+API_SERVER_TIMEOUT = 3     # Seconds mcstatus.io waits for a server before calling it offline (its default is 5)
+API_FAILURE_THRESHOLD = 5  # mcstatus.io failures in a row (rate limits, server errors, timeouts) before ...
+API_PAUSE_SECONDS = 60     # ... Java servers are checked through mcsrvstat.us for this long
+API_SLOWDOWN_RESET = 60    # Seconds without a rate limit before a slowed-down pacer goes back to full speed
+API_MAX_SLOWDOWN = 8       # A pacer slows down to at most this many times its normal spacing
 EDITION_LABELS = {'java': 'Java', 'bedrock': 'Bedrock'}
 JAVA_PORT = 25565         # Default port for Java servers given as an IP (hostnames go through mcstatus's SRV lookup)
 BEDROCK_PORT = 19132      # Default port for Bedrock servers
@@ -93,6 +113,10 @@ try:
     DIRECT_TIMEOUT = env_float('DIRECT_TIMEOUT', 3, 0.5, pinger.MAX_TIMEOUT,
                                why=f" (the pinger waits at most {pinger.MAX_TIMEOUT} seconds)")
     API_DELAY = env_float('API_DELAY', 0.2, 0.05, 60)  # mcstatus.io allows 5 requests/second per IP, shared by all scans
+    # Whether mcstatus.io also asks Java servers over the query protocol: software, plugins and full player lists
+    API_QUERY = env_switch('API_QUERY', True)
+    # mcsrvstat.us publishes no limit, so the bot asks it at most twice a second, shared by all scans
+    MCSRVSTAT_DELAY = env_float('MCSRVSTAT_DELAY', 0.5, 0.1, 60)
     GEO_DELAY = env_float('GEO_DELAY', 4, 0, 600)      # ip-api.com batch allows 15 requests/minute, shared by all scans
     PROGRESS_INTERVAL = env_int('PROGRESS_INTERVAL', 3, 2, 600)  # Seconds between progress message updates
     # Without the VPN: seconds between new tries of direct pings while they don't work (the startup probe failed)
@@ -413,20 +437,89 @@ class Pacer:
     Spaces out requests to a rate-limited service. mcstatus.io and ip-api.com count requests
     per client IP, so all scans running at the same time share one pacer each. Waiters are
     served in order, which makes concurrent scans take turns.
+
+    If the service rate-limits the bot anyway, slow_down() doubles the spacing (up to API_MAX_SLOWDOWN times), and
+    it goes back to normal after API_SLOWDOWN_RESET seconds without another rate limit.
     """
-    def __init__(self):
+    def __init__(self, name='The service'):
         self._lock = asyncio.Lock()
         self._next = 0.0
+        self.name = name
+        self.factor = 1
+        self.penalised_at = None  # When the spacing was last made longer
+
+    def spacing(self, interval):
+        """The gap to leave after a request: `interval`, or longer for a while after a rate limit."""
+        if self.factor > 1 and time.monotonic() - self.penalised_at >= API_SLOWDOWN_RESET:
+            self.factor = 1
+            log.info("%s hasn't rate-limited the bot for %d s; back to one request every %s s",
+                     self.name, API_SLOWDOWN_RESET, show_number(interval))
+        return interval * self.factor
+
+    def slow_down(self, interval, sent_at):
+        """
+        The service refused a request sent at `sent_at` as one too many. Requests sent before the last slowdown went
+        out at the old speed, so their refusals don't slow it down again: one burst of refusals counts once.
+        """
+        if self.penalised_at is not None and sent_at < self.penalised_at:
+            return
+        now = time.monotonic()
+        self.penalised_at = now
+        if self.factor < API_MAX_SLOWDOWN:
+            self.factor *= 2
+            log.warning("%s is rate-limiting the bot; spacing requests %s s apart until it stops",
+                        self.name, show_number(interval * self.factor))
+        self._next = max(self._next, now + interval * self.factor)
 
     async def wait(self, interval):
         async with self._lock:
             delay = self._next - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
-            self._next = time.monotonic() + interval
+            self._next = time.monotonic() + self.spacing(interval)
 
-api_pacer = Pacer()  # mcstatus.io
-geo_pacer = Pacer()  # ip-api.com
+class ApiHealth:
+    """
+    Whether mcstatus.io is answering. After API_FAILURE_THRESHOLD failures in a row (rate limits it kept up, server
+    errors, timeouts), Java servers are checked through mcsrvstat.us for API_PAUSE_SECONDS; then mcstatus.io gets
+    the next one again. Bedrock servers have nowhere else to go, so they keep asking mcstatus.io, and an answer to
+    one of them ends the pause too.
+    """
+    def __init__(self):
+        self.failures = 0
+        self.paused_until = 0.0
+
+    def paused(self):
+        return time.monotonic() < self.paused_until
+
+    def failed(self):
+        self.failures += 1
+        if self.failures >= API_FAILURE_THRESHOLD and not self.paused():
+            if self.failures == API_FAILURE_THRESHOLD:  # Later pauses in the same outage aren't logged again
+                log.warning("mcstatus.io failed %d checks in a row; Java servers are checked through mcsrvstat.us "
+                            "for the next %d s", self.failures, API_PAUSE_SECONDS)
+            self.paused_until = time.monotonic() + API_PAUSE_SECONDS
+
+    def answered(self):
+        if self.failures >= API_FAILURE_THRESHOLD:
+            log.info("mcstatus.io answers again")
+        self.failures = 0
+        self.paused_until = 0.0
+
+class Unchecked:
+    """check_api's answer when no service could check a server: it's neither online nor offline."""
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return 'UNCHECKED'
+
+UNCHECKED = Unchecked()
+
+api_pacer = Pacer('mcstatus.io')
+geo_pacer = Pacer('ip-api.com')
+mcsrvstat_pacer = Pacer('mcsrvstat.us')
+api_health = ApiHealth()  # mcstatus.io's, shared by all scans
 
 def to_int(value):
     """
@@ -445,7 +538,7 @@ def make_result(ip, address, players, players_max, names, version, motd, edition
     One online server. The keyword fields are whatever the source reported, None when it didn't: a direct ping
     knows latency, secure chat and Forge mods; mcstatus.io knows software, plugins and whether Mojang blocks the
     server (eula_blocked); Bedrock servers report a game mode, and to a direct ping a map name and brand.
-    `source` is where the answer came from: 'direct' or 'mcstatus.io'.
+    `source` is where the answer came from: 'direct', 'mcstatus.io' or 'mcsrvstat.us'.
     """
     return {
         "ip": ip,
@@ -600,27 +693,122 @@ async def check_direct_bedrock(entry):
 
 async def check_api(session, ip, edition='java'):
     """
-    Asks mcstatus.io about the server. Returns a result if it's online, None otherwise.
+    Asks mcstatus.io about the server, and for a Java server mcsrvstat.us when mcstatus.io can't answer (or has
+    failed so often lately that it's paused). Returns a result if the server is online, None if it's offline, and
+    UNCHECKED if no service could check it.
     """
-    for attempt in range(3):
-        try:
-            async with session.get(f"{MC_API_URLS[edition]}{ip}", timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 429:
-                    # Rate limited: wait and try again instead of calling the server offline
-                    await asyncio.sleep(1 + attempt)
-                    continue
-                if response.status != 200:
-                    return None
-                data = await response.json()
-        except Exception:
-            return None
+    if edition == 'java' and api_health.paused():
+        return await check_mcsrvstat(session, ip)
+    outcome = await check_mcstatus(session, ip, edition)
+    if outcome is UNCHECKED and edition == 'java':
+        return await check_mcsrvstat(session, ip)
+    return outcome
 
+async def check_mcstatus(session, ip, edition='java'):
+    """
+    Asks mcstatus.io about the server. Returns a result, None if it says the server is offline, or UNCHECKED if
+    it didn't answer: it kept rate-limiting the bot, had a server error, or timed out.
+    """
+    # mcstatus.io waits up to its own timeout for the server; 3 s instead of its default 5 frees dead hosts sooner
+    params = {'timeout': show_number(API_SERVER_TIMEOUT)}
+    if edition == 'java' and not API_QUERY:
+        params['query'] = 'false'
+    for attempt in range(3):
+        sent = time.monotonic()
+        try:
+            async with session.get(f"{MC_API_URLS[edition]}{ip}", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as response:
+                status = response.status
+                data = await response.json() if status == 200 else None
+        except Exception:
+            api_health.failed()  # Timed out, couldn't connect, or answered something that isn't JSON
+            return UNCHECKED
+        if status == 429:
+            # Rate limited: slow every scan's requests down, and try again in turn instead of calling it offline
+            api_pacer.slow_down(API_DELAY, sent)
+            if attempt < 2:
+                await api_pacer.wait(API_DELAY)
+                continue
+            api_health.failed()
+            return UNCHECKED
+        if status >= 500:
+            api_health.failed()
+            return UNCHECKED
+        api_health.answered()
+        if status != 200:
+            return None  # mcstatus.io answered but refused this address
         try:
             return parse_api_status(ip, data, edition)
         except Exception as e:
             log.warning("Unexpected mcstatus.io response for %s: %s", ip, e)
             return None
-    return None
+    return UNCHECKED
+
+async def check_mcsrvstat(session, ip):
+    """
+    Asks mcsrvstat.us about a Java server. Returns a result, None if it says the server is offline, or UNCHECKED if
+    it doesn't answer either. It keeps answers for 5 minutes, so a server that just came online can look offline.
+    """
+    for attempt in range(2):
+        await mcsrvstat_pacer.wait(MCSRVSTAT_DELAY)
+        sent = time.monotonic()
+        try:
+            async with session.get(f"{MCSRVSTAT_URL}{ip}", timeout=aiohttp.ClientTimeout(total=10)) as response:
+                status = response.status
+                data = await response.json(content_type=None) if status == 200 else None
+        except Exception:
+            return UNCHECKED
+        if status == 429 and attempt == 0:
+            mcsrvstat_pacer.slow_down(MCSRVSTAT_DELAY, sent)
+            continue
+        if status != 200:
+            return UNCHECKED
+        try:
+            return parse_mcsrvstat_status(ip, data)
+        except Exception as e:
+            log.warning("Unexpected mcsrvstat.us response for %s: %s", ip, e)
+            return UNCHECKED
+    return UNCHECKED
+
+def parse_mcsrvstat_status(ip, data):
+    """
+    Turns an mcsrvstat.us (API v3) response for a Java server into a result, or None if the server is offline.
+    Its offline answers still carry an `ip` (sometimes 127.0.0.1), so nothing is read from them.
+    """
+    if not isinstance(data, dict) or data.get('online') is not True:
+        return None
+
+    players = data.get('players')
+    if not isinstance(players, dict):
+        players = {}
+    names = [p['name'] for p in players.get('list') or [] if isinstance(p, dict) and isinstance(p.get('name'), str)
+             and p['name']]
+
+    # The MOTD comes as a list of lines, with HTML entities (&gt;) in them
+    motd = data.get('motd')
+    lines = motd.get('clean') if isinstance(motd, dict) else None
+    motd = "  ".join(html.unescape(line).strip() for line in lines if isinstance(line, str)) \
+        if isinstance(lines, list) else None
+
+    version = data.get('version')  # Free text, as the server sends it ("Paper 1.21.4", "We support: 1.20-1.21")
+    version = re.sub('§.', '', version).strip() if isinstance(version, str) else None
+    protocol = data.get('protocol')
+    protocol = protocol.get('version') if isinstance(protocol, dict) else None
+    mods = data.get('mods')  # Only there when the server reports mods
+    plugins = data.get('plugins')
+    plugins = [p['name'] for p in plugins if isinstance(p, dict) and isinstance(p.get('name'), str)] \
+        if isinstance(plugins, list) else None
+    software, eula_blocked = data.get('software'), data.get('eula_blocked')
+
+    return make_result(ip, data.get('ip'), players.get('online'), players.get('max'), names, version or None, motd,
+                       'java',
+                       protocol=protocol if isinstance(protocol, int) and not isinstance(protocol, bool) else None,
+                       modded=bool(mods) if isinstance(mods, list) else None,
+                       mod_count=len(mods) if isinstance(mods, list) and mods else None,
+                       software=software if isinstance(software, str) and software else None,
+                       plugins=plugins,
+                       eula_blocked=eula_blocked if isinstance(eula_blocked, bool) else None,
+                       source='mcsrvstat.us')
 
 def parse_api_status(ip, data, edition='java'):
     """
@@ -979,8 +1167,9 @@ async def run_direct(ips, results, state, edition='java', stop=None):
 
 async def run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False):
     """
-    Checks servers through mcstatus.io, starting one request every API_DELAY seconds.
-    Scans running at the same time take turns, so together they stay within the limit.
+    Checks servers through mcstatus.io (and Java servers it can't check through mcsrvstat.us), starting one request
+    every API_DELAY seconds. Scans running at the same time take turns, so together they stay within the limit.
+    Servers no service could check are counted in state['unchecked'], not as offline.
     """
     stop = stop or asyncio.Event()
     phase = "Retrying unreachable servers via API" if retrying else "Checking servers via API"
@@ -991,7 +1180,9 @@ async def run_api(session, ips, results, state, retrying, edition='java', stop=N
     async def check(ip):
         result = await check_api(session, ip, edition)
         state['done'] += 1
-        if result:
+        if result is UNCHECKED:
+            state['unchecked'] = state.get('unchecked', 0) + 1
+        elif result:
             results[ip] = result
             state['found'] += 1
 
@@ -1216,7 +1407,7 @@ def speed_text(direct, api):
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
                        vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None, error=False,
-                       networks=None):
+                       networks=None, unchecked=0):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -1239,6 +1430,9 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     if not_retried:
         was = "wasn't" if not_retried == 1 else "weren't"
         summary += f"\nℹ️ {not_retried} didn't answer a direct ping and {was} retried through the API"
+    if unchecked:
+        services = "mcstatus.io and mcsrvstat.us" if edition == 'java' else "mcstatus.io"
+        summary += f"\n❔ {unchecked} couldn't be checked: {services} didn't answer, so they aren't counted as offline"
     if blocked:
         summary += f"\n🚫 {blocked} name(s) pointed at private or local addresses and were skipped"
     if vpn_down:
@@ -1691,7 +1885,8 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
             else:
                 retry = ips
 
-            # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans
+            # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans (Java servers it
+            # can't check go to mcsrvstat.us)
             if retry and api_retry and not scan.stop.is_set():
                 began = time.monotonic()
                 await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition,
@@ -1739,7 +1934,7 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
     await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
                        blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
                        direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason, error=error,
-                       networks=networks)
+                       networks=networks, unchecked=state.get('unchecked', 0))
 
 async def shutdown(reason, grace=SHUTDOWN_GRACE, close=None):
     """
@@ -1790,6 +1985,9 @@ def check_settings():
     """Logs the direct ping settings at startup, and warns about the ones likely to cause trouble."""
     log.info("Direct pings: up to %d per scan (%d for all scans together), %s s timeout",
              DIRECT_CONCURRENCY, DIRECT_CONCURRENCY_TOTAL, show_number(DIRECT_TIMEOUT))
+    log.info("API checks: mcstatus.io every %s s (query %s, %d s server timeout); Java servers it can't check go to "
+             "mcsrvstat.us, every %s s", show_number(API_DELAY), "on" if API_QUERY else "off", API_SERVER_TIMEOUT,
+             show_number(MCSRVSTAT_DELAY))
     if API_DELAY < 0.2:
         log.warning("API_DELAY is %s: below 0.2, mcstatus.io rate-limits the bot, which makes scans slower, not faster",
                     show_number(API_DELAY))
