@@ -268,7 +268,7 @@ play.example.com:25566
 ```
 
 - **Range lines** stand for every address in them: a network (`5.6.7.0/24`, without its first and last address, except in a /31 or /32), an inclusive range (`5.6.8.10-5.6.8.40`) or a wildcard (`5.6.9.*`, the same as a /24). A port after it applies to every address. Private and local addresses in a range are skipped; a range entirely inside a private block (`10.0.0.0/8`) is skipped as one line. The start message says how many range lines were expanded into how many addresses
-- Up to **30,000** servers per scan, in a file of at most 2 MB. That counts the addresses after expanding range lines, without duplicates: a list that goes over is refused, naming the line where it does
+- Up to **30,000** servers per scan, in a file of at most 2 MB. That counts the addresses after expanding range lines, without duplicates: a list that goes over is refused, naming the line where it does. The range lines in one list may cover at most twice that (60,000 addresses), counting overlapping and repeated ranges each time
 - Lines without a port use **25565** for Java and **19132** for Bedrock, and ports go from 1 to 65535. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many. Case and a trailing dot don't matter, and `1.2.3.4` is the same server as `1.2.3.4:25565`. A Java hostname with and without `:25565` counts as two servers, because without a port the bot follows the name's SRV record, which can point somewhere else
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
@@ -645,6 +645,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP, hostname or range per line; IPv6 isn't supported |
 | `❌ Too many IPs: line N (...) has N addresses` or `takes the list past 30000 addresses` | A range line, or the whole list after expanding its ranges, has more addresses than a scan takes | Split the range into smaller ones, or the list into several files |
+| `❌ Too many IPs: the range lines up to line N (...) cover N addresses` | The list repeats or overlaps big ranges, which cover more than twice `MAX_IPS_PER_SCAN` addresses together | Remove the repeated and overlapping range lines |
 | `❌ Too many IPs: asn:... (N prefixes) has N addresses` | The AS or country is bigger than one scan | Scan it one `cidr:` prefix at a time, or raise `MAX_IPS_PER_SCAN` |
 | `❌ RIPEstat answered HTTP ...` or `RIPEstat didn't answer` | RIPEstat (stat.ripe.net) had a problem or isn't reachable | Try again later. A big country can take RIPEstat several seconds to answer |
 | `❌ ASxxxx announces no IPv4 prefixes` or `No IPv4 space is registered to XX` | That AS announces nothing on the internet right now (or only IPv6), or the country code doesn't exist | Check the number or code |

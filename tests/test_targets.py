@@ -161,6 +161,20 @@ class TargetScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(expanded 2 range line(s) into 5 addresses, skipped 1 private or local address(es))",
                       self.replies()[0])
 
+    async def test_the_file_is_parsed_off_the_event_loop(self):
+        real = scanbot.asyncio.to_thread
+        with mock.patch.object(scanbot.asyncio, 'to_thread', side_effect=real) as to_thread:
+            await self.scan(self.attachment(b'1.2.3.4\n'))
+        self.assertIs(to_thread.call_args.args[0], scanbot.parse_list)
+        self.assertEqual(self.checked, ['1.2.3.4'])
+
+    async def test_a_file_repeating_a_big_range_is_refused(self):
+        # 1,000 lines: the refusal comes at line 4 however long the file is, and a broken limit then fails in
+        # seconds (test_ranges checks a full 2 MB file)
+        await self.scan(self.attachment(b'1.1.0.0/18\n' * 1_000))
+        self.assertIn("the range lines up to line 4 (`1.1.0.0/18`) cover 65,528 addresses", self.replies()[-1])
+        self.assertEqual((self.checked, scanbot.scans), ([], {}))
+
     async def test_a_file_past_the_limit_names_the_line(self):
         with mock.patch.object(scanbot, 'MAX_IPS_PER_SCAN', 2):
             await self.scan(self.attachment(b'1.2.3.4\n1.2.3.0/30\n'))

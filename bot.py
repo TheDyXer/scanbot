@@ -1217,14 +1217,19 @@ class ParsedList(NamedTuple):
 class TooManyAddresses(Exception):
     """
     The list has more addresses than a scan takes. `line_number` is the line that went over (None for a target);
-    `count` is set when that one line or target is too big on its own.
+    `count` is set when that one line or target is too big on its own, and `covered` when the list's range lines
+    together cover more than RANGE_WORK_FACTOR scans' worth of addresses (repeats and overlaps counted each time).
     """
-    def __init__(self, line_number, line, count=None, hint=""):
+    def __init__(self, line_number, line, count=None, hint="", covered=None):
         super().__init__(line)
-        self.line_number, self.line, self.count, self.hint = line_number, line, count, hint
+        self.line_number, self.line, self.count, self.hint, self.covered = line_number, line, count, hint, covered
 
     def reply(self):
         where = f"line {self.line_number} (`{self.line}`)" if self.line_number else f"`{self.line}`"
+        if self.covered is not None:
+            return (f"❌ **Too many IPs:** the range lines up to {where} cover {self.covered:,} addresses, counting "
+                    f"overlapping and repeated ranges each time; a list may cover at most "
+                    f"{RANGE_WORK_FACTOR * MAX_IPS_PER_SCAN}, and a scan takes at most {MAX_IPS_PER_SCAN}.")
         if self.count is not None:
             text = (f"❌ **Too many IPs:** {where} has {self.count:,} addresses; a scan takes at most "
                     f"{MAX_IPS_PER_SCAN}.")
@@ -1232,16 +1237,22 @@ class TooManyAddresses(Exception):
             text = f"❌ **Too many IPs:** {where} takes the list past {MAX_IPS_PER_SCAN} addresses, the most a scan takes."
         return f"{text} {self.hint}".rstrip()
 
+# Range lines may cover at most this many scans' worth of addresses together, counting repeats and overlaps each
+# time. Expanding costs about a microsecond per address even when they're all duplicates, so without this a small
+# file repeating a big range ("1.1.0.0/18" 100,000 times) would keep the bot busy for half an hour.
+RANGE_WORK_FACTOR = 2
+
 def parse_list(text, edition='java'):
     """
     The servers in a list file. Blank lines and lines starting with # are ignored. A line is an address (IP or
     hostname, optionally with a 1-65535 port) or a range line (network, range or wildcard), which stands for every
     public address in it. Of two lines for the same server (see dedupe_key) the first one is kept as it was
-    written. Raises TooManyAddresses as soon as the list passes MAX_IPS_PER_SCAN, naming the line, without
-    expanding the rest.
+    written. Raises TooManyAddresses as soon as the list passes MAX_IPS_PER_SCAN, or its range lines cover more than
+    RANGE_WORK_FACTOR times that, naming the line, without expanding the rest.
     """
     unique = {}
     invalid = duplicates = blocked = expanded_lines = expanded_addresses = 0
+    covered = 0  # Addresses in the range lines expanded so far, repeats included
 
     def add(entry, number, line):
         nonlocal duplicates
@@ -1278,6 +1289,9 @@ def parse_list(text, edition='java'):
             continue
         if size > MAX_IPS_PER_SCAN:
             raise TooManyAddresses(number, line, size)
+        covered += size
+        if covered > RANGE_WORK_FACTOR * MAX_IPS_PER_SCAN:
+            raise TooManyAddresses(number, line, covered=covered)
         public = 0
         for entry in range_entries(first, last, port):
             public += 1
@@ -2103,7 +2117,11 @@ async def load_addresses(ctx, file, target, edition):
         if target is not None:
             return await expand_target(target)
         text = await read_list_file(ctx, file)
-        return None if text is None else (parse_list(text, edition), None)
+        if text is None:
+            return None
+        # In a thread: a list near the size limit takes a second or so, which would hold up every other scan and
+        # the connection to Discord
+        return await asyncio.to_thread(parse_list, text, edition), None
     except TooManyAddresses as e:
         await ctx.send(e.reply())
     except TargetError as e:

@@ -115,5 +115,50 @@ class LimitTests(unittest.TestCase):
         self.assertEqual(parse('10.0.0.0/8\n1.2.3.4').addresses, ['1.2.3.4'])
 
 
+class RepeatedRangeTests(unittest.TestCase):
+    """A small file repeating a big range must not keep the bot busy: expanding costs time even for duplicates."""
+
+    def refused_quickly(self, text):
+        self.assertLessEqual(len(text.encode()), 2_000_000)
+        real, budget = scanbot.range_entries, [3 * scanbot.MAX_IPS_PER_SCAN]
+
+        def counted(*args):
+            # Without the limit these files take up to an hour; stop after a few scans' worth so the test fails fast
+            for entry in real(*args):
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise AssertionError("expanded more than three scans' worth of addresses")
+                yield entry
+
+        began = time.monotonic()
+        with mock.patch.object(scanbot, 'range_entries', counted), \
+                self.assertRaises(scanbot.TooManyAddresses) as caught:
+            parse(text)
+        self.assertLess(time.monotonic() - began, 1)
+        return caught.exception
+
+    def test_a_2_mb_file_repeating_one_range_is_refused_at_once(self):
+        e = self.refused_quickly('1.1.0.0/18\n' * 181_818)
+        self.assertEqual((e.line_number, e.covered), (4, 4 * 16_382))
+        self.assertIn("the range lines up to line 4 (`1.1.0.0/18`) cover 65,528 addresses", e.reply())
+        self.assertIn(f"a scan takes at most {scanbot.MAX_IPS_PER_SCAN}", e.reply())
+
+    def test_shifting_each_range_doesnt_get_around_it(self):
+        e = self.refused_quickly(''.join(f'1.1.0.{i % 250}-1.1.63.{i % 250}\n' for i in range(80_000)))
+        self.assertEqual(e.line_number, 4)
+
+    def test_many_small_repeated_ranges_are_refused_too(self):
+        e = self.refused_quickly('1.1.0.0/30\n' * 181_818)
+        self.assertEqual(e.line_number, scanbot.RANGE_WORK_FACTOR * scanbot.MAX_IPS_PER_SCAN // 2 + 1)
+
+    def test_ordinary_overlaps_are_fine(self):
+        parsed = parse('1.2.0.0/18\n1.2.0.0/19\n1.2.3.*')
+        self.assertEqual((len(parsed.addresses), parsed.duplicates), (16_382, 8_190 + 254))
+
+    def test_a_2_mb_file_of_repeated_plain_lines_is_still_read(self):
+        parsed = parse('1.1.1.1\n' * 250_000)
+        self.assertEqual((parsed.addresses, parsed.duplicates), (['1.1.1.1'], 249_999))
+
+
 if __name__ == '__main__':
     unittest.main()
