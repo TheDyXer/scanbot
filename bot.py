@@ -25,8 +25,10 @@ import signal
 import socket
 import sys
 import time
+import types
 from typing import Literal, NamedTuple, Optional
 
+import jobs
 import pinger
 import vpn_switch
 from pinger import is_public_ip
@@ -97,6 +99,8 @@ GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
 GEO_ASN_DB_PATH = (os.environ.get('GEO_ASN_DB_PATH')
                    or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dbip-asn-lite.mmdb'))
 GEO_ASN_DB_URL = 'https://download.db-ip.com/free/dbip-asn-lite-{month}.mmdb.gz'
+# Running and recent scans are saved here, so that a restart resumes them. With Docker: ./state, mounted at /state
+STATE_DIR = os.environ.get('STATE_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state')
 USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
 # These can be changed in .env (see README, "Configuration"); a value out of range stops the bot at startup
 try:
@@ -121,6 +125,10 @@ try:
     PROGRESS_INTERVAL = env_int('PROGRESS_INTERVAL', 3, 2, 600)  # Seconds between progress message updates
     # Without the VPN: seconds between new tries of direct pings while they don't work (the startup probe failed)
     DIRECT_RECHECK = env_int('DIRECT_RECHECK', 300, 10, 86400)
+    # Seconds between saves of a running scan's progress (see STATE_DIR): a crash loses at most this much of a scan
+    CHECKPOINT_INTERVAL = env_int('CHECKPOINT_INTERVAL', 10, 2, 600)
+    # Ended scans kept on disk per user, with their results
+    KEEP_FINISHED_PER_USER = env_int('KEEP_FINISHED_PER_USER', 5, 2, 1000)
 except ValueError as e:
     print(f"❌ Error: {e}")
     sys.exit(1)
@@ -434,6 +442,7 @@ bot.probed_at = 0.0  # With the VPN: when the probes last ran (time.monotonic)
 bot.vpn_switcher = None  # With Mullvad: moves the VPN off servers that are down (set in on_ready)
 bot.direct_watcher = None  # Without the VPN: tries direct pings again while they don't work (set in on_ready)
 bot.geo_watcher = None  # Keeps the country database up to date (set in on_ready)
+bot.resumed = False  # Set once on_ready has put back the scans saved before a restart
 
 class Scan:
     """
@@ -449,11 +458,14 @@ class Scan:
         self.stopped_by = None        # Who used /stop on it, if anyone
         self.stop_reason = None       # 'user' for /stop, 'restart' when the bot is shutting down
         self.done = asyncio.Event()   # Set once it has finished, results posted, and been forgotten
+        self.job = None               # Its jobs.Job: what it scans and how far it has got
 
 scans = {}  # User ID -> that user's scan, queued or running
 queue = []  # Scans waiting for a free slot, oldest first
 shutting_down = False  # Set by shutdown(): no new scans, and queued ones don't start
 shutdown_tasks = set()  # shutdown() runs started by a signal, kept so they aren't garbage collected
+resume_tasks = set()    # Scans resumed after a restart (start_resumed), kept for the same reason
+store = None  # The jobs.JobStore that scans are saved in, or None when they can't be (opened in main)
 
 def running_count():
     return sum(1 for s in scans.values() if s.running)
@@ -1370,22 +1382,41 @@ def direct_slots():
         direct_slots_state = (key, asyncio.Semaphore(DIRECT_CONCURRENCY_TOTAL))
     return direct_slots_state[1]
 
-async def run_direct(ips, results, state, edition='java', stop=None):
+class Cursor:
+    """
+    How far a phase has got, for resuming after a restart: state['cursor'] is the number of entries (from the start
+    of the phase's list) that are all checked. Servers are checked many at once and finish out of order, so a few
+    past the cursor may be checked too; a resumed scan checks those again.
+    """
+    def __init__(self, state, offset, count):
+        self.state, self.offset, self.checked, self.low = state, offset, bytearray(count), 0
+        state['cursor'] = offset
+
+    def done(self, index):
+        self.checked[index] = 1
+        while self.low < len(self.checked) and self.checked[self.low]:
+            self.low += 1
+        self.state['cursor'] = self.offset + self.low
+
+async def run_direct(ips, results, state, edition='java', stop=None, offset=0):
     """
     Pings every server directly: DIRECT_CONCURRENCY workers, each taking the next server from the list, and at most
     DIRECT_CONCURRENCY_TOTAL pings in flight across all scans. Returns the IPs that didn't answer, in file order.
+    `ips` may be the rest of a list whose first `offset` entries were checked before a restart.
     """
     stop = stop or asyncio.Event()
-    state.update(phase="Pinging servers", done=0, total=len(ips))
+    state.update(phase="Pinging servers", done=offset, total=offset + len(ips))
+    cursor = Cursor(state, offset, len(ips))
     slots = direct_slots()
     pinged = set()
     check_server = check_direct if edition == 'java' else check_direct_bedrock
-    remaining = iter(ips)  # Shared by the workers. next() can't be interrupted, so each server is taken once
+    remaining = iter(enumerate(ips))  # Shared by the workers. next() can't be interrupted, so each server is taken once
+    blocked = state.setdefault('blocked_entries', [])
 
     async def worker():
-        for ip in remaining:
+        for index, ip in remaining:
             if stop.is_set():
-                return
+                return  # Not checked, so the cursor stops here
             async with slots:
                 if stop.is_set():
                     return
@@ -1394,44 +1425,55 @@ async def run_direct(ips, results, state, edition='java', stop=None):
                 except BlockedAddress:
                     # Not pinged, and not passed on to the API either
                     state['done'] += 1
-                    state['blocked'] += 1
+                    if ip not in blocked:  # A resumed scan may check it again
+                        state['blocked'] += 1
+                        blocked.append(ip)
+                    cursor.done(index)
                     continue
             state['done'] += 1
             pinged.add(ip)
             if result:
+                if isinstance(result, dict) and not result.get('source'):
+                    result['source'] = 'direct'  # What the API phase skips (see retry_list)
+                if ip not in results:  # A resumed scan may check a server it found before the restart again
+                    state['found'] += 1
                 results[ip] = result
-                state['found'] += 1
+            cursor.done(index)
 
     await asyncio.gather(*(worker() for _ in range(min(DIRECT_CONCURRENCY, len(ips)))))
     return [ip for ip in ips if ip in pinged and ip not in results]
 
-async def run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False):
+async def run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False, offset=0):
     """
     Checks servers through mcstatus.io (and Java servers it can't check through mcsrvstat.us), starting one request
     every API_DELAY seconds. Scans running at the same time take turns, so together they stay within the limit.
-    Servers no service could check are counted in state['unchecked'], not as offline.
+    Servers no service could check are counted in state['unchecked'], not as offline. `ips` may be the rest of a
+    list whose first `offset` entries were checked before a restart.
     """
     stop = stop or asyncio.Event()
     phase = "Retrying unreachable servers via API" if retrying else "Checking servers via API"
     if vpn_down:
         phase += " (VPN down)"
-    state.update(phase=phase, done=0, total=len(ips))
+    state.update(phase=phase, done=offset, total=offset + len(ips))
+    cursor = Cursor(state, offset, len(ips))
 
-    async def check(ip):
+    async def check(index, ip):
         result = await check_api(session, ip, edition)
         state['done'] += 1
         if result is UNCHECKED:
             state['unchecked'] = state.get('unchecked', 0) + 1
         elif result:
+            if ip not in results:
+                state['found'] += 1
             results[ip] = result
-            state['found'] += 1
+        cursor.done(index)  # Not reached when cancelled by a stop: the cursor stops at the first unfinished check
 
     tasks = []
-    for ip in ips:
+    for index, ip in enumerate(ips):
         await api_pacer.wait(API_DELAY)
         if stop.is_set():
             break
-        tasks.append(asyncio.create_task(check(ip)))
+        tasks.append(asyncio.create_task(check(index, ip)))
 
     # Wait for the last checks, but not after a stop: one check can take half a minute (timeouts and retries), and
     # a stop for a restart has to post its results within SHUTDOWN_GRACE
@@ -1647,7 +1689,7 @@ def speed_text(direct, api):
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
                        vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None, error=False,
-                       networks=None, unchecked=0):
+                       networks=None, unchecked=0, resumed=0):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -1664,6 +1706,8 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         title += f" · {owner}"  # Several people may be scanning in the same channel
     summary = (f"{title}\n🟢 {len(populated)} with players · ⚪ {len(empty)} empty · 🔎 {total_ips} IPs\n"
                f"⏱️ **Time:** {minutes}m {seconds}s")
+    if resumed:
+        summary += f" (resumed {'once' if resumed == 1 else f'{resumed} times'} after the bot restarted)"
     speed = speed_text(direct, api)
     if speed and not stopped:
         summary += f"\n{speed}"
@@ -1867,7 +1911,13 @@ async def direct_pings_work(edition):
 
 @bot.event
 async def on_ready():
-    # on_ready runs again after reconnects; only probe once
+    # Before any await, so a /scan arriving now can't take a resumed scan's place (on_ready runs again after
+    # reconnects; this runs once)
+    pending = []
+    if store is not None and not bot.resumed:
+        bot.resumed = True
+        pending = register_resumable(store)
+    # Only probe once
     if bot.direct_ok is None and PINGER_URL:
         log.info("Pings go through the VPN (pinger at %s); Discord, the APIs and DNS use this machine's connection.",
                  PINGER_URL)
@@ -1891,6 +1941,9 @@ async def on_ready():
     if bot.geo_watcher is None:
         bot.geo_watcher = asyncio.create_task(watch_geo_db())
     log.info("Logged in as %s", bot.user.name)
+    if pending:
+        log.info("Resuming %d scan(s) saved before the restart", len(pending))
+        start_resumed(pending)
     await update_presence()
 
 @bot.event
@@ -1927,7 +1980,8 @@ async def help(ctx):
               "`api` is `on` (default) or `off`: with `off`, a server that doesn't answer a direct ping counts as "
               "offline instead of being retried through mcstatus.io, which is much faster for long lists of "
               "mostly dead addresses.\n"
-              f"Up to {MAX_CONCURRENT_SCANS} people can scan at once, one scan each; more wait in a queue.",
+              f"Up to {MAX_CONCURRENT_SCANS} people can scan at once, one scan each; more wait in a queue. If the "
+              "bot restarts (for an update), scans carry on where they left off.",
         inline=False
     )
     embed.add_field(
@@ -1978,7 +2032,7 @@ async def stop(ctx, scope: Optional[Literal['all']] = None, user: Optional[disco
     if scan is None:
         await ctx.send("⚠️ **You don't have a scan running.**")
         return
-    started = scan.running
+    started = scan.running or (scan.job is not None and has_progress(scan.job))  # Queued again after a restart
     request_stop(scan, by=ctx.author)
     if started:
         await ctx.send("🛑 **Stop requested.** Your scan will stop shortly and post what it found so far...")
@@ -2157,85 +2211,227 @@ async def run_scan(ctx, scan, file, edition, api_retry=True, target=None):
         await ctx.send(no_direct_reply())
         return
 
+    job = jobs.new_job(ctx.author.id, ctx.author.mention, scan.guild_id, plain_id(getattr(ctx.channel, 'id', None)),
+                       edition, api_retry, {'kind': 'file' if target is None else 'target',
+                                            'description': source or getattr(file, 'filename', 'the file')},
+                       total_ips, extra)
+    scan.job = job
+    # Saved before it's queued, so a restart while it waits doesn't lose it either
+    if store is not None and store.write_list(job, ips) and store.save(job):
+        job.persistent = True
+    await run_job(ctx, scan, job, ips)
+
+def plain_id(value):
+    """A Discord ID worth saving: an int (tests pass mocks)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+def saving(job):
+    """Whether this scan is saved on disk (it isn't when there's no store, or its list couldn't be written)."""
+    return store is not None and getattr(job, 'persistent', False)
+
+def save_job(job, status=None):
+    if status:
+        job.status = status
+    if saving(job):
+        store.save(job)
+
+def forget_job(job):
+    """A scan that never started: nothing worth keeping."""
+    if saving(job):
+        store.delete(job)
+
+def has_progress(job):
+    """Whether a scan got anywhere before a restart."""
+    return bool(job.results or job.blocked) or job.cursor != {'phase': 'direct', 'index': 0}
+
+def retry_list(ips, results, blocked):
+    """
+    What the API phase checks: every entry the direct pings didn't find, except names of private addresses. Worked
+    out from what's saved instead of saved itself, so it comes out the same after a restart.
+    """
+    blocked = set(blocked)
+    return [ip for ip in ips if ip not in blocked and (results.get(ip) or {}).get('source') != 'direct']
+
+def resume_note(job, ips):
+    """How far a resumed scan had got, for its start message."""
+    found = len(job.results)
+    phase, index = job.cursor['phase'], job.cursor['index']
+    if phase == 'direct':
+        return f"{index:,} of {len(ips):,} were pinged before the restart, {found} found so far."
+    if phase == 'api':
+        return (f"Direct pings were done before the restart, and {index:,} of "
+                f"{len(retry_list(ips, job.results, job.blocked)):,} API checks; {found} found so far.")
+    return f"Every server was checked before the restart; {found} found."
+
+async def checkpoints(job, state, sync):
+    """Saves a running scan's progress every CHECKPOINT_INTERVAL seconds, when it has changed."""
+    last = None
+    while True:
+        await asyncio.sleep(CHECKPOINT_INTERVAL)
+        key = (job.cursor['phase'], state.get('cursor'), len(job.results), state['blocked'], state.get('unchecked'))
+        if key != last:
+            sync()
+            store.save(job)
+            last = key
+
+async def run_job(ctx, scan, job, ips, place=None, resumed=False):
+    """
+    Runs a scan: waits for a slot, pings the servers, asks the API about the rest, looks up countries and posts the
+    results. A resumed job (after a restart) carries on from where it had got to. `place` is its place in the queue
+    if it already has one (register_resumable), None to claim a slot here.
+    """
+    edition, api_retry, total_ips = job.edition, job.api_retry, job.total
+    owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
+
+    async def tell(text, channel=False):
+        # Replies to the command, or posts in the channel when that reply may no longer work: a slash command's reply
+        # stops working after 15 minutes, which the queue may have taken, and a resumed scan has no command
+        if channel or resumed:
+            return await send_channel(ctx, text)
+        return await ctx.send(text)
+
     # --- Wait for a free slot --- (unless /stop came while the file was being read)
-    place = 0 if scan.stop.is_set() else claim_slot(scan)
+    if place is None:
+        place = 0 if scan.stop.is_set() else claim_slot(scan)
     if place:
-        await ctx.send(f"🕒 **Queued** (#{place}). All {MAX_CONCURRENT_SCANS} scan slots are busy; your scan of "
+        save_job(job, 'queued' if not has_progress(job) else job.status)
+        if resumed:
+            await tell(f"🕒 {owner}, your scan is back in the queue (#{place}) after the restart. It carries on when "
+                       "a slot frees up; `/stop` cancels it.")
+        else:
+            await tell(f"🕒 **Queued** (#{place}). All {MAX_CONCURRENT_SCANS} scan slots are busy; your scan of "
                        f"{total_ips} IPs starts automatically when one frees up. `/stop` cancels it.")
         await update_presence()
         await scan.turn.wait()
-    if scan.stop.is_set():
+    if scan.stop.is_set() and scan.stop_reason == 'restart' and saving(job):
+        # The bot is restarting before this scan got its turn: it starts (or carries on) once the bot is back
+        if not has_progress(job):
+            save_job(job, 'queued')
+            await tell(f"⏸️ {owner}, the bot is restarting, so your {'queued ' if place else ''}scan starts once "
+                       "it's back (usually within a minute).", channel=bool(place))
+        else:
+            save_job(job, 'interrupted')
+        return
+    if scan.stop.is_set() and not has_progress(job):
         # Stopped before it started. The owner's own /stop already said so; a moderator's reply
         # may be in another channel, so tell the owner here.
         stopped_by = scan.stopped_by
         if scan.stop_reason == 'restart':
-            note = (f"🛑 {ctx.author.mention}, your {'queued ' if place else ''}scan was cancelled because the bot "
-                    "is restarting. Start it again in a minute.")
-            # A queued scan's slash command reply may have stopped working (15 minutes)
-            await (send_channel(ctx, note) if place else ctx.send(note))
+            await tell(f"🛑 {ctx.author.mention}, your {'queued ' if place else ''}scan was cancelled because the "
+                       "bot is restarting. Start it again in a minute.", channel=bool(place))
         elif not place:
-            await ctx.send("🛑 **Scan cancelled.**")
+            await tell("🛑 **Scan cancelled.**")
         elif stopped_by is not None and stopped_by.id != ctx.author.id:
             await send_channel(ctx, f"🛑 {ctx.author.mention}, your queued scan was cancelled by {stopped_by.mention}.")
+        forget_job(job)
         return
 
-    start_time = time.monotonic()  # Not time.time(): a clock adjustment mid-scan must not change the duration
     # Direct pings, unless the startup probe failed. With the VPN, pings only ever go through it:
     # while it's down, every server is checked through the API instead.
     direct_ok = await direct_pings_work(edition)
-    if not api_retry and not direct_ok:
-        # They stopped working while this scan was queued
-        if place:
-            await send_channel(ctx, no_direct_reply())
-        else:
-            await ctx.send(no_direct_reply())
-        return
+    refused = False
+    if not api_retry and not direct_ok and not scan.stop.is_set():
+        # They stopped working while this scan was queued (or the bot was down)
+        await tell(no_direct_reply(), channel=bool(place))
+        if not has_progress(job):
+            forget_job(job)
+            return
+        refused = True  # Post what it found before the restart
     no_vpn = bool(PINGER_URL) and not direct_ok
-    owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
     label = "Bedrock " if edition == 'bedrock' else ""
-    started = f"🚀 **Scan started** by {owner} on {total_ips} {label}IPs{extra}..."
+    if resumed and has_progress(job):
+        started = (f"🔄 **Scan resumed** after a restart: {owner}'s scan of {total_ips} {label}IPs{job.notes}. "
+                   f"{resume_note(job, ips)}")
+    else:
+        started = f"🚀 **Scan started** by {owner} on {total_ips} {label}IPs{job.notes}..."
     if not api_retry:
         started += "\nℹ️ **API retry is off:** a server that doesn't answer a direct ping counts as offline."
     if no_vpn:
         started += "\n⚠️ **The VPN is down:** checking every server through the API only, so this is slower."
-    if place:
-        # The slash command's reply stops working after 15 minutes, which the queue may have taken
-        await send_channel(ctx, started)
-    else:
-        await ctx.send(started)
+    if not refused and not scan.stop.is_set():
+        await tell(started, channel=bool(place))
     await update_presence()
+    if resumed and job.progress_message_id and hasattr(ctx.channel, 'get_partial_message'):
+        try:
+            await ctx.channel.get_partial_message(job.progress_message_id).edit(
+                content="⏩ The bot restarted; this scan's progress continues below.")
+        except discord.HTTPException:
+            pass  # Deleted, or in a channel the scan no longer posts to
 
-    state = {"phase": "Starting", "done": 0, "total": total_ips, "found": 0, "blocked": 0, "owner": owner}
+    state = {"phase": "Starting", "done": 0, "total": total_ips, "found": len(job.results),
+             "blocked": len(job.blocked), "owner": owner, "unchecked": job.unchecked,
+             "blocked_entries": list(job.blocked), "cursor": job.cursor['index']}
     progress = await send_channel(ctx, progress_text(state))
-    updater = asyncio.create_task(report_progress(progress, state))
-    results = {}
+    job.progress_message_id = plain_id(getattr(progress, 'id', None)) if progress is not None else None
+    results = job.results
     locations = {}
     networks = {}
-    direct = api = None  # (servers checked, seconds) for each phase that ran, for the speed line
     retry = []
     error = False
+    elapsed_before = job.elapsed
+    segment = time.monotonic()  # Not time.time(): a clock adjustment mid-scan must not change the duration
+    # The phase running now, for the speed line: (name, its figures from earlier runs, the index this run started
+    # at, blocked names so far, when it started). Saved as it goes, so a crash doesn't lose the time it ran.
+    phase_run = None
 
+    def measure(reached=None):
+        """Puts the running phase's figures, (servers checked, seconds) over all its runs, into the job."""
+        if phase_run is None:
+            return
+        name, before, start, blocked_before, began = phase_run
+        checked = (state['cursor'] if reached is None else reached) - start - (state['blocked'] - blocked_before)
+        seconds = time.monotonic() - began
+        job.timings[name] = [before[0] + checked, before[1] + seconds] if before else [checked, seconds]
+
+    def sync():
+        """Copies the scan's progress into its job, ready to save."""
+        if job.cursor['phase'] in ('direct', 'api'):
+            job.cursor['index'] = state['cursor']
+        job.blocked = list(state['blocked_entries'])
+        job.unchecked = state.get('unchecked', 0)
+        job.elapsed = elapsed_before + (time.monotonic() - segment)
+        measure()
+
+    def enter(phase):
+        job.cursor = {'phase': phase, 'index': 0}
+        state['cursor'] = 0
+        sync()
+        save_job(job)
+
+    save_job(job, 'running')
+    updater = asyncio.create_task(report_progress(progress, state))
+    saver = asyncio.create_task(checkpoints(job, state, sync)) if saving(job) else None
     try:
         async with api_session() as session:
             # 1. Direct pings, many at once
-            if direct_ok:
-                began = time.monotonic()
-                retry = await run_direct(ips, results, state, edition, stop=scan.stop)
-                direct = (len(ips) - state['blocked'], time.monotonic() - began)
-            else:
-                retry = ips
+            if not refused and not scan.stop.is_set() and job.cursor['phase'] == 'direct':
+                if direct_ok:
+                    start = job.cursor['index']
+                    phase_run = ('direct', job.timings.get('direct'), start, state['blocked'], time.monotonic())
+                    await run_direct(ips[start:], results, state, edition, stop=scan.stop, offset=start)
+                    measure(None if scan.stop.is_set() else len(ips))  # Stopped: as far as it got
+                    phase_run = None
+                if not scan.stop.is_set():
+                    enter('api')
 
             # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans (Java servers it
             # can't check go to mcsrvstat.us)
-            if retry and api_retry and not scan.stop.is_set():
-                began = time.monotonic()
-                await run_api(session, retry, results, state, retrying=bool(direct_ok), edition=edition,
-                              stop=scan.stop, vpn_down=no_vpn)
-                api = (len(retry), time.monotonic() - began)
+            retry = retry_list(ips, results, state['blocked_entries'])
+            if not refused and not scan.stop.is_set() and job.cursor['phase'] == 'api':
+                if retry and api_retry:
+                    start = job.cursor['index']
+                    retrying = job.timings.get('direct') is not None
+                    phase_run = ('api', job.timings.get('api'), start, state['blocked'], time.monotonic())
+                    await run_api(session, retry[start:], results, state, retrying=retrying, edition=edition,
+                                  stop=scan.stop, vpn_down=no_vpn, offset=start)
+                    measure(None if scan.stop.is_set() else len(retry))
+                    phase_run = None
+                if not scan.stop.is_set():
+                    enter('geo')
 
             # 3. Countries and networks: offline databases first (instant), ip-api.com for what they don't know.
             # The network database only counts when it's open, so a failed download doesn't send every server
-            # to ip-api.com.
+            # to ip-api.com. Done again in full after a restart: it isn't saved until the scan ends.
             addresses = sorted({r['address'] for r in results.values() if r['address']})
             locations = lookup_countries(addresses)
             networks = lookup_networks(addresses)
@@ -2246,16 +2442,35 @@ async def run_scan(ctx, scan, file, edition, api_retry=True, target=None):
                 for address, code in found.items():
                     locations.setdefault(address, code)  # The offline database's answer wins
                 state['done'] = len(addresses)
+            if not scan.stop.is_set():
+                enter('send')  # A crash while posting posts again after the restart
     except Exception:
         # Exception, not BaseException: cancelling the task (the bot shutting down hard) must still cancel it
         error = True
+        job.error = True
         log.exception("Scan by %s failed while %s (%d/%d); posting the %d server(s) found so far",
                       ctx.author, state['phase'].lower(), state['done'], state['total'], len(results))
     finally:
         updater.cancel()
+        if saver is not None:
+            saver.cancel()
+        await asyncio.gather(updater, *([saver] if saver else []), return_exceptions=True)
+    sync()
 
-    stopped = scan.stop.is_set() or error
+    stopped = scan.stop.is_set() or error or refused
     stop_reason = scan.stop_reason if scan.stop.is_set() else None
+    if stop_reason == 'restart' and saving(job) and not error:
+        # Saved instead of posted: it carries on from here once the bot is back
+        save_job(job, 'interrupted')
+        if progress is not None:
+            try:
+                await progress.edit(content=(
+                    f"⏸️ **Paused:** the bot is restarting. {owner}'s scan carries on once it's back, usually within "
+                    f"a minute ({state['phase'].lower()}: {state['done']}/{state['total']}, {state['found']} found "
+                    "so far)."))
+            except discord.HTTPException:
+                pass
+        return
     if error:
         head = "⚠️ **Error:** the scan stopped early."
     elif stop_reason == 'restart':
@@ -2271,10 +2486,125 @@ async def run_scan(ctx, scan, file, edition, api_retry=True, target=None):
     # With api:off, the servers that didn't answer a direct ping are offline as far as this scan knows. (A stopped
     # scan doesn't know how many never got pinged, so it says nothing.)
     not_retried = len(retry) if not api_retry and not stopped else 0
-    await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
+    job.locations = dict(locations)
+    job.networks = {address: list(network) for address, network in networks.items()}
+    job.stopped_by = plain_id(getattr(scan.stopped_by, 'id', None))
+    if stopped:
+        job.finished_at = jobs.now()
+        save_job(job, 'stopped')  # Ended before posting: a crash now doesn't make a stopped scan carry on
+    timings = {phase: tuple(t) if t else None for phase, t in job.timings.items()}
+    await send_results(ctx, list(results.values()), locations, stopped, total_ips, job.elapsed,
                        blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
-                       direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason, error=error,
-                       networks=networks, unchecked=state.get('unchecked', 0))
+                       direct=timings.get('direct'), api=timings.get('api'), not_retried=not_retried,
+                       stop_reason=stop_reason, error=error, networks=networks, unchecked=state.get('unchecked', 0),
+                       resumed=job.resumed)
+    if not stopped:
+        job.finished_at = jobs.now()
+        save_job(job, 'done')
+    if saving(job):
+        store.remove_list(job)
+        store.prune(job.owner_id, KEEP_FINISHED_PER_USER)
+
+# --- Resuming after a restart ---
+
+class ChannelContext:
+    """
+    Stands in for a command's context when a scan resumes after a restart. There's no command to reply to, so
+    everything goes to the channel (send_channel), and send(), its fallback, is a DM to the owner.
+    """
+    interaction = None
+
+    def __init__(self, channel, owner):
+        self.channel = channel
+        self.author = owner
+        self.guild = getattr(channel, 'guild', None)  # For upload_limit; None in DMs
+        self.user = None
+
+    async def send(self, *args, **kwargs):
+        if self.user is None:
+            self.user = await bot.fetch_user(self.author.id)
+        return await self.user.send(*args, **kwargs)
+
+def abandon(job, why):
+    log.warning("Can't resume scan %s by user %s: %s", job.id, job.owner_id, why)
+    job.finished_at = jobs.now()
+    save_job(job, 'abandoned')
+    if saving(job):
+        store.remove_list(job)
+
+def register_resumable(store):
+    """
+    Puts the scans saved before a restart back, oldest first: each gets a slot or a place in the queue, in the order
+    they were started. Synchronous, so no new /scan can get in between. Returns [(scan, job, place in the queue)].
+    """
+    pending = []
+    for job in store.unfinished():
+        job.persistent = True
+        if job.owner_id in scans:
+            abandon(job, "its owner has an older scan to resume")
+            continue
+        scan = Scan(types.SimpleNamespace(id=job.owner_id, mention=job.owner_mention), job.guild_id)
+        scan.job = job
+        scans[job.owner_id] = scan
+        pending.append((scan, job, claim_slot(scan)))
+    return pending
+
+async def resume_context(job):
+    """Where a resumed scan posts: the channel it was started in, or else a DM to its owner. None if neither works."""
+    channel = bot.get_channel(job.channel_id) if job.channel_id else None
+    if channel is None and job.channel_id:
+        try:
+            channel = await bot.fetch_channel(job.channel_id)
+        except (discord.HTTPException, discord.InvalidData):  # Deleted, the bot can't see it any more, or odd
+            channel = None
+    owner = types.SimpleNamespace(id=job.owner_id, mention=job.owner_mention)
+    if channel is not None:
+        return ChannelContext(channel, owner)
+    try:
+        user = await bot.fetch_user(job.owner_id)
+        channel = await user.create_dm()
+        await channel.send("⏩ The channel your scan was started in is gone, or the bot can't see it any more, so "
+                           "it carries on here.")
+    except discord.HTTPException as e:
+        abandon(job, f"its channel is gone and its owner can't be sent a DM ({e})")
+        return None
+    return ChannelContext(channel, owner)
+
+async def run_resumed(scan, job, place):
+    """Resumes one saved scan. Like the /scan command, it always frees its slot, whatever happens."""
+    try:
+        ctx = await resume_context(job)
+        if ctx is None:
+            return
+        ips = store.read_list(job)
+        if not ips:
+            abandon(job, "its list of addresses is gone")
+            return
+        job.resumed += 1
+        await run_job(ctx, scan, job, ips, place=place, resumed=True)
+    except Exception:
+        log.exception("Resuming scan %s failed", job.id)
+        abandon(job, "it failed (see above)")
+    finally:
+        release(scan)
+        await update_presence()
+
+def start_resumed(pending):
+    for scan, job, place in pending:
+        task = asyncio.create_task(run_resumed(scan, job, place))
+        resume_tasks.add(task)
+        task.add_done_callback(resume_tasks.discard)
+
+def open_store():
+    """Opens the folder scans are saved in (main, at startup). Without it, a restart ends running scans."""
+    global store
+    store = jobs.JobStore.open(STATE_DIR)
+    if store is None:
+        return
+    store.prune_all(KEEP_FINISHED_PER_USER)
+    waiting = len(store.unfinished())
+    log.info("Scans are saved in %s%s", STATE_DIR,
+             f"; {waiting} unfinished scan(s) resume after login" if waiting else "")
 
 async def shutdown(reason, grace=SHUTDOWN_GRACE, close=None):
     """
@@ -2291,8 +2621,8 @@ async def shutdown(reason, grace=SHUTDOWN_GRACE, close=None):
         return
     shutting_down = True
     pending = list(scans.values())
-    log.warning("%s: shutting down. Stopping %d running and %d queued scan(s) first", reason,
-                sum(1 for s in pending if s.running), len(queue))
+    log.warning("%s: shutting down. %s %d running and %d queued scan(s) first", reason,
+                "Saving" if store is not None else "Stopping", sum(1 for s in pending if s.running), len(queue))
     for scan in pending:
         if not scan.stop.is_set():  # One its owner or a moderator already stopped keeps that reason
             request_stop(scan, reason='restart')
@@ -2348,6 +2678,7 @@ async def main():
         print(f"❌ Error: {e}")
         sys.exit(1)
     await load_geo_db()
+    open_store()
     # discord.py only builds its own connector if none is set, so Discord traffic uses Quad9 too
     bot.http.connector = aiohttp.TCPConnector(limit=0, resolver=Quad9Resolver())
     try:

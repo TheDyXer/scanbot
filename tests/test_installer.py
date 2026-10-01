@@ -222,5 +222,44 @@ class FetchComposeTests(InstallerTestCase):
         self.assertNotIn("SCANBOT_COMPOSE_DIGEST", self.env())
 
 
+class StateDirTests(InstallerTestCase):
+    """make_state_dir: the folder scans are saved in, writable by the user the bot runs as."""
+
+    # Stand-ins for id and chown: the tests don't run as root
+    AS_ROOT = """
+id() { echo 0; }
+chown() { echo "chown $*" >> calls; }
+"""
+
+    def test_it_is_created(self):
+        done = self.bash('make_state_dir')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.install_dir / 'state').is_dir())
+        self.assertEqual(done.stdout, '')
+
+    def test_under_sudo_it_is_given_to_the_bots_user(self):
+        write(self.install_dir / '.env', "SCANBOT_UID=1000\nSCANBOT_GID=1001\n")
+        done = self.bash(self.AS_ROOT + 'make_state_dir')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(read(self.install_dir / 'calls'), "chown 1000:1001 state\n")
+
+    def test_under_sudo_without_a_user_in_env_nothing_is_changed(self):
+        done = self.bash(self.AS_ROOT + 'make_state_dir')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.install_dir / 'calls').exists())
+
+    @unittest.skipIf(os.name == 'nt' or (hasattr(os, 'geteuid') and os.geteuid() == 0),
+                     "needs Unix permissions and a user that isn't root")
+    def test_a_folder_the_user_cant_write_is_reported_with_the_fix(self):
+        state = self.install_dir / 'state'
+        state.mkdir()
+        state.chmod(0o555)
+        self.addCleanup(state.chmod, 0o755)
+        done = self.bash('make_state_dir')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("The bot can't save scans in", done.stdout)
+        self.assertIn(f"sudo chown {os.getuid()}:{os.getgid()}", done.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

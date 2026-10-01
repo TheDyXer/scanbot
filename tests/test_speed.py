@@ -98,12 +98,13 @@ class ScanSpeedTests(unittest.IsolatedAsyncioTestCase):
         def online(ip):
             return scanbot.make_result(ip, ip, 3, 20, [], '1.21', 'hello')
 
-        async def fake_run_direct(ips, results, state, edition='java', stop=None):
+        async def fake_run_direct(ips, results, state, edition='java', stop=None, offset=0):
             self.clock.advance(self.direct_seconds)
-            results.update({ip: online(ip) for ip in ips[:self.answered]})
+            results.update({ip: dict(online(ip), source='direct') for ip in ips[:self.answered]})
             return [ip for ip in ips if ip not in results]
 
-        async def fake_run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False):
+        async def fake_run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False,
+                               offset=0):
             self.clock.advance(self.api_seconds)
             results.update({ip: online(ip) for ip in ips})
 

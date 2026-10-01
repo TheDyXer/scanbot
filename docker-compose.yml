@@ -39,8 +39,13 @@ services:
       PROGRESS_INTERVAL: ${PROGRESS_INTERVAL:-}
       GEO_DB_MAX_AGE_DAYS: ${GEO_DB_MAX_AGE_DAYS:-}
       DIRECT_RECHECK: ${DIRECT_RECHECK:-}
+      CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-}
+      KEEP_FINISHED_PER_USER: ${KEEP_FINISHED_PER_USER:-}
+      # Running and recent scans are saved here, so an update or restart resumes them
+      STATE_DIR: /state
     volumes:
       - ./data:/data:ro
+      - ./state:/state  # Must be writable by SCANBOT_UID (the installer creates it)
     labels:
       # Picked up by the watchtower service below, or by a Watchtower you already run
       com.centurylinklabs.watchtower.enable: "true"

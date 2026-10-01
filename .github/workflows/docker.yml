@@ -55,7 +55,7 @@ jobs:
           fi
 
       - name: Python files compile
-        run: python3 -m compileall -q bot.py pinger.py vpn_select.py vpn_switch.py tests
+        run: python3 -m compileall -q bot.py jobs.py pinger.py vpn_select.py vpn_switch.py tests
 
       - name: Compose files are valid
         run: |

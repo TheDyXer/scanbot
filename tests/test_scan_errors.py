@@ -33,12 +33,14 @@ class ScanErrorTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.send = mock.AsyncMock(return_value=self.progress)
         self.ctx.channel.send = mock.AsyncMock(return_value=self.progress)
 
-        async def fake_run_direct(ips, results, state, edition='java', stop=None):
-            results.update({ip: scanbot.make_result(ip, ip, 3, 20, [], '1.21', 'hello') for ip in ips[:3]})
+        async def fake_run_direct(ips, results, state, edition='java', stop=None, offset=0):
+            results.update({ip: scanbot.make_result(ip, ip, 3, 20, [], '1.21', 'hello', source='direct')
+                            for ip in ips[:3]})
             state['found'] = 3
             return [ip for ip in ips if ip not in results]
 
-        async def fake_run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False):
+        async def fake_run_api(session, ips, results, state, retrying, edition='java', stop=None, vpn_down=False,
+                               offset=0):
             raise self.api_error
 
         for p in (mock.patch.object(scanbot, 'run_direct', fake_run_direct),

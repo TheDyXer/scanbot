@@ -80,6 +80,7 @@ e5015f8c2b2928c0a4e708d45520a4f178692785ffdd874afd3a9b054ec1bead
 b0180b6f8fd45dea4d20daddc100718404fc964cec9f3c73af37b04cfdf2204c
 f42480fb21fe2c911e7be3ded48ee8b8055e86b00349e1157daebafbb1b9de43
 70af29717480df28f808ad0d334b3fc9a65148a83e629d8d9988628a52586922
+4ffb6680069590e1c3230488897e4394f6f2d757344f9f400e9cbaf1da939f89
 "
 
 # The compose file without the watchtower block (from its comment to the next service or top-level
@@ -136,6 +137,19 @@ fetch_compose() {
   env_set SCANBOT_COMPOSE_DIGEST "${new}"
 }
 
+# Running scans are saved in ./state, so a restart resumes them. Docker would create a missing folder as root,
+# which the bot (SCANBOT_UID) can't write to, so it's made here
+make_state_dir() {
+  local uid gid
+  mkdir -p state
+  uid="$(env_get SCANBOT_UID)"; gid="$(env_get SCANBOT_GID)"
+  if [ "$(id -u)" = 0 ] && [ -n "${uid}" ] && [ -n "${gid}" ]; then
+    chown "${uid}:${gid}" state
+  elif [ ! -w state ]; then
+    warn "The bot can't save scans in $(pwd)/state, so a restart ends them. Fix: sudo chown $(id -u):$(id -g) $(pwd)/state"
+  fi
+}
+
 # tests/test_installer.py sources this file for the functions above; nothing below runs then
 if (return 0 2>/dev/null); then return 0; fi
 
@@ -183,6 +197,7 @@ else
   VPN_SETUP="${VPN_SETUP:-yes}"  # First install: ask about the VPN too
 fi
 fetch_compose  # After .env, which keeps its digest
+make_state_dir
 IMAGE="$(env_get SCANBOT_IMAGE)"; IMAGE="${IMAGE:-ghcr.io/thedyxer/scanbot:latest}"
 GLUETUN_IMAGE="$(env_get GLUETUN_IMAGE)"; GLUETUN_IMAGE="${GLUETUN_IMAGE:-qmcgaw/gluetun:v3}"
 

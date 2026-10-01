@@ -5,3 +5,4 @@ __pycache__/
 *.mmdb.tmp
 vpn.env
 vpn/
+state/
