@@ -36,11 +36,12 @@ class RegistrationTests(unittest.TestCase):
                 self.assertIsNotNone(scanbot.bot.get_command(name))
         self.assertIs(scanbot.bot.get_command('check'), scanbot.bot.get_command('scan'))
 
-    def test_scan_takes_a_required_attachment_first(self):
+    def test_scan_takes_an_attachment_or_a_target_both_optional(self):
         params = scanbot.bot.tree.get_command('scan').parameters
-        self.assertEqual([p.name for p in params], ['file', 'edition', 'api'])
+        self.assertEqual([p.name for p in params], ['file', 'target', 'edition', 'api'])
         self.assertEqual(params[0].type, discord.AppCommandOptionType.attachment)
-        self.assertTrue(params[0].required)
+        self.assertEqual(params[1].type, discord.AppCommandOptionType.string)
+        self.assertFalse(any(p.required for p in params))
 
 
 class SettingsTests(unittest.TestCase):

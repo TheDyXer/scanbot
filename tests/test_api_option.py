@@ -24,7 +24,7 @@ import bot as scanbot  # noqa: E402
 class ApiOptionCommandTests(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_offers_on_and_off_and_defaults_to_on(self):
         params = {p.name: p for p in scanbot.bot.tree.get_command('scan').parameters}
-        self.assertEqual(list(params), ['file', 'edition', 'api'])
+        self.assertEqual(list(params), ['file', 'target', 'edition', 'api'])
         self.assertFalse(params['api'].required)
         self.assertEqual([c.value for c in params['api'].choices], ['on', 'off'])
         self.assertIn('mcstatus.io', params['api'].description)
@@ -43,7 +43,7 @@ class ApiOptionCommandTests(unittest.IsolatedAsyncioTestCase):
             await ctx.command._parse_arguments(ctx)
         except commands.BadLiteralArgument as e:
             return 'bad', e.param.name
-        return ctx.args[2:]  # after (self-less) ctx and file
+        return ctx.args[3:]  # after (self-less) ctx, file and target
 
     async def test_prefix_command_takes_the_api_option_after_the_edition(self):
         self.assertEqual(await self.parse('!scan bedrock off'), ['bedrock', 'off'])
@@ -130,7 +130,8 @@ class ApiOptionScanTests(unittest.IsolatedAsyncioTestCase):
                                            read=mock.AsyncMock(return_value=self.IPS))
         with mock.patch.object(scanbot.bot, 'direct_ok', direct_ok), \
                 mock.patch.object(scanbot.bot, 'direct_ok_bedrock', bedrock_ok):
-            await scanbot.bot.get_command('scan').callback(self.ctx, attachment, *options)
+            await scanbot.bot.get_command('scan').callback(self.ctx, attachment,
+                                                           **dict(zip(('edition', 'api'), options)))
 
     async def test_off_never_asks_the_api(self):
         await self.scan('java', 'off')

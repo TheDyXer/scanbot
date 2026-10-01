@@ -25,7 +25,7 @@ import signal
 import socket
 import sys
 import time
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 import pinger
 import vpn_switch
@@ -260,6 +260,18 @@ if not TOKEN:
 
 # host or IP, optionally with :port
 ADDRESS_RE = re.compile(r'^[A-Za-z0-9._-]+(:\d{1,5})?$')
+# Range lines: a network (1.2.3.0/24), an inclusive range (1.2.3.10-1.2.3.20) or a wildcard (1.2.3.*), each with an
+# optional :port for every address in it. Checked before ADDRESS_RE, which would take them for hostnames.
+NETWORK_RE = re.compile(r'^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})(?::(\d{1,5}))?$')
+RANGE_RE = re.compile(r'^(\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$')
+WILDCARD_RE = re.compile(r'^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\*(?::(\d{1,5}))?$')
+# Every block with addresses that aren't on the public internet. A range that doesn't touch any of them is all
+# public; one that does is checked address by address (is_public_ip), and one entirely inside a block is skipped
+# without expanding it. A fixed list on purpose: Python's own rules for whole networks changed between versions.
+SPECIAL_NETWORKS = tuple(ipaddress.IPv4Network(n) for n in (
+    '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24',
+    '192.0.2.0/24', '192.88.99.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24',
+    '224.0.0.0/4', '240.0.0.0/4'))
 
 # Anyone in the channel can start a scan, so it must never reach the machine the bot runs on
 # or the network behind it. Only addresses on the public internet are pinged.
@@ -308,6 +320,60 @@ def dedupe_key(entry, edition='java'):
     if port == default and (edition == 'bedrock' or is_ip_literal(host)):
         return host
     return f"{host}:{port}"
+
+def plausible_host(host):
+    """
+    An IP address, or a name whose last part has a letter in it: no top-level domain is all digits, so
+    1.2.3.999 or 1.2.3.4-9 are typos, not servers.
+    """
+    if is_ip_literal(host):
+        return True
+    return any(c.isalpha() for c in host.rstrip('.').rsplit('.', 1)[-1])
+
+def parse_range(line):
+    """
+    A range line as (first, last, port): the first and last address to scan, and the port for all of them (None for
+    the default). None if the line isn't a range line. Raises ValueError if it looks like one but isn't valid: an
+    address out of range, a prefix longer than 32, a range that runs backwards, a port outside 1-65535.
+    A network's first and last address (network and broadcast) are left out, except in a /31 or /32.
+    """
+    if m := NETWORK_RE.match(line):
+        network = ipaddress.IPv4Network(f"{m[1]}/{m[2]}", strict=False)
+        first, last, port = network.network_address, network.broadcast_address, m[3]
+        if network.prefixlen <= 30:
+            first, last = first + 1, last - 1
+    elif m := RANGE_RE.match(line):
+        first, last, port = ipaddress.IPv4Address(m[1]), ipaddress.IPv4Address(m[2]), m[3]
+        if last < first:
+            raise ValueError("the range runs backwards")
+    elif m := WILDCARD_RE.match(line):
+        network = ipaddress.IPv4Network(f"{m[1]}.0/24")
+        first, last, port = network.network_address + 1, network.broadcast_address - 1, m[2]
+    else:
+        return None
+    if port is not None and not 1 <= int(port) <= 65535:
+        raise ValueError("the port must be 1-65535")
+    return first, last, int(port) if port else None
+
+def range_size(first, last):
+    return int(last) - int(first) + 1
+
+def inside_special_network(first, last):
+    """True if the whole range lies in one block that isn't public, like 10.0.0.0/8."""
+    return any(first in block and last in block for block in SPECIAL_NETWORKS)
+
+def range_entries(first, last, port=None):
+    """The public addresses from first to last, as list entries (with the port, when there is one), in order."""
+    suffix = f":{port}" if port else ""
+    low, high = int(first), int(last)
+    if not any(int(block.network_address) <= high and int(block.broadcast_address) >= low for block in SPECIAL_NETWORKS):
+        for n in range(low, high + 1):  # Touches no special block, so every address is public
+            yield f"{ipaddress.IPv4Address(n)}{suffix}"
+        return
+    for n in range(low, high + 1):
+        address = ipaddress.IPv4Address(n)
+        if is_public_ip(address):
+            yield f"{address}{suffix}"
 
 async def resolve_public_address(host):
     """
@@ -1007,6 +1073,93 @@ def parse_as(value, isp=None):
     name = match.group(2).strip() or (isp.strip() if isinstance(isp, str) else '')
     return int(match.group(1)), name
 
+# --- Scan targets: an AS number's or a country's addresses, from RIPEstat ---
+RIPESTAT_URL = 'https://stat.ripe.net/data/{call}/data.json'
+ASN_RE = re.compile(r'^(?:AS)?(\d{1,10})$', re.IGNORECASE)
+COUNTRY_RE = re.compile(r'^[A-Za-z]{2}$')
+TARGET_EXAMPLES = "`asn:AS8400`, `country:RS` or `cidr:1.2.3.0/24`"
+
+class TargetError(Exception):
+    """A target the bot can't scan; the message says why, for the user."""
+
+class LookupFailed(TargetError):
+    """RIPEstat couldn't answer."""
+
+def shown(text, limit=60):
+    """User input, safe to put between backticks in a reply."""
+    text = text.replace('`', "'").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+def parse_asn(value):
+    m = ASN_RE.match(value.strip())
+    if not m or not 0 < int(m[1]) < 2 ** 32:
+        raise TargetError(f"`{shown(value)}` isn't an AS number (like `asn:AS8400`).")
+    return int(m[1])
+
+def parse_country(value):
+    if not COUNTRY_RE.match(value.strip()):
+        raise TargetError(f"`{shown(value)}` isn't a two-letter country code (like `country:RS`).")
+    return value.strip().upper()
+
+async def ripestat(session, call, **params):
+    """RIPEstat's data for one call. Raises LookupFailed when it doesn't answer, or answers with an error."""
+    resource = params.get('resource')
+    try:
+        async with session.get(RIPESTAT_URL.format(call=call), params={**params, 'sourceapp': 'scanbot'},
+                               timeout=aiohttp.ClientTimeout(total=30)) as response:
+            if response.status != 200:
+                raise LookupFailed(f"RIPEstat answered HTTP {response.status} for {resource}. Try again later.")
+            data = await response.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        raise LookupFailed(f"RIPEstat didn't answer for {resource} ({type(e).__name__}). Try again later.") from e
+    if not isinstance(data, dict) or data.get('status') != 'ok' or not isinstance(data.get('data'), dict):
+        raise LookupFailed(f"RIPEstat couldn't look up {resource}. Try again later.")
+    return data['data']
+
+def ipv4_networks(prefixes):
+    """The IPv4 networks among RIPEstat's prefixes, with overlapping ones merged."""
+    networks = []
+    for prefix in prefixes:
+        if isinstance(prefix, str) and ':' not in prefix:
+            try:
+                networks.append(ipaddress.IPv4Network(prefix, strict=False))
+            except ValueError:
+                pass
+    return list(ipaddress.collapse_addresses(networks))
+
+async def prefixes_for_asn(session, asn):
+    """The IPv4 networks an AS announces (RIPEstat's routing data of the last two weeks)."""
+    number = parse_asn(asn)
+    data = await ripestat(session, 'announced-prefixes', resource=f"AS{number}")
+    networks = ipv4_networks(p.get('prefix') for p in data.get('prefixes') or [] if isinstance(p, dict))
+    if not networks:
+        raise TargetError(f"AS{number} announces no IPv4 prefixes.")
+    return networks
+
+async def prefixes_for_country(session, code):
+    """The IPv4 networks registered to a country (RIPEstat's country resource list)."""
+    code = parse_country(code)
+    data = await ripestat(session, 'country-resource-list', resource=code, v4_format='prefix')
+    resources = data.get('resources')
+    networks = ipv4_networks((resources.get('ipv4') or []) if isinstance(resources, dict) else [])
+    if not networks:
+        raise TargetError(f"No IPv4 space is registered to {code}.")
+    return networks
+
+def network_bounds(network):
+    """A network's first and last address to scan: the same rule as a network line in a list."""
+    first, last = network.network_address, network.broadcast_address
+    return (first + 1, last - 1) if network.prefixlen <= 30 else (first, last)
+
+def address_count(networks):
+    """How many addresses expand_prefixes goes through for these networks."""
+    return sum(range_size(*network_bounds(n)) for n in networks)
+
+def expand_prefixes(networks, port=None):
+    """The public addresses in these networks, one at a time."""
+    for network in networks:
+        yield from range_entries(*network_bounds(network), port)
+
 async def batch_get_locations(session, ips, stop=None, networks=None):
     """
     Uses ip-api.com batch endpoint to get locations for a list of IPs.
@@ -1053,20 +1206,93 @@ async def batch_get_locations(session, ips, stop=None, networks=None):
 
     return locations
 
-def parse_ips(text, edition='java'):
+class ParsedList(NamedTuple):
+    addresses: list           # Unique public addresses to scan, in list order
+    invalid: int = 0          # Lines that aren't an address or a range
+    duplicates: int = 0       # Addresses already in the list
+    blocked: int = 0          # Private or local addresses (a range entirely inside one block counts once)
+    expanded_lines: int = 0   # Range lines with public addresses in them ...
+    expanded_addresses: int = 0  # ... and how many public addresses they had
+
+class TooManyAddresses(Exception):
     """
-    Returns (unique valid addresses in file order, invalid line count, duplicate count,
-    private or local address count). Blank lines and lines starting with # are ignored, ports must be 1-65535,
-    and of two lines for the same server (see dedupe_key) the first one is kept as it was written.
+    The list has more addresses than a scan takes. `line_number` is the line that went over (None for a target);
+    `count` is set when that one line or target is too big on its own.
     """
-    lines = [line.strip() for line in text.splitlines()]
-    lines = [line for line in lines if line and not line.startswith('#')]
-    valid = [line for line in lines if ADDRESS_RE.match(line) and valid_port(line)]
-    public = [line for line in valid if is_public_entry(line)]
+    def __init__(self, line_number, line, count=None, hint=""):
+        super().__init__(line)
+        self.line_number, self.line, self.count, self.hint = line_number, line, count, hint
+
+    def reply(self):
+        where = f"line {self.line_number} (`{self.line}`)" if self.line_number else f"`{self.line}`"
+        if self.count is not None:
+            text = (f"❌ **Too many IPs:** {where} has {self.count:,} addresses; a scan takes at most "
+                    f"{MAX_IPS_PER_SCAN}.")
+        else:
+            text = f"❌ **Too many IPs:** {where} takes the list past {MAX_IPS_PER_SCAN} addresses, the most a scan takes."
+        return f"{text} {self.hint}".rstrip()
+
+def parse_list(text, edition='java'):
+    """
+    The servers in a list file. Blank lines and lines starting with # are ignored. A line is an address (IP or
+    hostname, optionally with a 1-65535 port) or a range line (network, range or wildcard), which stands for every
+    public address in it. Of two lines for the same server (see dedupe_key) the first one is kept as it was
+    written. Raises TooManyAddresses as soon as the list passes MAX_IPS_PER_SCAN, naming the line, without
+    expanding the rest.
+    """
     unique = {}
-    for line in public:
-        unique.setdefault(dedupe_key(line, edition), line)
-    return list(unique.values()), len(lines) - len(valid), len(public) - len(unique), len(valid) - len(public)
+    invalid = duplicates = blocked = expanded_lines = expanded_addresses = 0
+
+    def add(entry, number, line):
+        nonlocal duplicates
+        key = dedupe_key(entry, edition)
+        if key in unique:
+            duplicates += 1
+        elif len(unique) >= MAX_IPS_PER_SCAN:
+            raise TooManyAddresses(number, line)
+        else:
+            unique[key] = entry
+
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        try:
+            bounds = parse_range(line)
+        except ValueError:
+            invalid += 1
+            continue
+        if bounds is None:
+            if not (ADDRESS_RE.match(line) and valid_port(line) and plausible_host(line.partition(':')[0])):
+                invalid += 1
+            elif not is_public_entry(line):
+                blocked += 1
+            else:
+                add(line, number, line)
+            continue
+
+        first, last, port = bounds
+        size = range_size(first, last)
+        if inside_special_network(first, last):
+            blocked += 1  # Like 10.0.0.0/8: nothing in it is scanned, however big it is
+            continue
+        if size > MAX_IPS_PER_SCAN:
+            raise TooManyAddresses(number, line, size)
+        public = 0
+        for entry in range_entries(first, last, port):
+            public += 1
+            add(entry, number, line)
+        if public:
+            expanded_lines += 1
+            expanded_addresses += public
+            blocked += size - public
+        else:
+            blocked += 1
+    return ParsedList(list(unique.values()), invalid, duplicates, blocked, expanded_lines, expanded_addresses)
+
+def parse_ips(text, edition='java'):
+    """parse_list's (addresses, invalid lines, duplicates, private or local addresses)."""
+    return tuple(parse_list(text, edition)[:4])
 
 async def set_status(text):
     try:
@@ -1679,8 +1905,11 @@ async def help(ctx):
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="/scan file:<.txt> [edition] [api]  (or !scan [edition] [api])",
-        value="Scans a list of Minecraft server IPs from a `.txt` file. `edition` is `java` (default) or `bedrock`.\n"
+        name="/scan [file] [target] [edition] [api]  (or !scan [target] [edition] [api])",
+        value="Scans a list of Minecraft server IPs from a `.txt` file: one IP, hostname or range "
+              "(`1.2.3.0/24`, `1.2.3.10-1.2.3.20`, `1.2.3.*`) per line. `edition` is `java` (default) or `bedrock`.\n"
+              "Instead of a file, `target:` scans an AS number's or a country's addresses, or a range: "
+              f"{TARGET_EXAMPLES} (`!scan asn:AS8400 bedrock`). At most {MAX_IPS_PER_SCAN} addresses.\n"
               "`api` is `on` (default) or `off`: with `off`, a server that doesn't answer a direct ping counts as "
               "offline instead of being retried through mcstatus.io, which is much faster for long lists of "
               "mostly dead addresses.\n"
@@ -1700,7 +1929,8 @@ async def help(ctx):
         inline=False
     )
     embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use /scan.\n"
-                          "Country flags and networks: IP Geolocation by DB-IP (db-ip.com)")
+                          "Country flags and networks: IP Geolocation by DB-IP (db-ip.com). AS and country "
+                          "targets: RIPEstat (stat.ripe.net)")
     await ctx.send(embed=embed)
 
 def is_moderator(ctx):
@@ -1741,12 +1971,41 @@ async def stop(ctx, scope: Optional[Literal['all']] = None, user: Optional[disco
     else:
         await ctx.send("🛑 **Scan cancelled** before it started.")
 
-@bot.hybrid_command(name="scan", aliases=['check'], description="Check a list of Minecraft servers from a .txt file")
-@app_commands.describe(file="A .txt file with one IP or hostname per line",
-                       edition="Minecraft edition of the servers in the file (default: java)",
+class TargetSpec(NamedTuple):
+    kind: str   # asn, country, cidr, or invalid (the slash command passes anything on; the scan says what's wrong)
+    value: str
+
+def parse_target(text):
+    """asn:..., country:... or cidr:... (any case), or a bare network, range or wildcard; None for anything else."""
+    text = text.strip()
+    kind, sep, value = text.partition(':')
+    if sep and kind.lower() in ('asn', 'country', 'cidr'):
+        return TargetSpec(kind.lower(), value.strip())
+    if NETWORK_RE.match(text) or RANGE_RE.match(text) or WILDCARD_RE.match(text):
+        return TargetSpec('cidr', text)
+    return None
+
+class Target(commands.Converter):
+    """
+    /scan's target option. With ! commands, a word that isn't a target is left for the edition (`!scan bedrock`).
+    The slash command never fails here (discord.py would only say "something went wrong"): the scan explains.
+    """
+    async def convert(self, ctx, argument):
+        target = parse_target(argument)
+        if target is None:
+            if ctx.interaction is None:
+                raise commands.BadArgument(f"{argument!r} isn't a scan target")
+            return TargetSpec('invalid', argument.strip())
+        return target
+
+@bot.hybrid_command(name="scan", aliases=['check'],
+                    description="Check Minecraft servers from a .txt file, an AS number, a country or an IP range")
+@app_commands.describe(file="A .txt file with one IP, hostname or IP range per line",
+                       target="Instead of a file: asn:AS8400, country:RS or cidr:1.2.3.0/24",
+                       edition="Minecraft edition of the servers (default: java)",
                        api="off: servers that don't answer a direct ping count as offline, no mcstatus.io retry (default: on)")
-async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock'] = 'java',
-                api: Literal['on', 'off'] = 'on'):
+async def check(ctx, file: Optional[discord.Attachment] = None, target: Optional[Target] = None,
+                edition: Literal['java', 'bedrock'] = 'java', api: Literal['on', 'off'] = 'on'):
     await ctx.defer()  # A slash command must be answered within 3 seconds
 
     # No await between these checks and registering the scan, so nobody can start two at once, and shutdown()
@@ -1760,7 +2019,7 @@ async def check(ctx, file: discord.Attachment, edition: Literal['java', 'bedrock
     scan = Scan(ctx.author, ctx.guild.id if ctx.guild else None)
     scans[ctx.author.id] = scan
     try:
-        await run_scan(ctx, scan, file, edition, api_retry=(api == 'on'))
+        await run_scan(ctx, scan, file, edition, api_retry=(api == 'on'), target=target)
     finally:
         release(scan)
         await update_presence()
@@ -1773,43 +2032,106 @@ def no_direct_reply():
     return ("❌ `api:off` would check nothing: direct pings don't work from this network. "
             "Scan with the API on instead (5 servers per second).")
 
-async def run_scan(ctx, scan, file, edition, api_retry=True):
-    # --- File Input --- (checked before queueing, so a bad file is rejected right away)
+async def read_list_file(ctx, file):
+    """The attached list as text, or None after telling the user what's wrong with it."""
     if not file.filename.lower().endswith('.txt'):
         await ctx.send("❌ Must be a `.txt` file.")
-        return
+        return None
     if file.size > MAX_FILE_BYTES:
         await ctx.send(f"❌ That file is too big ({file.size // 1000:,} KB). The limit is {MAX_FILE_BYTES // 1_000_000} MB.")
-        return
-
+        return None
     try:
         content = await file.read()
     except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("Couldn't download %s from Discord: %s", file.filename, e)
         await ctx.send("❌ Couldn't download the attachment from Discord. Please try again.")
-        return
+        return None
     try:
-        text = content.decode('utf-8-sig')  # -sig: some editors add a BOM
+        return content.decode('utf-8-sig')  # -sig: some editors add a BOM
     except UnicodeDecodeError:
         await ctx.send("❌ The file isn't UTF-8 text. Save it as plain UTF-8 text, one server per line.")
-        return
-    ips, invalid, duplicates, blocked = parse_ips(text, edition)
+        return None
 
+async def expand_target(target):
+    """A target's addresses, as (ParsedList, where they came from). Raises TargetError or TooManyAddresses."""
+    if target.kind == 'invalid':
+        raise TargetError(f"`{shown(target.value)}` isn't a scan target. Use {TARGET_EXAMPLES}.")
+    if target.kind == 'cidr':
+        try:
+            bounds = parse_range(target.value)
+        except ValueError:
+            bounds = None
+        if bounds is None:
+            raise TargetError(f"`{shown(target.value)}` isn't a network, range or wildcard "
+                              "(like `1.2.3.0/24`, `1.2.3.10-1.2.3.20` or `1.2.3.*`).")
+        first, last, port = bounds
+        size = range_size(first, last)
+        if inside_special_network(first, last):
+            raise TargetError(f"`{shown(target.value)}` is a private or local range: the bot only scans public servers.")
+        if size > MAX_IPS_PER_SCAN:
+            raise TooManyAddresses(None, f"cidr:{shown(target.value)}", size)
+        entries = list(range_entries(first, last, port))
+        return ParsedList(entries, blocked=size - len(entries)), f"`cidr:{shown(target.value)}`"
+
+    async with api_session() as session:
+        if target.kind == 'asn':
+            name = f"AS{parse_asn(target.value)}"
+            networks = await prefixes_for_asn(session, target.value)
+        else:
+            name = parse_country(target.value)
+            networks = await prefixes_for_country(session, target.value)
+    count = address_count(networks)
+    where = f"{name} ({len(networks)} prefix{'es' if len(networks) != 1 else ''})"
+    if count > MAX_IPS_PER_SCAN:
+        raise TooManyAddresses(None, f"{target.kind}:{where}", count,
+                               hint="Scan part of it with `cidr:`, one prefix at a time.")
+    entries = list(expand_prefixes(networks))
+    return ParsedList(entries, blocked=count - len(entries)), where
+
+async def load_addresses(ctx, file, target, edition):
+    """
+    What to scan, from the attached file or the target, as (ParsedList, where it came from or None for a file), or
+    None after telling the user what's wrong. Runs before the scan is queued, so mistakes are answered at once.
+    """
+    if file is None and target is None:
+        await ctx.send(f"❌ Attach a `.txt` file, or give a target: {TARGET_EXAMPLES}.")
+        return None
+    if file is not None and target is not None:
+        await ctx.send("❌ Give a file or a target, not both.")
+        return None
+    try:
+        if target is not None:
+            return await expand_target(target)
+        text = await read_list_file(ctx, file)
+        return None if text is None else (parse_list(text, edition), None)
+    except TooManyAddresses as e:
+        await ctx.send(e.reply())
+    except TargetError as e:
+        await ctx.send(f"❌ {e}")
+    return None
+
+async def run_scan(ctx, scan, file, edition, api_retry=True, target=None):
+    # --- What to scan --- (checked before queueing, so a bad file or target is rejected right away)
+    loaded = await load_addresses(ctx, file, target, edition)
+    if loaded is None:
+        return
+    parsed, source = loaded
+    ips = parsed.addresses
     if not ips:
-        note = f" ({blocked} private or local address(es) are never scanned)" if blocked else ""
-        await ctx.send(f"⚠️ No valid IPs in the file.{note}")
+        note = f" ({parsed.blocked} private or local address(es) are never scanned)" if parsed.blocked else ""
+        await ctx.send(f"⚠️ No valid IPs in {source or 'the file'}.{note}")
         return
-
     total_ips = len(ips)
-    if total_ips > MAX_IPS_PER_SCAN:
-        await ctx.send(f"❌ Too many IPs. Maximum allowed per scan is {MAX_IPS_PER_SCAN}.")
-        return
 
     notes = []
-    if invalid: notes.append(f"skipped {invalid} invalid line(s)")
-    if blocked: notes.append(f"skipped {blocked} private or local address(es)")
-    if duplicates: notes.append(f"removed {duplicates} duplicate(s)")
+    if parsed.expanded_lines:
+        notes.append(f"expanded {parsed.expanded_lines} range line(s) into {parsed.expanded_addresses:,} addresses")
+    if parsed.invalid: notes.append(f"skipped {parsed.invalid} invalid line(s)")
+    if parsed.blocked: notes.append(f"skipped {parsed.blocked} private or local address(es)")
+    if parsed.duplicates: notes.append(f"removed {parsed.duplicates} duplicate(s)")
     extra = f" ({', '.join(notes)})" if notes else ""
+    if source:
+        extra = f" from {source}{extra}"
 
     # api:off only checks servers with direct pings, so there's nothing to do while they don't work. Checked before
     # queueing, so nobody waits in line for a refusal, and again once it's their turn.

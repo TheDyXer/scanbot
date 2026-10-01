@@ -48,6 +48,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 ## Features
 
 - **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
+- **Ranges, networks and whole ISPs:** list lines like `1.2.3.0/24`, `1.2.3.10-1.2.3.20` or `1.2.3.*`, or no file at all: `/scan target:asn:AS8400`, `target:country:RS` or `target:cidr:1.2.3.0/24` (AS and country address lists come from RIPEstat)
 - **Fast scans:** pings servers directly, 300 at a time, and retries the ones that don't answer through `api.mcstatus.io`, with `api.mcsrvstat.us` as a second opinion for Java servers when mcstatus.io can't answer
 - **Skip the retry when it isn't worth it:** `/scan file:<.txt> api:off` counts only servers that answer a direct ping, which is much faster for long lists of mostly dead addresses (see [Skipping the API retry](#skipping-the-api-retry))
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
@@ -216,6 +217,7 @@ or, if your network blocks Minecraft's port:
 | Command | What it does |
 | --- | --- |
 | `/scan file:<.txt> [edition] [api]` (or `!scan [edition] [api]` + attached `.txt`; `!check` works too) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file. `api` is `on` (the default) or `off`: [skip the API retry](#skipping-the-api-retry), as in `!scan java off` |
+| `/scan target:<target> [edition] [api]` (or `!scan <target> [edition] [api]`, no file) | Scans an AS number's, a country's or a range's addresses instead of a file: `asn:AS8400`, `country:RS` or `cidr:1.2.3.0/24` (a range or wildcard works too). See [Scanning without a file](#scanning-without-a-file) |
 | `/stop` (or `!stop`) | Stops your scan and posts what it found so far, or cancels it if it's still queued |
 | `/stop user:@name` (or `!stop @name`) | Moderators: stops that person's scan |
 | `/stop all:all` (or `!stop all`) | Moderators: stops every scan in this server |
@@ -238,11 +240,21 @@ With `api:off` (`!scan java off`), a server that doesn't answer a direct ping co
 
 - **What you can miss:** servers that only answer through the API, for example hosts that route by hostname (Hypixel answers by name but not by IP), or servers that block your address but not mcstatus.io's.
 - **It needs direct pings.** If they don't work (your network blocks port 25565 and there's no VPN, or the VPN is down), the bot refuses `api:off`, because it would check nothing. Use the API then.
-- In `!scan` the edition comes first: `!scan bedrock off`. `!scan off` isn't understood.
+- In `!scan` the edition comes first: `!scan bedrock off`. `!scan off` isn't understood. A target goes before both: `!scan asn:AS8400 bedrock off`.
+
+### Scanning without a file
+
+`target:` takes the place of the file:
+
+- **`asn:AS8400`:** every IPv4 network the AS (an ISP or hosting company) announces, from RIPEstat's routing data of the last two weeks. `AS8400`, `as8400` and `8400` all work.
+- **`country:RS`:** every IPv4 network registered to that country (two-letter code), from RIPEstat.
+- **`cidr:1.2.3.0/24`:** a network, a range (`cidr:1.2.3.10-1.2.3.20`) or a wildcard (`cidr:1.2.3.*`), optionally with a port for every address (`cidr:1.2.3.0/24:25570`). With `!scan`, the `cidr:` can be left out: `!scan 1.2.3.0/24`.
+
+The same limit applies as for a file: at most 30,000 addresses (`MAX_IPS_PER_SCAN`). A whole ISP or country is usually more: the bot then says how many addresses it has and scans nothing, and you can scan it one `cidr:` prefix at a time. For example, in October 2026 AS8400 had 66 IPv4 networks (after merging overlapping ones) with about 823,000 addresses, and Serbia 388 with about 2.3 million. A big country takes RIPEstat a while: the United States took 10 seconds. A network's first and last address (network and broadcast) are left out, except in a /31 or /32, and private or local addresses never count.
 
 ### The IP list
 
-One server per line, as an IP, a hostname, or either with a port:
+One server per line, as an IP, a hostname, or either with a port, or a range of IPs:
 
 ```text
 # comments and blank lines are ignored
@@ -250,13 +262,18 @@ One server per line, as an IP, a hostname, or either with a port:
 1.2.3.4:25570
 play.example.com
 play.example.com:25566
+5.6.7.0/24
+5.6.8.10-5.6.8.40
+5.6.9.*:25570
 ```
 
-- Up to **30,000** servers per scan, in a file of at most 2 MB
+- **Range lines** stand for every address in them: a network (`5.6.7.0/24`, without its first and last address, except in a /31 or /32), an inclusive range (`5.6.8.10-5.6.8.40`) or a wildcard (`5.6.9.*`, the same as a /24). A port after it applies to every address. Private and local addresses in a range are skipped; a range entirely inside a private block (`10.0.0.0/8`) is skipped as one line. The start message says how many range lines were expanded into how many addresses
+- Up to **30,000** servers per scan, in a file of at most 2 MB. That counts the addresses after expanding range lines, without duplicates: a list that goes over is refused, naming the line where it does
 - Lines without a port use **25565** for Java and **19132** for Bedrock, and ports go from 1 to 65535. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many. Case and a trailing dot don't matter, and `1.2.3.4` is the same server as `1.2.3.4:25565`. A Java hostname with and without `:25565` counts as two servers, because without a port the bot follows the name's SRV record, which can point somewhere else
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
-- IPv6 addresses aren't supported
+- IPv6 addresses and networks aren't supported
+- Something that only looks like an IP, like `1.2.3.999` or `1.2.3.4-9`, is an invalid line, not a hostname
 - Only the first attachment on the message is read
 
 ### What you'll see
@@ -341,7 +358,7 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 
 | Setting | Default | Allowed | What it does |
 | --- | --- | --- | --- |
-| `MAX_IPS_PER_SCAN` | `30000` | 1 to 1,000,000 | Largest list the bot accepts. The largest file it reads grows with it: 64 bytes per line, at least 2 MB |
+| `MAX_IPS_PER_SCAN` | `30000` | 1 to 1,000,000 | Most addresses one scan takes, after expanding range lines and targets. The largest file it reads grows with it: 64 bytes per line, at least 2 MB |
 | `MAX_CONCURRENT_SCANS` | `5` | 1 to 50 | Scans running at the same time (one per person); more wait in a queue |
 | `DIRECT_CONCURRENCY` | `300` | 1 to 2,000 | Direct pings in flight at the same time, per scan |
 | `DIRECT_CONCURRENCY_TOTAL` | twice `DIRECT_CONCURRENCY` | 1 to 20,000 | Direct pings in flight for all scans together |
@@ -626,7 +643,11 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `⏳ You already have a scan running or queued` | Everyone gets one scan at a time | Wait for it to finish, or `/stop` it first |
 | `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
 | `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |
-| `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP or hostname per line; IPv6 isn't supported |
+| `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP, hostname or range per line; IPv6 isn't supported |
+| `❌ Too many IPs: line N (...) has N addresses` or `takes the list past 30000 addresses` | A range line, or the whole list after expanding its ranges, has more addresses than a scan takes | Split the range into smaller ones, or the list into several files |
+| `❌ Too many IPs: asn:... (N prefixes) has N addresses` | The AS or country is bigger than one scan | Scan it one `cidr:` prefix at a time, or raise `MAX_IPS_PER_SCAN` |
+| `❌ RIPEstat answered HTTP ...` or `RIPEstat didn't answer` | RIPEstat (stat.ripe.net) had a problem or isn't reachable | Try again later. A big country can take RIPEstat several seconds to answer |
+| `❌ ASxxxx announces no IPv4 prefixes` or `No IPv4 space is registered to XX` | That AS announces nothing on the internet right now (or only IPv6), or the country code doesn't exist | Check the number or code |
 | `❌ api:off would check nothing` | Direct pings don't work: your network blocks port 25565, or the VPN is down | Scan with the API on, or fix the direct pings (see the row above and [VPN](#vpn)) |
 | `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
@@ -647,6 +668,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 - [mcstatus.io](https://mcstatus.io): server status API (5 requests/second per IP)
 - [mcsrvstat.us](https://mcsrvstat.us): second server status API for Java servers. It keeps answers for 5 minutes and needs a User-Agent
 - [IP Geolocation by DB-IP](https://db-ip.com): the offline country and network (ASN) databases (DB-IP Lite), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- [RIPEstat](https://stat.ripe.net): the networks of an AS number or a country, for `asn:` and `country:` targets
 - [ip-api.com](https://ip-api.com): fallback IP geolocation and networks. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
 - [dnspython](https://www.dnspython.org) and [Quad9](https://quad9.net): encrypted DNS
 - [gluetun](https://github.com/qdm12/gluetun): VPN client container, and its server lists

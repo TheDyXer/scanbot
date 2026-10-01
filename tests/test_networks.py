@@ -144,7 +144,7 @@ class ScanLookupTests(unittest.IsolatedAsyncioTestCase):
     async def scan(self):
         attachment = types.SimpleNamespace(filename='ips.txt', size=len(self.IPS),
                                            read=mock.AsyncMock(return_value=self.IPS))
-        await bot.bot.get_command('scan').callback(self.ctx, attachment, 'java', 'off')
+        await bot.bot.get_command('scan').callback(self.ctx, attachment, edition='java', api='off')
         return self.send_results.await_args
 
     async def test_ip_api_gets_what_either_database_does_not_know_and_the_databases_win(self):
