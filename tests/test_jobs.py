@@ -96,6 +96,17 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([j.status for j in self.store.finished_for(1)], ['stopped', 'done'])  # Newest first
         self.assertEqual(self.store.finished_for(2), [])
 
+    def test_one_users_jobs_are_found_without_reading_anyone_elses(self):
+        mine = self.new(owner=1, status='done', finished_at='2026-10-01T00:00:00Z')
+        self.store.save(mine)
+        other = self.new(owner=12, status='done')
+        broken = os.path.join(self.store.jobs_dir, other.id + '.json')
+        with open(broken, 'w') as f:
+            f.write('{"id": ')  # Would be renamed .broken if it were read
+        self.assertEqual([j.id for j in self.store.finished_for(1)], [mine.id])
+        self.store.prune(1, keep=1)
+        self.assertIn(other.id + '.json', self.files())
+
     def test_prune_keeps_each_users_newest_ended_jobs_and_every_unfinished_one(self):
         kept, deleted = [], []
         for i in range(4):

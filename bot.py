@@ -2339,7 +2339,7 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
         refused = True  # Post what it found before the restart
     no_vpn = bool(PINGER_URL) and not direct_ok
     label = "Bedrock " if edition == 'bedrock' else ""
-    if resumed:
+    if resumed and has_progress(job):
         started = (f"🔄 **Scan resumed** after a restart: {owner}'s scan of {total_ips} {label}IPs{job.notes}. "
                    f"{resume_note(job, ips)}")
     else:
@@ -2555,7 +2555,7 @@ async def resume_context(job):
     if channel is None and job.channel_id:
         try:
             channel = await bot.fetch_channel(job.channel_id)
-        except discord.HTTPException:  # Deleted, or the bot can't see it any more
+        except (discord.HTTPException, discord.InvalidData):  # Deleted, the bot can't see it any more, or odd
             channel = None
     owner = types.SimpleNamespace(id=job.owner_id, mention=job.owner_mention)
     if channel is not None:

@@ -315,6 +315,16 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((job.status, job.resumed), ('done', 1))
         self.assertEqual(scanbot.scans, {})
 
+    async def test_a_scan_that_hadnt_started_simply_starts(self):
+        self.new_job(status='queued')
+        channel = make_channel()
+        await self.resume(channel)
+        posted = texts(channel.send)
+        self.assertTrue(any('Scan started' in t for t in posted), posted)
+        self.assertFalse([t for t in posted if 'Scan resumed' in t])
+        self.assertEqual(self.checked, IPS)
+        self.assertEqual(self.saved().status, 'done')
+
     async def test_a_scan_restarted_in_the_api_phase_checks_only_the_rest(self):
         job = self.new_job(cursor={'phase': 'api', 'index': 2}, status='interrupted',
                            results={'1.0.0.1': online('1.0.0.1', 'direct')}, timings={'direct': [6, 2.0], 'api': None})

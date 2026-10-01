@@ -101,8 +101,8 @@ class JobStore:
         except OSError as e:
             ids = f"{os.getuid()}:{os.getgid()}" if hasattr(os, 'getuid') else None
             fix = (f"With Docker, run this in the scanbot folder:  sudo mkdir -p state && sudo chown {ids} state  "
-                   "(the installer does it too), then restart the bot." if ids else
-                   "Set STATE_DIR to a folder the bot can write to.")
+                   "(the installer does it too), then restart the bot. " if ids else "")
+            fix += "Without Docker, set STATE_DIR to a folder the bot can write to."
             log.warning("Scans can't be saved in %s (%s), so a restart ends them instead of resuming them. %s",
                         directory, e.strerror or e, fix)
             return None
@@ -166,8 +166,11 @@ class JobStore:
             except OSError as e:
                 log.warning("Couldn't delete %s: %s", self.path(job, suffix), e)
 
-    def all(self):
-        """Every job, oldest first. A file that can't be read is renamed to .broken and skipped."""
+    def all(self, owner_id=None):
+        """
+        Every job, or one user's, oldest first. A file that can't be read is renamed to .broken and skipped. The file
+        names carry the owner (see new_job), so one user's jobs are found without reading anyone else's.
+        """
         found = []
         try:
             names = sorted(os.listdir(self.jobs_dir))
@@ -175,7 +178,7 @@ class JobStore:
             log.warning("Couldn't read the scans in %s: %s", self.jobs_dir, e)
             return found
         for name in names:
-            if not name.endswith('.json'):
+            if not name.endswith('.json') or (owner_id is not None and f'-{owner_id}-' not in name):
                 continue
             path = os.path.join(self.jobs_dir, name)
             try:
@@ -201,12 +204,12 @@ class JobStore:
 
     def finished_for(self, owner_id):
         """A user's done and stopped jobs, newest first."""
-        return sorted((j for j in self.all() if j.owner_id == owner_id and j.status in ('done', 'stopped')),
+        return sorted((j for j in self.all(owner_id) if j.owner_id == owner_id and j.status in ('done', 'stopped')),
                       key=lambda j: (j.finished_at or j.created_at, j.id), reverse=True)
 
     def prune(self, owner_id, keep, jobs=None):
         """Deletes a user's ended jobs beyond the newest `keep`. Unfinished ones are never deleted."""
-        ended = sorted((j for j in (jobs if jobs is not None else self.all())
+        ended = sorted((j for j in (jobs if jobs is not None else self.all(owner_id))
                         if j.owner_id == owner_id and j.finished),
                        key=lambda j: (j.finished_at or j.created_at, j.id), reverse=True)
         for job in ended[keep:]:
