@@ -131,6 +131,15 @@ class RemotePingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[0]['port'], 19133)
         self.assertEqual((result['edition'], result['players']), ('Bedrock', 7))
 
+    async def test_extra_fields_travel_through_the_pinger_with_their_types(self):
+        self.reply = {"online": True, **STATUS, "latency": 45.7, "protocol": 769, "secure_chat": True,
+                      "modded": "yes", "icon": "data:image/png;base64,AAAA"}
+        result = await scanbot.check_direct('1.2.3.4')
+        self.assertEqual((result['latency'], result['protocol'], result['secure_chat'], result['source']),
+                         (45.7, 769, True, 'direct'))
+        self.assertIsNone(result['modded'])  # Not a bool, so dropped
+        self.assertNotIn('icon', result)
+
     async def test_offline_answer(self):
         self.reply = {"online": False}
         self.assertIsNone(await scanbot.ping_server('1.2.3.4', 25565, 'java'))

@@ -117,6 +117,12 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result['address'], result['names'], result['edition']),
                          ('144.172.67.4', [], 'Bedrock'))
 
+    def test_bedrock_response_fills_gamemode_brand_and_protocol(self):
+        result = scanbot.parse_api_status('demo.mcstatus.io', BEDROCK_API_RESPONSE, 'bedrock')
+        self.assertEqual((result['gamemode'], result['brand'], result['protocol'], result['source']),
+                         ('Survival', 'MCPE', 575, 'mcstatus.io'))
+        self.assertIsNone(result['mod_count'])  # Bedrock replies have no mods field
+
     def test_java_response_is_unchanged(self):
         result = scanbot.parse_api_status('1.2.3.4', JAVA_API_RESPONSE)
         self.assertEqual((result['version'], result['names'], result['edition']), ('1.21', ['Steve'], 'Java'))
@@ -202,8 +208,8 @@ class OutputTests(unittest.TestCase):
         table = next(f for f in files if f.filename == 'scan_results.csv')
         table.fp.seek(0)
         rows = list(csv.reader(io.StringIO(table.fp.read().decode('utf-8'))))
-        self.assertEqual(rows[0][-1], 'edition')
-        self.assertEqual([r[-1] for r in rows[1:]], ['Java', 'Bedrock'])
+        self.assertEqual(rows[0][8], 'edition')  # The first nine columns never move; newer ones come after
+        self.assertEqual([r[8] for r in rows[1:]], ['Java', 'Bedrock'])
 
 
 class EditionErrorTests(unittest.IsolatedAsyncioTestCase):

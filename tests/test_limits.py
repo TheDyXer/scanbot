@@ -6,6 +6,7 @@ Run from the repository root:  python -m unittest discover -s tests
 """
 import csv
 import io
+import json
 import os
 import sys
 import time
@@ -188,7 +189,8 @@ class ResultsTests(unittest.IsolatedAsyncioTestCase):
         await scanbot.send_results(ctx, online(100), {}, False, 100, 5)
         messages = self.sent(ctx)
         self.assertEqual(len(messages), 1)
-        self.assertEqual([f.filename for f in messages[0][1]], ['scan_results.txt', 'scan_results.csv'])
+        self.assertEqual([f.filename for f in messages[0][1]],
+                         ['scan_results.txt', 'scan_results.csv', 'scan_results.json'])
 
     async def test_a_huge_scan_is_delivered_in_messages_that_each_fit(self):
         # 30,000 online servers with long MOTDs and player lists: well over Discord's 10 MiB together
@@ -204,16 +206,19 @@ class ResultsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Scan Complete', messages[0][0])
         self.assertIn('continued', messages[1][0])
 
-        # Every server is in the CSV parts, exactly once, and every part is a valid CSV
-        rows = 0
+        # Every server is in the CSV parts and in the JSON parts, exactly once, and every part is valid
+        rows, servers = 0, []
         for _, files in messages:
             for f in files:
+                f.fp.seek(0)
                 if f.filename.endswith('.csv'):
-                    f.fp.seek(0)
                     parsed = list(csv.reader(io.StringIO(f.fp.read().decode('utf-8'))))
                     self.assertEqual(parsed[0][0], 'ip')
                     rows += len(parsed) - 1
+                elif f.filename.endswith('.json'):
+                    servers += [row['ip'] for row in json.loads(f.fp.read().decode('utf-8'))]
         self.assertEqual(rows, 30000)
+        self.assertEqual(sorted(servers), sorted(r['ip'] for r in results))
 
     async def test_a_boosted_server_gets_fewer_messages(self):
         results = online(30000, motd_length=150, names=8)

@@ -56,7 +56,8 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Several people can scan at once:** up to 5 scans run side by side, one per person, and more wait in a queue
 - **`/stop` at any point**, which posts what was found so far. It stops your own scan; moderators can stop anyone's
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs stay on your machine (only the few the database doesn't know are looked up at ip-api.com)
-- **Results as files** (`scan_results.txt`, `scan_results.csv`) when they don't fit in one message. A huge scan's files are split to fit Discord's upload limit and arrive as several messages
+- **Results as files** (`scan_results.txt`, `scan_results.csv`, `scan_results.json`) when they don't fit in one message. A huge scan's files are split to fit Discord's upload limit and arrive as several messages
+- **More than player counts** in the files: each server's network (AS number and name, from a second offline database), latency, protocol, software, plugins, Forge mods, secure chat, and Bedrock's game mode and map, as far as the server tells
 - **Clean input:** blank lines, `#` comments, invalid entries and duplicates are skipped
 - **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
@@ -83,7 +84,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
    | View Channels | Seeing the command |
    | Send Messages | Replies and the progress message |
    | Embed Links | `!help` |
-   | Attach Files | `scan_results.txt` / `.csv` |
+   | Attach Files | `scan_results.txt` / `.csv` / `.json` |
 
 Commands also work in a direct message to the bot.
 
@@ -293,8 +294,13 @@ Then the results, sorted by player count. Example from a test run:
 
 If the results don't fit in one Discord message, you get the summary and the top 10 servers in chat, with the full list attached:
 
-- `scan_results.txt`: the same report as plain text
-- `scan_results.csv`: one row per online server with the columns `ip, resolved_ip, country, players_online, players_max, version, motd, players, edition`. `players_online` is the number of players; `players` lists the names the server shows, separated by `; `
+- `scan_results.txt`: the same report as plain text, with one more line per server for its network and details (`└ 🌐 AS8400 TELEKOM SRBIJA a.d. · protocol 767 · Paper · 12 mods`)
+- `scan_results.csv`: one row per online server. `players_online` is the number of players; `players` lists the names the server shows, separated by `; `. The columns:
+  - `ip, resolved_ip, country, players_online, players_max, version, motd, players, edition`: these first nine never move, so older spreadsheets keep working
+  - `latency_ms, protocol, secure_chat, modded, mod_count, software, plugins, eula_blocked, gamemode, map, brand, asn, as_name, source`: empty when unknown. A direct ping reports latency, secure chat and Forge mods; mcstatus.io reports software, plugins and `eula_blocked` (blocked by Mojang). `source` is `direct` or `mcstatus.io`
+- `scan_results.json`: the same rows and names as the CSV, as a JSON array, with numbers, `true`/`false`, lists for `players` and `plugins`, and `null` when unknown. Each part of a split file is a complete array
+
+In chat, a server's line also shows its latency (`· 45 ms`) when a direct ping measured it.
 
 ## How scanning works
 
@@ -311,9 +317,9 @@ flowchart TD
 
 1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 300 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 5 minutes. An IP address is pinged right away; for a hostname, the bot first looks for an SRV record that points the name at another host or port. If no probe answers, the bot tries again every 5 minutes (`DIRECT_RECHECK`) and switches direct pings on as soon as one does. (With the [VPN](#vpn), the VPN checks do this instead.)
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 30,000 IPs take about 100 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
-3. **Countries.** Online servers are looked up in the free [DB-IP Lite](https://db-ip.com/db/download/ip-to-country-lite) country database, which the bot keeps on disk: thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs it doesn't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
-   - **Docker:** the database is built into the image. The weekly image rebuild picks up DB-IP's new monthly edition.
-   - **Without Docker:** the bot downloads the database (about 8 MB) next to `bot.py` on first start. It checks the database's age once a day, and downloads a new one when it's more than 40 days old.
+3. **Countries and networks.** Online servers are looked up in two free [DB-IP Lite](https://db-ip.com/db/lite.php) databases, which the bot keeps on disk: one for the country, one for the network (AS number and name). Thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs they don't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
+   - **Docker:** the databases are built into the image. The weekly image rebuild picks up DB-IP's new monthly editions.
+   - **Without Docker:** the bot downloads them (about 8 MB and 10 MB) next to `bot.py` on first start. It checks their age once a day, and downloads new ones when they're more than 40 days old. If the network database can't be downloaded, networks come from ip-api.com for the IPs it's asked about anyway, and the rest have none.
 
 `/stop` works in every phase. Direct pings already in flight finish (at most 3 seconds), API checks in flight are dropped, and nothing new starts.
 
@@ -348,7 +354,7 @@ These are fixed in `bot.py`:
 - **Connection tracking:** every unanswered ping leaves an entry in the kernel's connection table for up to two minutes. If `dmesg` shows `nf_conntrack: table full, dropping packet`, lower `DIRECT_CONCURRENCY_TOTAL` or raise `net.netfilter.nf_conntrack_max`.
 - **Lost answers:** if scans find fewer servers after you raise it, your connection or the VPN drops pings at that rate. Go back down.
 
-The country database lives next to `bot.py` as `dbip-country-lite.mmdb`. Set the `GEO_DB_PATH` environment variable to keep it somewhere else.
+The country database lives next to `bot.py` as `dbip-country-lite.mmdb`, and the network database as `dbip-asn-lite.mmdb`. Set the `GEO_DB_PATH` and `GEO_ASN_DB_PATH` environment variables to keep them somewhere else.
 
 Set `SLASH_ONLY=1` to run without the Message Content intent: only the slash commands work then, and `!` commands are replaced by mentioning the bot (`@Scanbot scan`). With Docker Compose, put `SLASH_ONLY=1` in the `.env` file. An install made before this setting existed has a `docker-compose.yml` that doesn't pass it on: run the installer again, which updates the file. If you changed the file yourself, the installer leaves it alone: add `SLASH_ONLY: ${SLASH_ONLY:-}` under `environment:` instead.
 
@@ -624,8 +630,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 - [discord.py](https://github.com/Rapptz/discord.py): Discord API wrapper
 - [mcstatus](https://github.com/py-mine/mcstatus): direct Minecraft server pings
 - [mcstatus.io](https://mcstatus.io): server status API (5 requests/second per IP)
-- [IP Geolocation by DB-IP](https://db-ip.com): the offline country database (DB-IP Lite), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
-- [ip-api.com](https://ip-api.com): fallback IP geolocation. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
+- [IP Geolocation by DB-IP](https://db-ip.com): the offline country and network (ASN) databases (DB-IP Lite), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- [ip-api.com](https://ip-api.com): fallback IP geolocation and networks. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
 - [dnspython](https://www.dnspython.org) and [Quad9](https://quad9.net): encrypted DNS
 - [gluetun](https://github.com/qdm12/gluetun): VPN client container, and its server lists
 - [wgcf](https://github.com/ViRb3/wgcf): Cloudflare WARP keys

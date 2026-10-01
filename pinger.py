@@ -51,16 +51,27 @@ def raise_file_limit(wanted):
 async def ping(ip, port, edition, timeout):
     """
     Pings ip:port once. Returns the server's status as a plain dict, or None if it doesn't answer.
+    The optional fields are read with getattr, so a field an mcstatus version doesn't have is None
+    instead of making every server look offline.
     """
     try:
         if edition == 'java':
             status = await JavaServer(ip, port, timeout=timeout).async_status(tries=1)
             names = [p.name for p in (status.players.sample or []) if p.name]
+            mods = getattr(getattr(status, 'forge_data', None), 'mods', None)  # Forge servers list their mods
+            extra = {"secure_chat": getattr(status, 'enforces_secure_chat', None),
+                     "modded": getattr(status, 'is_modded', None),
+                     "mod_count": len(mods) if isinstance(mods, (list, tuple)) else None}
         else:
             status = await BedrockServer(ip, port, timeout=timeout).async_status(tries=1)
             names = []
+            extra = {"gamemode": getattr(status, 'gamemode', None), "map": getattr(status, 'map_name', None),
+                     "brand": getattr(status.version, 'brand', None)}
+        latency = getattr(status, 'latency', None)
         return {"players": status.players.online, "max": status.players.max, "names": names,
-                "version": status.version.name, "motd": status.motd.to_plain()}
+                "version": status.version.name, "motd": status.motd.to_plain(),
+                "latency": round(latency, 1) if isinstance(latency, (int, float)) else None,
+                "protocol": getattr(status.version, 'protocol', None), **extra}
     except Exception:
         return None
 

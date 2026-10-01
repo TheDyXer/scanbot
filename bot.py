@@ -15,6 +15,7 @@ import dns.resolver
 import gzip
 import io
 import ipaddress
+import json
 import logging
 import maxminddb
 import os
@@ -72,6 +73,10 @@ GEO_BATCH_URL = 'http://ip-api.com/batch' # Fallback for IPs the offline databas
 # Offline country database (DB-IP Lite, CC BY 4.0), next to bot.py unless GEO_DB_PATH is set
 GEO_DB_PATH = os.environ.get('GEO_DB_PATH') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dbip-country-lite.mmdb')
 GEO_DB_URL = 'https://download.db-ip.com/free/dbip-country-lite-{month}.mmdb.gz'
+# Offline network database (which AS / ISP an IP belongs to), from DB-IP too. The Docker image has it at /app.
+GEO_ASN_DB_PATH = (os.environ.get('GEO_ASN_DB_PATH')
+                   or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dbip-asn-lite.mmdb'))
+GEO_ASN_DB_URL = 'https://download.db-ip.com/free/dbip-asn-lite-{month}.mmdb.gz'
 USER_AGENT = 'scanbot (+https://github.com/TheDyXer/scanbot)'  # DB-IP rejects Python's default one
 # These can be changed in .env (see README, "Configuration"); a value out of range stops the bot at startup
 try:
@@ -433,7 +438,15 @@ def to_int(value):
     except (TypeError, ValueError, OverflowError):
         return 0
 
-def make_result(ip, address, players, players_max, names, version, motd, edition='java'):
+def make_result(ip, address, players, players_max, names, version, motd, edition='java', *, latency=None,
+                protocol=None, secure_chat=None, modded=None, mod_count=None, software=None, plugins=None,
+                eula_blocked=None, gamemode=None, map_name=None, brand=None, source=None):
+    """
+    One online server. The keyword fields are whatever the source reported, None when it didn't: a direct ping
+    knows latency, secure chat and Forge mods; mcstatus.io knows software, plugins and whether Mojang blocks the
+    server (eula_blocked); Bedrock servers report a game mode, and to a direct ping a map name and brand.
+    `source` is where the answer came from: 'direct' or 'mcstatus.io'.
+    """
     return {
         "ip": ip,
         "edition": EDITION_LABELS[edition],
@@ -443,7 +456,30 @@ def make_result(ip, address, players, players_max, names, version, motd, edition
         "names": names,
         "version": version or 'Unknown',
         "motd": (motd or '').strip().replace('\n', '  '),
+        "latency": latency,           # Milliseconds
+        "protocol": protocol,         # Protocol number of the server's version
+        "secure_chat": secure_chat,   # Java: whether the server enforces signed chat
+        "modded": modded,
+        "mod_count": mod_count,
+        "software": software,         # Paper, Velocity, ... as mcstatus.io reports it
+        "plugins": plugins,           # Plugin names
+        "eula_blocked": eula_blocked, # Blocked by Mojang for breaking the EULA
+        "gamemode": gamemode,
+        "map": map_name,
+        "brand": brand,               # Bedrock: MCPE or MCEE (Education Edition)
+        "source": source,
     }
+
+# Optional fields a direct ping may report, and the type each must have. An older pinger sends none of them and
+# a newer one may send more, so missing keys are None and unknown ones are dropped.
+STATUS_FIELDS = {'latency': (int, float), 'protocol': int, 'mod_count': int, 'secure_chat': bool, 'modded': bool,
+                 'gamemode': str, 'map': str, 'brand': str}
+
+def status_extras(status):
+    """The optional fields of a direct ping's answer, as make_result's keyword arguments."""
+    extras = {key: status.get(key) for key in STATUS_FIELDS}
+    extras['map_name'] = extras.pop('map')
+    return extras
 
 pinger_session = None
 
@@ -462,10 +498,16 @@ def get_pinger_session():
 def clean_status(data):
     """The pinger's answer, with every field forced to the type a result needs."""
     names = data.get('names')
-    return {"players": data.get('players'), "max": data.get('max'),
-            "names": [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
-            "version": data.get('version') if isinstance(data.get('version'), str) else None,
-            "motd": data.get('motd') if isinstance(data.get('motd'), str) else ''}
+    status = {"players": data.get('players'), "max": data.get('max'),
+              "names": [n for n in names if isinstance(n, str)] if isinstance(names, list) else [],
+              "version": data.get('version') if isinstance(data.get('version'), str) else None,
+              "motd": data.get('motd') if isinstance(data.get('motd'), str) else ''}
+    for key, kind in STATUS_FIELDS.items():
+        value = data.get(key)
+        # True is an int to Python, but not a latency or a protocol number
+        typed = isinstance(value, kind) and (kind is bool or not isinstance(value, bool))
+        status[key] = value if typed else None
+    return status
 
 async def ping_server(address, port, edition):
     """
@@ -524,7 +566,7 @@ async def check_direct(ip):
         return None
 
     return make_result(ip, str(address), status['players'], status['max'],
-                       status['names'], status['version'], status['motd'])
+                       status['names'], status['version'], status['motd'], **status_extras(status), source='direct')
 
 def split_entry(entry, default_port):
     """Splits "host" or "host:port" from the IP list."""
@@ -553,7 +595,8 @@ async def check_direct_bedrock(entry):
         return None
 
     return make_result(entry, str(address), status['players'], status['max'],
-                       [], status['version'], status['motd'], edition='bedrock')
+                       [], status['version'], status['motd'], edition='bedrock', **status_extras(status),
+                       source='direct')
 
 async def check_api(session, ip, edition='java'):
     """
@@ -598,17 +641,45 @@ def parse_api_status(ip, data, edition='java'):
             names.append(p)
 
     version = data.get('version')
+    protocol = None
     if isinstance(version, dict):
+        protocol = version.get('protocol')
         version = version.get('name_clean') or version.get('name_raw') or version.get('name')  # Bedrock only has "name"
     motd = data.get('motd')
     if isinstance(motd, dict):
         motd = motd.get('clean') or motd.get('raw')
 
+    mods = data.get('mods')  # Java only; an empty list for a server without Forge mods
+    plugins = data.get('plugins')
+    plugins = [p['name'] for p in plugins if isinstance(p, dict) and isinstance(p.get('name'), str)] \
+        if isinstance(plugins, list) else None
+    software, eula_blocked, gamemode = data.get('software'), data.get('eula_blocked'), data.get('gamemode')
+    brand = data.get('edition') if edition == 'bedrock' else None  # MCPE or MCEE
+
     return make_result(ip, data.get('ip_address'), players.get('online'), players.get('max'), names,
                        version if isinstance(version, str) else None,
-                       motd if isinstance(motd, str) else None, edition)
+                       motd if isinstance(motd, str) else None, edition,
+                       protocol=protocol if isinstance(protocol, int) and not isinstance(protocol, bool) else None,
+                       modded=bool(mods) if isinstance(mods, list) else None,
+                       mod_count=len(mods) if isinstance(mods, list) and mods else None,
+                       software=software if isinstance(software, str) and software else None,
+                       plugins=plugins,
+                       eula_blocked=eula_blocked if isinstance(eula_blocked, bool) else None,
+                       gamemode=gamemode if isinstance(gamemode, str) and gamemode else None,
+                       brand=brand if isinstance(brand, str) and brand else None,
+                       source='mcstatus.io')
 
 geo_db = None  # Offline country database, opened by load_geo_db() at startup
+asn_db = None  # Offline network (AS) database, the same way
+
+# DB-IP's two Lite databases: the global holding the open one, what it's for, the setting with its path, its URL
+DATABASES = (('geo_db', 'country', 'GEO_DB_PATH', GEO_DB_URL),
+             ('asn_db', 'network', 'GEO_ASN_DB_PATH', GEO_ASN_DB_URL))
+NO_DATABASE = {'country': "No country database (%s); flags come from ip-api.com only.",
+               'network': "No network database (%s); networks come from ip-api.com, for the IPs it's asked about."}
+
+def database_paths():
+    return [globals()[setting] for _, _, setting, _ in DATABASES]  # Looked up now: tests change the settings
 
 def api_session():
     """
@@ -618,17 +689,20 @@ def api_session():
     return aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=Quad9Resolver()),
                                  headers={'User-Agent': USER_AGENT})
 
-def geo_db_age_days():
-    """Days since the database at GEO_DB_PATH was built, or None if it's missing or unreadable."""
+def mmdb_age_days(path):
+    """Days since the database at `path` was built, or None if it's missing or unreadable."""
     try:
-        with maxminddb.open_database(GEO_DB_PATH) as db:
+        with maxminddb.open_database(path) as db:
             return (time.time() - db.metadata().build_epoch) / 86400
     except Exception:
         return None
 
-async def update_geo_db():
+def is_old(age):
+    return age is None or age > GEO_DB_MAX_AGE_DAYS
+
+async def update_mmdb(path, url, label):
     """
-    Downloads this month's DB-IP country database to GEO_DB_PATH, or last month's
+    Downloads this month's DB-IP database (`label`: country or network) to `path`, or last month's
     if this month's isn't published yet. Returns True if it saved one.
     """
     today = datetime.date.today()
@@ -636,54 +710,58 @@ async def update_geo_db():
     async with api_session() as session:
         for month in (today.strftime('%Y-%m'), last_month.strftime('%Y-%m')):
             try:
-                async with session.get(GEO_DB_URL.format(month=month), timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                async with session.get(url.format(month=month), timeout=aiohttp.ClientTimeout(total=120)) as resp:
                     if resp.status != 200:
                         continue
                     data = gzip.decompress(await resp.read())
             except Exception as e:
-                log.warning("Country database download failed: %s", e)
+                log.warning("The %s database download failed: %s", label, e)
                 continue
             # Write next to the old file, then swap, so a failed write never leaves half a database
-            tmp_path = GEO_DB_PATH + '.tmp'
+            tmp_path = path + '.tmp'
             with open(tmp_path, 'wb') as f:
                 f.write(data)
-            os.replace(tmp_path, GEO_DB_PATH)
-            log.info("Downloaded the DB-IP country database for %s", month)
+            os.replace(tmp_path, path)
+            log.info("Downloaded the DB-IP %s database for %s", label, month)
             return True
     return False
 
-async def load_geo_db():
-    """Opens the offline country database, downloading or refreshing it first if needed."""
-    global geo_db
-    age = geo_db_age_days()
-    if age is None or age > GEO_DB_MAX_AGE_DAYS:
+async def load_mmdb(name, label, path, url):
+    """Opens one database into the global `name`, downloading or refreshing it first if needed."""
+    if is_old(mmdb_age_days(path)):
         try:
-            await update_geo_db()
+            await update_mmdb(path, url, label)
         except OSError as e:
             # e.g. a read-only install folder; keep using the old database if there is one
-            log.warning("Could not save the country database to %s: %s", GEO_DB_PATH, e)
+            log.warning("Could not save the %s database to %s: %s", label, path, e)
     try:
-        new = maxminddb.open_database(GEO_DB_PATH)
+        new = maxminddb.open_database(path)
         built = datetime.datetime.fromtimestamp(new.metadata().build_epoch, datetime.timezone.utc)
     except Exception as e:
-        if geo_db is None:
-            log.warning("No country database (%s); flags come from ip-api.com only.", e)
+        if globals()[name] is None:
+            log.warning(NO_DATABASE[label], e)
         else:
-            log.warning("Couldn't open the new country database (%s); still using the old one.", e)
+            log.warning("Couldn't open the new %s database (%s); still using the old one.", label, e)
         return
-    # Swap first, then close the old one, so scans looking up countries right now never find no database
-    old, geo_db = geo_db, new
+    # Swap first, then close the old one, so scans looking something up right now never find no database
+    old = globals()[name]
+    globals()[name] = new
     if old is not None:
         old.close()
-    log.info("Country database loaded (DB-IP, built %s)", built.strftime('%Y-%m-%d'))
+    log.info("%s database loaded (DB-IP, built %s)", label.capitalize(), built.strftime('%Y-%m-%d'))
+
+async def load_geo_db():
+    """Opens the offline country and network databases, downloading or refreshing them first if needed."""
+    for (name, label, _, url), path in zip(DATABASES, database_paths()):
+        await load_mmdb(name, label, path, url)
 
 async def refresh_geo_db_if_old():
-    """Loads a new country database if the one on disk is older than GEO_DB_MAX_AGE_DAYS. True if it tried."""
-    age = geo_db_age_days()
-    if age is not None and age <= GEO_DB_MAX_AGE_DAYS:
+    """Loads new databases if one on disk is older than GEO_DB_MAX_AGE_DAYS or missing. True if it tried."""
+    old = [path for path in database_paths() if is_old(mmdb_age_days(path))]
+    if not old:
         return False
-    if not os.access(os.path.dirname(GEO_DB_PATH) or '.', os.W_OK):
-        return False  # Docker: the database is part of the image, which the weekly rebuild keeps fresh
+    if not any(os.access(os.path.dirname(path) or '.', os.W_OK) for path in old):
+        return False  # Docker: the databases are part of the image, which the weekly rebuild keeps fresh
     await load_geo_db()
     return True
 
@@ -713,10 +791,39 @@ def lookup_countries(ips):
             found[ip] = code
     return found
 
-async def batch_get_locations(session, ips, stop=None):
+def lookup_networks(ips):
+    """
+    Looks up networks in the offline database. Returns {ip: (AS number, organisation)} for the IPs it knows.
+    """
+    found = {}
+    if asn_db is None:
+        return found
+    for ip in ips:
+        try:
+            record = asn_db.get(ip)
+        except ValueError:  # Not an IP address
+            continue
+        number = (record or {}).get('autonomous_system_number')
+        if isinstance(number, int):
+            name = record.get('autonomous_system_organization')
+            found[ip] = (number, name if isinstance(name, str) else '')
+    return found
+
+AS_FIELD = re.compile(r'^AS(\d+)\s*(.*)$')
+
+def parse_as(value, isp=None):
+    """ip-api.com's "as" field, like "AS8400 Telekom Srbija a.d.", as (8400, 'Telekom Srbija a.d.'), or None."""
+    match = AS_FIELD.match(value.strip()) if isinstance(value, str) else None
+    if not match:
+        return None
+    name = match.group(2).strip() or (isp.strip() if isinstance(isp, str) else '')
+    return int(match.group(1)), name
+
+async def batch_get_locations(session, ips, stop=None, networks=None):
     """
     Uses ip-api.com batch endpoint to get locations for a list of IPs.
-    Max 100 IPs per request.
+    Max 100 IPs per request. With `networks` (a dict), also asks for each IP's network and adds the
+    ones `networks` doesn't have yet as {ip: (AS number, name)}.
     """
     stop = stop or asyncio.Event()
     locations = {}
@@ -726,7 +833,8 @@ async def batch_get_locations(session, ips, stop=None):
     # Split into chunks of 100
     chunks = [ips[i:i + 100] for i in range(0, len(ips), 100)]
 
-    payloads = [[{"query": ip, "fields": "query,countryCode"} for ip in chunk] for chunk in chunks]
+    fields = "query,countryCode,as,isp" if networks is not None else "query,countryCode"
+    payloads = [[{"query": ip, "fields": fields} for ip in chunk] for chunk in chunks]
     for payload in payloads:
         # A rate limit, a server error or a network hiccup gets one more try; after that, those IPs get no flag
         for attempt in range(2):
@@ -738,9 +846,12 @@ async def batch_get_locations(session, ips, stop=None):
                 async with session.post(GEO_BATCH_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         for entry in await resp.json():
-                            # Entry looks like: {"query": "1.2.3.4", "countryCode": "US"}
+                            # Entry looks like: {"query": "1.2.3.4", "countryCode": "US", "as": "AS3320 ...", ...}
                             if entry.get('query'):
                                 locations[entry['query']] = entry.get('countryCode')
+                                network = parse_as(entry.get('as'), entry.get('isp'))
+                                if networks is not None and network:
+                                    networks.setdefault(entry['query'], network)
                         break
                     problem = f"HTTP {resp.status}"
                     retry = resp.status == 429 or resp.status >= 500
@@ -903,7 +1014,32 @@ async def run_api(session, ips, results, state, retrying, edition='java', stop=N
             t.cancel()
     await finished
 
-def format_entry(r, locations, markdown=True):
+def details_line(r, networks=None):
+    """The .txt report's extra line: network, protocol, software, mods and the like, whatever is known."""
+    parts = []
+    asn, as_name = (networks or {}).get(r['address']) or (None, None)
+    if asn is not None:
+        parts.append(f"AS{asn} {as_name}".strip())
+    if r.get('protocol') is not None:
+        parts.append(f"protocol {r['protocol']}")
+    for key in ('software', 'brand', 'gamemode'):
+        if r.get(key):
+            parts.append(r[key])
+    if r.get('map'):
+        parts.append(f"map {r['map']}")
+    if r.get('secure_chat'):
+        parts.append("secure chat")
+    if r.get('mod_count'):
+        parts.append(f"{r['mod_count']} mods")
+    elif r.get('modded'):
+        parts.append("modded")
+    if r.get('plugins'):
+        parts.append(f"{len(r['plugins'])} plugins")
+    if r.get('eula_blocked'):
+        parts.append("blocked by Mojang")
+    return " · ".join(parts)
+
+def format_entry(r, locations, markdown=True, networks=None):
     bold = (lambda s: f"**{s}**") if markdown else (lambda s: s)
     motd = discord.utils.escape_markdown(r['motd']) if markdown else r['motd']
     names = ", ".join(r['names'])
@@ -914,9 +1050,42 @@ def format_entry(r, locations, markdown=True):
     if markdown:  # Both come from the list or the server, and names like play_server_1 would turn italic
         ip, version = discord.utils.escape_markdown(ip), discord.utils.escape_markdown(version)
     text = f"{get_flag_emoji(locations.get(r['address']))} {bold(ip)} | Players: {r['players']}/{r['max']} | Ver: {version}"
+    if isinstance(r.get('latency'), (int, float)):
+        text += f" · {round(r['latency'])} ms"
     if motd: text += f"\n   └ 📝 {motd}"
     if names: text += f"\n   └ 👤 {bold('Users:')} {names}"
+    details = "" if markdown else details_line(r, networks)  # Chat stays short; the file has room
+    if details: text += f"\n   └ 🌐 {details}"
     return text
+
+# The results files' columns, in order. The first nine were the only ones until October 2026, so new ones go at the
+# end. The CSV and the JSON file use the same names; `players` holds the names, `players_online` the count.
+COLUMNS = ('ip', 'resolved_ip', 'country', 'players_online', 'players_max', 'version', 'motd', 'players', 'edition',
+           'latency_ms', 'protocol', 'secure_chat', 'modded', 'mod_count', 'software', 'plugins', 'eula_blocked',
+           'gamemode', 'map', 'brand', 'asn', 'as_name', 'source')
+
+def result_row(r, locations, networks=None):
+    """One result under the files' column names. Lists stay lists, and anything unknown is None."""
+    asn, as_name = (networks or {}).get(r['address']) or (None, None)
+    return {
+        'ip': r['ip'], 'resolved_ip': r['address'], 'country': locations.get(r['address']) or None,
+        'players_online': r['players'], 'players_max': r['max'], 'version': r['version'], 'motd': r['motd'],
+        'players': r['names'], 'edition': r['edition'], 'latency_ms': r.get('latency'), 'protocol': r.get('protocol'),
+        'secure_chat': r.get('secure_chat'), 'modded': r.get('modded'), 'mod_count': r.get('mod_count'),
+        'software': r.get('software'), 'plugins': r.get('plugins'), 'eula_blocked': r.get('eula_blocked'),
+        'gamemode': r.get('gamemode'), 'map': r.get('map'), 'brand': r.get('brand'), 'asn': asn,
+        'as_name': as_name or None, 'source': r.get('source'),
+    }
+
+def csv_value(value):
+    """A CSV cell: empty for unknown, true/false, lists joined with "; ", text defused (see csv_cell)."""
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, list):
+        value = "; ".join(value)
+    return csv_cell(value)
 
 def csv_cell(value):
     """
@@ -932,47 +1101,49 @@ def csv_line(values):
     csv.writer(buffer).writerow(values)
     return buffer.getvalue()
 
-def report_rows(populated, empty, locations):
+def report_rows(populated, empty, locations, networks=None):
     """
-    Returns (text rows, CSV header, CSV rows) of the results. Each row is a whole entry, so a report
+    Returns (text rows, CSV header, CSV rows, JSON rows) of the results. Each row is a whole entry, so a report
     that is too big for one upload can be split between rows.
     """
     txt_rows = []
     if populated:
         txt_rows.append(f"Servers with Players ({len(populated)}):\n")
-        txt_rows += [format_entry(r, locations, markdown=False) + "\n" for r in populated]
+        txt_rows += [format_entry(r, locations, markdown=False, networks=networks) + "\n" for r in populated]
         txt_rows.append("\n")
     if empty:
         txt_rows.append(f"Online (Empty) Servers ({len(empty)}):\n")
-        txt_rows += [format_entry(r, locations, markdown=False) + "\n" for r in empty]
+        txt_rows += [format_entry(r, locations, markdown=False, networks=networks) + "\n" for r in empty]
 
-    header = csv_line(["ip", "resolved_ip", "country", "players_online", "players_max", "version", "motd", "players",
-                       "edition"])
-    csv_rows = [csv_line([csv_cell(v) for v in (r['ip'], r['address'] or '', locations.get(r['address']) or '',
-                                                 r['players'], r['max'], r['version'], r['motd'],
-                                                 "; ".join(r['names']), r['edition'])])
-                for r in populated + empty]
-    return txt_rows, header, csv_rows
+    rows = [result_row(r, locations, networks) for r in populated + empty]
+    header = csv_line(COLUMNS)
+    csv_rows = [csv_line([csv_value(row[column]) for column in COLUMNS]) for row in rows]
+    json_rows = [json.dumps(row, ensure_ascii=False) for row in rows]
+    return txt_rows, header, csv_rows, json_rows
 
-def split_rows(filename, header, rows, limit):
+def split_rows(filename, header, rows, limit, joiner='', footer=''):
     """
     Returns [(filename, bytes), ...]: the rows as one file, or as several when they wouldn't fit in `limit`
-    bytes. Only splits between rows, and every part starts with the header. Parts are named name_1.ext, name_2.ext, ...
+    bytes. Only splits between rows, and every part is header + rows joined by `joiner` + footer (so each part of
+    a JSON array is a valid array too). Parts are named name_1.ext, name_2.ext, ...
     """
-    header_bytes = header.encode('utf-8')
-    parts, current, size = [], [], len(header_bytes)
+    header_bytes, joiner_bytes, footer_bytes = header.encode('utf-8'), joiner.encode('utf-8'), footer.encode('utf-8')
+    fixed = len(header_bytes) + len(footer_bytes)
+    parts, current, size = [], [], fixed
     for row in rows:
         data = row.encode('utf-8')
-        if current and size + len(data) > limit:
+        added = len(data) + (len(joiner_bytes) if current else 0)
+        if current and size + added > limit:
             parts.append(current)
-            current, size = [], len(header_bytes)
+            current, size, added = [], fixed, len(data)
         current.append(data)
-        size += len(data)
+        size += added
     parts.append(current)
-    if len(parts) == 1:
-        return [(filename, header_bytes + b"".join(parts[0]))]
+    files = [header_bytes + joiner_bytes.join(part) + footer_bytes for part in parts]
+    if len(files) == 1:
+        return [(filename, files[0])]
     stem, extension = os.path.splitext(filename)
-    return [(f"{stem}_{number}{extension}", header_bytes + b"".join(part)) for number, part in enumerate(parts, 1)]
+    return [(f"{stem}_{number}{extension}", data) for number, data in enumerate(files, 1)]
 
 def batch_files(files, limit):
     """Groups (filename, bytes) files, in order, into messages that each stay within `limit` bytes in total."""
@@ -993,16 +1164,18 @@ def upload_limit(ctx):
         limit = UPLOAD_LIMIT
     return int(limit * UPLOAD_HEADROOM)
 
-def build_file_batches(populated, empty, locations, limit):
+def build_file_batches(populated, empty, locations, limit, networks=None):
     """Returns the results files as batches of discord.File, one batch per message, each within `limit` bytes."""
-    txt_rows, header, csv_rows = report_rows(populated, empty, locations)
-    files = split_rows("scan_results.txt", "", txt_rows, limit) + split_rows("scan_results.csv", header, csv_rows, limit)
+    txt_rows, header, csv_rows, json_rows = report_rows(populated, empty, locations, networks)
+    files = (split_rows("scan_results.txt", "", txt_rows, limit)
+             + split_rows("scan_results.csv", header, csv_rows, limit)
+             + split_rows("scan_results.json", "[\n", json_rows, limit, joiner=",\n", footer="\n]\n"))
     return [[discord.File(io.BytesIO(data), filename=name) for name, data in batch]
             for batch in batch_files(files, limit)]
 
-def build_files(populated, empty, locations):
-    """Returns a readable .txt report and a .csv of every online server."""
-    return build_file_batches(populated, empty, locations, float('inf'))[0]
+def build_files(populated, empty, locations, networks=None):
+    """Returns a readable .txt report, a .csv and a .json of every online server."""
+    return build_file_batches(populated, empty, locations, float('inf'), networks)[0]
 
 async def send_channel(ctx, *args, **kwargs):
     """
@@ -1042,7 +1215,8 @@ def speed_text(direct, api):
     return text
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
-                       vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None, error=False):
+                       vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None, error=False,
+                       networks=None):
     minutes = int(duration // 60)
     seconds = int(duration % 60)
 
@@ -1100,7 +1274,7 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
     message = summary
     if top:
         message += "\n\n**Top servers:**\n" + "\n".join(top)
-    batches = build_file_batches(populated, empty, locations, upload_limit(ctx))
+    batches = build_file_batches(populated, empty, locations, upload_limit(ctx), networks)
     message += "\n\n📎 Full results are in the attached files."
     if len(batches) > 1:
         message += f" They're too big for one message, so they come in {len(batches)}."
@@ -1332,7 +1506,7 @@ async def help(ctx):
         inline=False
     )
     embed.set_footer(text=f"Attach a .txt file with IPs (one per line, max {MAX_IPS_PER_SCAN}) to use /scan.\n"
-                          "Country flags: IP Geolocation by DB-IP (db-ip.com)")
+                          "Country flags and networks: IP Geolocation by DB-IP (db-ip.com)")
     await ctx.send(embed=embed)
 
 def is_moderator(ctx):
@@ -1502,6 +1676,7 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
     updater = asyncio.create_task(report_progress(progress, state))
     results = {}
     locations = {}
+    networks = {}
     direct = api = None  # (servers checked, seconds) for each phase that ran, for the speed line
     retry = []
     error = False
@@ -1523,13 +1698,18 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
                               stop=scan.stop, vpn_down=no_vpn)
                 api = (len(retry), time.monotonic() - began)
 
-            # 3. Geolocation: offline database first (instant), ip-api.com for the rest
+            # 3. Countries and networks: offline databases first (instant), ip-api.com for what they don't know.
+            # The network database only counts when it's open, so a failed download doesn't send every server
+            # to ip-api.com.
             addresses = sorted({r['address'] for r in results.values() if r['address']})
             locations = lookup_countries(addresses)
-            unknown = [a for a in addresses if a not in locations]
+            networks = lookup_networks(addresses)
+            unknown = [a for a in addresses if a not in locations or (asn_db is not None and a not in networks)]
             if unknown and not scan.stop.is_set():
-                state.update(phase="Resolving locations", done=len(locations), total=len(addresses))
-                locations.update(await batch_get_locations(session, unknown, stop=scan.stop))
+                state.update(phase="Resolving locations", done=len(addresses) - len(unknown), total=len(addresses))
+                found = await batch_get_locations(session, unknown, stop=scan.stop, networks=networks)
+                for address, code in found.items():
+                    locations.setdefault(address, code)  # The offline database's answer wins
                 state['done'] = len(addresses)
     except Exception:
         # Exception, not BaseException: cancelling the task (the bot shutting down hard) must still cancel it
@@ -1558,7 +1738,8 @@ async def run_scan(ctx, scan, file, edition, api_retry=True):
     not_retried = len(retry) if not api_retry and not stopped else 0
     await send_results(ctx, list(results.values()), locations, stopped, total_ips, time.monotonic() - start_time,
                        blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
-                       direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason, error=error)
+                       direct=direct, api=api, not_retried=not_retried, stop_reason=stop_reason, error=error,
+                       networks=networks)
 
 async def shutdown(reason, grace=SHUTDOWN_GRACE, close=None):
     """

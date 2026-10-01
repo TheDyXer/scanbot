@@ -110,19 +110,19 @@ class ApiSessionTests(unittest.IsolatedAsyncioTestCase):
 class DatabaseRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_old_or_missing_database_is_loaded_again(self):
         for age in (bot.GEO_DB_MAX_AGE_DAYS + 1, None):
-            with self.subTest(age=age), mock.patch.object(bot, 'geo_db_age_days', return_value=age), \
+            with self.subTest(age=age), mock.patch.object(bot, 'mmdb_age_days', return_value=age), \
                     mock.patch.object(bot, 'load_geo_db', mock.AsyncMock()) as load:
                 self.assertTrue(await bot.refresh_geo_db_if_old())
                 load.assert_awaited_once()
 
     async def test_a_database_the_bot_cannot_replace_is_left_alone(self):
         # In Docker it's in the image (/app, owned by root): downloading a new one every day would be for nothing
-        with mock.patch.object(bot, 'geo_db_age_days', return_value=bot.GEO_DB_MAX_AGE_DAYS + 1),                 mock.patch.object(bot.os, 'access', return_value=False),                 mock.patch.object(bot, 'load_geo_db', mock.AsyncMock()) as load:
+        with mock.patch.object(bot, 'mmdb_age_days', return_value=bot.GEO_DB_MAX_AGE_DAYS + 1),                 mock.patch.object(bot.os, 'access', return_value=False),                 mock.patch.object(bot, 'load_geo_db', mock.AsyncMock()) as load:
             self.assertFalse(await bot.refresh_geo_db_if_old())
             load.assert_not_awaited()
 
     async def test_a_fresh_database_is_left_alone(self):
-        with mock.patch.object(bot, 'geo_db_age_days', return_value=bot.GEO_DB_MAX_AGE_DAYS - 1), \
+        with mock.patch.object(bot, 'mmdb_age_days', return_value=bot.GEO_DB_MAX_AGE_DAYS - 1), \
                 mock.patch.object(bot, 'load_geo_db', mock.AsyncMock()) as load:
             self.assertFalse(await bot.refresh_geo_db_if_old())
             load.assert_not_awaited()
@@ -131,22 +131,27 @@ class DatabaseRefreshTests(unittest.IsolatedAsyncioTestCase):
         old = mock.MagicMock()
         new = mock.MagicMock()
         new.metadata.return_value = types.SimpleNamespace(build_epoch=1_790_000_000)
-        with mock.patch.object(bot, 'geo_db', old), mock.patch.object(bot, 'geo_db_age_days', return_value=1), \
+        with mock.patch.object(bot, 'geo_db', old), mock.patch.object(bot, 'asn_db', None), \
+                mock.patch.object(bot, 'mmdb_age_days', return_value=1), \
                 mock.patch.object(bot.maxminddb, 'open_database', return_value=new):
             with self.assertLogs('scanbot', level='INFO'):
                 await bot.load_geo_db()
             self.assertIs(bot.geo_db, new)
+            self.assertIs(bot.asn_db, new)  # The network database is opened the same way
         old.close.assert_called_once()
 
     async def test_a_new_database_that_does_not_open_keeps_the_old_one(self):
         old = mock.MagicMock()
-        with mock.patch.object(bot, 'geo_db', old), mock.patch.object(bot, 'geo_db_age_days', return_value=1), \
+        with mock.patch.object(bot, 'geo_db', old), mock.patch.object(bot, 'asn_db', None), \
+                mock.patch.object(bot, 'mmdb_age_days', return_value=1), \
                 mock.patch.object(bot.maxminddb, 'open_database', side_effect=OSError('broken')):
             with self.assertLogs('scanbot', level='WARNING') as logs:
                 await bot.load_geo_db()
             self.assertIs(bot.geo_db, old)
+            self.assertIsNone(bot.asn_db)
         old.close.assert_not_called()
         self.assertIn('still using the old one', logs.output[0])
+        self.assertIn('No network database', logs.output[1])
 
     async def test_the_watcher_checks_the_age_after_each_interval(self):
         checked = asyncio.Event()
