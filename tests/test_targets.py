@@ -24,7 +24,7 @@ Target = scanbot.TargetSpec
 
 
 async def parse(content, attach=True):
-    """The scan command's arguments for a ! message, after ctx: [file, target, edition, api], or 'bad'."""
+    """The scan command's arguments for a ! message, after ctx: [file, target, edition, api, confirm], or 'bad'."""
     att = discord.Attachment(data={'id': 1, 'filename': 'ips.txt', 'size': 10, 'url': 'https://x/y',
                                    'proxy_url': 'https://x/y'}, state=mock.MagicMock())
     msg = mock.MagicMock(attachments=[att] if attach else [], content=content)
@@ -43,22 +43,26 @@ async def parse(content, attach=True):
 
 class PrefixParsingTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_file_and_no_words_is_still_the_plain_scan(self):
-        self.assertEqual(await parse('!scan'), ['file', None, 'java', 'on'])
+        self.assertEqual(await parse('!scan'), ['file', None, 'java', 'auto', None])
 
     async def test_the_edition_and_api_still_come_without_a_target(self):
-        self.assertEqual(await parse('!scan bedrock off'), ['file', None, 'bedrock', 'off'])
-        self.assertEqual(await parse('!scan bedrock'), ['file', None, 'bedrock', 'on'])
+        self.assertEqual(await parse('!scan bedrock off'), ['file', None, 'bedrock', 'off', None])
+        self.assertEqual(await parse('!scan bedrock'), ['file', None, 'bedrock', 'auto', None])
         self.assertEqual(await parse('!scan pocket'), 'bad')
 
     async def test_a_target_comes_first(self):
         self.assertEqual(await parse('!scan asn:AS8400 bedrock off', attach=False),
-                         [None, Target('asn', 'AS8400'), 'bedrock', 'off'])
-        self.assertEqual(await parse('!scan COUNTRY:rs', attach=False), [None, Target('country', 'rs'), 'java', 'on'])
+                         [None, Target('asn', 'AS8400'), 'bedrock', 'off', None])
+        self.assertEqual(await parse('!scan COUNTRY:rs', attach=False),
+                         [None, Target('country', 'rs'), 'java', 'auto', None])
+        self.assertEqual(await parse('!scan asn:AS8400 java auto yes', attach=False),
+                         [None, Target('asn', 'AS8400'), 'java', 'auto', 'yes'])
 
     async def test_a_bare_network_range_or_wildcard_is_a_cidr_target(self):
         for word in ('1.2.3.0/24', '1.2.3.1-1.2.3.9', '1.2.3.*', '1.2.3.0/24:25570'):
             with self.subTest(word=word):
-                self.assertEqual(await parse(f'!scan {word}', attach=False), [None, Target('cidr', word), 'java', 'on'])
+                self.assertEqual(await parse(f'!scan {word}', attach=False),
+                                 [None, Target('cidr', word), 'java', 'auto', None])
 
 
 class ConverterTests(unittest.IsolatedAsyncioTestCase):
@@ -95,6 +99,7 @@ class TargetScanTests(unittest.IsolatedAsyncioTestCase):
                   mock.patch.object(scanbot, 'api_pacer', scanbot.Pacer()),
                   mock.patch.object(scanbot, 'set_status', mock.AsyncMock()),
                   mock.patch.dict(scanbot.scans, clear=True),
+                  mock.patch.dict(scanbot.target_cache, clear=True),
                   mock.patch.object(scanbot, 'queue', [])):
             p.start()
             self.addCleanup(p.stop)
@@ -129,12 +134,31 @@ class TargetScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(self.checked), ['1.2.3.1', '1.2.3.2'])
         self.assertIn("on 2 IPs from AS8400 (1 prefix)", self.replies()[0])
 
-    async def test_an_asn_bigger_than_a_scan_is_refused_with_its_size_and_nothing_starts(self):
+    async def test_an_asn_bigger_than_a_scan_gets_a_campaign_preview_and_nothing_starts(self):
         self.prefixes_for_asn.return_value = [ipaddress.IPv4Network('11.0.0.0/16'), ipaddress.IPv4Network('12.0.0.0/16')]
-        await self.scan(target=Target('asn', 'AS8400'))
+        # Direct pings on for the preview, but never sent: a broken preview must fail here, not ping real networks
+        with mock.patch.object(scanbot.bot, 'direct_ok', True), mock.patch.object(scanbot, 'check_direct', mock.AsyncMock(side_effect=AssertionError('a preview pings nothing'))):
+            await self.scan(target=Target('asn', 'AS8400'))
+        reply = self.replies()[-1]
+        self.assertTrue(reply.startswith("📋 **Campaign preview:** AS8400 (2 prefixes) has 131,068 addresses: 5 parts "
+                                         "of up to 30,000"), reply)
+        self.assertIn("`/scan target:asn:AS8400 confirm:yes`", reply)
+        self.assertEqual((self.checked, scanbot.scans), ([], {}))
+
+    async def test_an_asn_bigger_than_a_campaign_is_refused_with_its_size(self):
+        self.prefixes_for_asn.return_value = [ipaddress.IPv4Network('11.0.0.0/16'), ipaddress.IPv4Network('12.0.0.0/16')]
+        with mock.patch.object(scanbot, 'MAX_CAMPAIGN_ADDRESSES', 100_000):
+            await self.scan(target=Target('asn', 'AS8400'))
         self.assertEqual(self.replies()[-1],
-                         "❌ **Too many IPs:** `asn:AS8400 (2 prefixes)` has 131,068 addresses; a scan takes at most "
-                         f"{scanbot.MAX_IPS_PER_SCAN}. Scan part of it with `cidr:`, one prefix at a time.")
+                         "❌ **Too many IPs:** `asn:AS8400 (2 prefixes)` has 131,068 addresses; a campaign takes at "
+                         "most 100000. Scan part of it with `cidr:`, one prefix at a time. The bot's owner can raise "
+                         "MAX_CAMPAIGN_ADDRESSES.")
+        self.assertEqual((self.checked, scanbot.scans), ([], {}))
+
+    async def test_a_campaign_without_direct_pings_needs_the_api_on(self):
+        self.prefixes_for_asn.return_value = [ipaddress.IPv4Network('11.0.0.0/16')]
+        await self.scan(target=Target('asn', 'AS8400'))  # direct_ok is False here
+        self.assertIn("A campaign checks servers only with direct pings unless you add `api:on`", self.replies()[-1])
         self.assertEqual((self.checked, scanbot.scans), ([], {}))
 
     async def test_bad_targets_get_helpful_replies(self):
@@ -176,7 +200,7 @@ class TargetScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.checked, scanbot.scans), ([], {}))
 
     async def test_a_file_past_the_limit_names_the_line(self):
-        with mock.patch.object(scanbot, 'MAX_IPS_PER_SCAN', 2):
+        with mock.patch.object(scanbot, 'MAX_IPS_PER_SCAN', 2), mock.patch.object(scanbot, 'MAX_CAMPAIGN_ADDRESSES', 2):
             await self.scan(self.attachment(b'1.2.3.4\n1.2.3.0/30\n'))
         self.assertEqual(self.replies()[-1], "❌ **Too many IPs:** line 2 (`1.2.3.0/30`) takes the list past 2 "
                                              "addresses, the most a scan takes.")

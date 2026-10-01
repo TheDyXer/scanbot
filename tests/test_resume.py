@@ -173,7 +173,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: self.waiting == 1 and len(self.checked) == 6)
 
         # Every entry but the slow one is checked; the cursor waits at it
-        await until(lambda: self.saved().cursor == {'phase': 'direct', 'index': 3})
+        await until(lambda: self.saved().cursor == {'part': 0, 'phase': 'direct', 'index': 3})
         job = self.saved()
         self.assertEqual(job.status, 'running')
         self.assertEqual(set(job.results), {'1.0.0.1', '1.0.0.3'})
@@ -250,7 +250,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
 
         job = self.saved()
         self.assertEqual(job.status, 'interrupted')
-        self.assertEqual(job.cursor, {'phase': 'direct', 'index': 4})  # 1.0.0.4 finished, 1.0.0.5 never started
+        self.assertEqual(job.cursor, {'part': 0, 'phase': 'direct', 'index': 4})  # 1.0.0.4 finished, 1.0.0.5 never started
         self.assertEqual(set(job.results), {'1.0.0.1', '1.0.0.3'})
         self.assertEqual(self.store.read_list(job), IPS)
         self.assertFalse([t for t in texts(ctx.channel.send) if 'Scan stopped' in t or 'Scan Complete' in t])

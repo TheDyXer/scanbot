@@ -49,6 +49,8 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 
 - **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
 - **Ranges, networks and whole ISPs:** list lines like `1.2.3.0/24`, `1.2.3.10-1.2.3.20` or `1.2.3.*`, or no file at all: `/scan target:asn:AS8400`, `target:country:RS` or `target:cidr:1.2.3.0/24` (AS and country address lists come from RIPEstat)
+- **Campaigns:** a list or target bigger than one scan (up to 2,000,000 addresses) runs in parts of 30,000, one after another, with one result at the end. The bot first says how long it may take, and starts it when you confirm (see [Campaigns](#campaigns))
+- **Rescan and diff:** `/rescan` checks again the servers your last scan found online; `/diff` compares your last two scans: new servers, gone ones and player changes
 - **Fast scans:** pings servers directly, 300 at a time, and retries the ones that don't answer through `api.mcstatus.io`, with `api.mcsrvstat.us` as a second opinion for Java servers when mcstatus.io can't answer
 - **Skip the retry when it isn't worth it:** `/scan file:<.txt> api:off` counts only servers that answer a direct ping, which is much faster for long lists of mostly dead addresses (see [Skipping the API retry](#skipping-the-api-retry))
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
@@ -64,7 +66,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Public servers only:** private and local addresses (`127.0.0.1`, `192.168.x.x`, `localhost`, ...) are never contacted, so nobody can use the bot to probe the network it runs on
 - **Safe output:** server MOTDs and player names can't `@mention` anyone or break formatting
 - **Private DNS:** every lookup goes to Quad9 over DNS-over-TLS, or DNS-over-HTTPS where port 853 is blocked
-- Up to 30,000 IPs per scan
+- Up to 30,000 IPs per scan, and 2,000,000 in a campaign
 - **Docker image** for `amd64` and `arm64`, a one-line installer, and automatic daily updates
 
 ## Discord bot setup
@@ -218,8 +220,10 @@ or, if your network blocks Minecraft's port:
 
 | Command | What it does |
 | --- | --- |
-| `/scan file:<.txt> [edition] [api]` (or `!scan [edition] [api]` + attached `.txt`; `!check` works too) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file. `api` is `on` (the default) or `off`: [skip the API retry](#skipping-the-api-retry), as in `!scan java off` |
-| `/scan target:<target> [edition] [api]` (or `!scan <target> [edition] [api]`, no file) | Scans an AS number's, a country's or a range's addresses instead of a file: `asn:AS8400`, `country:RS` or `cidr:1.2.3.0/24` (a range or wildcard works too). See [Scanning without a file](#scanning-without-a-file) |
+| `/scan file:<.txt> [edition] [api] [confirm]` (or `!scan [edition] [api] [yes]` + attached `.txt`; `!check` works too) | Scans every server in the file. `edition` is `java` (the default) or `bedrock`, and applies to the whole file. `api` is `on`, `off` or `auto` (the default: on for a scan, off for a campaign): [skip the API retry](#skipping-the-api-retry), as in `!scan java off`. `confirm:yes` starts a [campaign](#campaigns) |
+| `/scan target:<target> [edition] [api] [confirm]` (or `!scan <target> [edition] [api] [yes]`, no file) | Scans an AS number's, a country's or a range's addresses instead of a file: `asn:AS8400`, `country:RS` or `cidr:1.2.3.0/24` (a range or wildcard works too). See [Scanning without a file](#scanning-without-a-file) |
+| `/rescan [edition] [api]` (or `!rescan [edition] [api]`) | Checks again the servers your last finished scan found online (your last one of that edition, if you give one). `api` defaults to what that scan used. See [Rescan and diff](#rescan-and-diff) |
+| `/diff` (or `!diff`) | Compares your last two finished scans of the same edition: new servers, gone ones, and changed player counts, with a `diff.csv` |
 | `/stop` (or `!stop`) | Stops your scan and posts what it found so far, or cancels it if it's still queued |
 | `/stop user:@name` (or `!stop @name`) | Moderators: stops that person's scan |
 | `/stop all:all` (or `!stop all`) | Moderators: stops every scan in this server |
@@ -242,6 +246,7 @@ With `api:off` (`!scan java off`), a server that doesn't answer a direct ping co
 
 - **What you can miss:** servers that only answer through the API, for example hosts that route by hostname (Hypixel answers by name but not by IP), or servers that block your address but not mcstatus.io's.
 - **It needs direct pings.** If they don't work (your network blocks port 25565 and there's no VPN, or the VPN is down), the bot refuses `api:off`, because it would check nothing. Use the API then.
+- **A campaign skips it unless you ask:** `api` is `auto` by default, which is on for a normal scan and off for a [campaign](#campaigns). Add `api:on` to retry a campaign's dead addresses too.
 - In `!scan` the edition comes first: `!scan bedrock off`. `!scan off` isn't understood. A target goes before both: `!scan asn:AS8400 bedrock off`.
 
 ### Scanning without a file
@@ -252,7 +257,38 @@ With `api:off` (`!scan java off`), a server that doesn't answer a direct ping co
 - **`country:RS`:** every IPv4 network registered to that country (two-letter code), from RIPEstat.
 - **`cidr:1.2.3.0/24`:** a network, a range (`cidr:1.2.3.10-1.2.3.20`) or a wildcard (`cidr:1.2.3.*`), optionally with a port for every address (`cidr:1.2.3.0/24:25570`). With `!scan`, the `cidr:` can be left out: `!scan 1.2.3.0/24`.
 
-The same limit applies as for a file: at most 30,000 addresses (`MAX_IPS_PER_SCAN`). A whole ISP or country is usually more: the bot then says how many addresses it has and scans nothing, and you can scan it one `cidr:` prefix at a time. For example, in October 2026 AS8400 had 66 IPv4 networks (after merging overlapping ones) with about 823,000 addresses, and Serbia 388 with about 2.3 million. A big country takes RIPEstat a while: the United States took 10 seconds. A network's first and last address (network and broadcast) are left out, except in a /31 or /32, and private or local addresses never count.
+A target of up to 30,000 addresses (`MAX_IPS_PER_SCAN`) is one scan. A whole ISP or country is usually more, and then it's a [campaign](#campaigns), up to 2,000,000 addresses (`MAX_CAMPAIGN_ADDRESSES`). Anything bigger is refused with its size: scan it one `cidr:` prefix at a time. For example, in October 2026 AS8400 had 66 IPv4 networks (after merging overlapping ones) with about 823,000 addresses, a campaign of 28 parts, and Serbia 388 with about 2.3 million, which needs `MAX_CAMPAIGN_ADDRESSES` raised. A big country takes RIPEstat a while: the United States took 10 seconds. The bot keeps RIPEstat's answer for 10 minutes, so confirming a campaign doesn't ask again. A network's first and last address (network and broadcast) are left out, except in a /31 or /32, and private or local addresses never count.
+
+### Campaigns
+
+A list or target with more than 30,000 addresses (`MAX_IPS_PER_SCAN`), up to 2,000,000 (`MAX_CAMPAIGN_ADDRESSES`), runs as a campaign: in parts of 30,000, one after another, in one scan slot, with one result at the end.
+
+1. **The first `/scan` shows a preview** and starts nothing: how many addresses and parts, and how long it may take. The time is the worst case, as if no server answered: every ping waits out its 3 seconds, 300 at a time.
+2. **Run the command it shows to start it:** the same `/scan` with `confirm:yes` (and the same file attached, for a list). With `!scan`, `yes` comes last, after the edition and the API option: `!scan asn:AS8400 java auto yes`.
+
+```text
+📋 Campaign preview: AS8400 (66 prefixes) has 823,420 addresses: 28 parts of up to 30,000, scanned one after another in one slot, with one result at the end.
+⏱️ Up to about 2 h 17 m with direct pings only: a server that doesn't answer counts as offline.
+▶️ To start it: /scan target:asn:AS8400 confirm:yes
+ℹ️ With api:on, every server that doesn't answer would also be checked through mcstatus.io: up to about 1 d 21 h more, and it slows everyone's API checks while it runs.
+```
+
+- **The API is off by default** in a campaign: hours of API checks at 5 a second would slow every other scan. `api:on` turns it on, and the preview says how much longer that takes.
+- **Progress** names the part: `🔎 @Steve · Part 3/28 · Pinging servers: 12000/30000 · Found: 412` (found so far in the whole campaign).
+- **`/stop`** stops the whole campaign and posts what every part found so far, with the part it stopped in.
+- **A restart** pauses it like any scan, and it carries on in the same part (see [Restarts and updates](#restarts-and-updates)).
+- **If direct pings stop working** in the middle (the VPN is down) and the API is off, the campaign waits for them, checking again every minute, instead of giving up. Its progress says `Waiting for direct pings`; `/stop` still works.
+- **A list file** may be up to 20 MB (`MAX_FILE_BYTES`), but Discord itself takes at most 10 MB on most servers: about 600,000 IPs. A big target needs no file and takes no memory for its addresses: each part is worked out when it starts.
+- A campaign takes one of the 5 scan slots for as long as it runs, like any scan.
+
+### Rescan and diff
+
+The bot keeps your last 5 finished scans with their results (`KEEP_FINISHED_PER_USER`, see [Restarts and updates](#restarts-and-updates)).
+
+- **`/rescan`** checks again the servers your last finished scan found online, as they were written in its list. `edition:bedrock` picks your last Bedrock scan. `api` defaults to what that scan used. A rescan is a scan like any other: one at a time, and it counts as your newest scan afterwards.
+- **`/diff`** compares your last finished scan with the one before it of the same edition: which servers are new, which are gone, and whose player count changed, with the 10 biggest changes and a `diff.csv` of every server (`ip`, `change`, `players_before`, `players_after`, `max`, `version`, `country`).
+- **"Gone" means went offline** when the newer scan is a rescan of the older one. When the two scans had different lists, it may also mean the newer scan didn't check that server, and `/diff` says so. A scan that was stopped early is marked partial.
+- Both need the `state` folder. Without it (`Scans can't be saved` in the log), they say there's nothing to compare.
 
 ### The IP list
 
@@ -270,7 +306,8 @@ play.example.com:25566
 ```
 
 - **Range lines** stand for every address in them: a network (`5.6.7.0/24`, without its first and last address, except in a /31 or /32), an inclusive range (`5.6.8.10-5.6.8.40`) or a wildcard (`5.6.9.*`, the same as a /24). A port after it applies to every address. Private and local addresses in a range are skipped; a range entirely inside a private block (`10.0.0.0/8`) is skipped as one line. The start message says how many range lines were expanded into how many addresses
-- Up to **30,000** servers per scan, in a file of at most 2 MB. That counts the addresses after expanding range lines, without duplicates: a list that goes over is refused, naming the line where it does. The range lines in one list may cover at most twice that (60,000 addresses), counting overlapping and repeated ranges each time
+- Up to **30,000** servers per scan, in a file of at most 20 MB. That counts the addresses after expanding range lines, without duplicates. A list with more is a [campaign](#campaigns), up to 2,000,000: a list that goes over that is refused, naming the line where it does
+- A range line may have at most 30,000 addresses, and the range lines in one list may cover at most twice that (60,000 addresses), counting overlapping and repeated ranges each time. For a bigger range, use `target:cidr:` instead: it doesn't have to be expanded into a list
 - Lines without a port use **25565** for Java and **19132** for Bedrock, and ports go from 1 to 65535. One file holds one edition: pick it with `edition`
 - Duplicates and invalid lines are skipped, and the start message tells you how many. Case and a trailing dot don't matter, and `1.2.3.4` is the same server as `1.2.3.4:25565`. A Java hostname with and without `:25565` counts as two servers, because without a port the bot follows the name's SRV record, which can point somewhere else
 - Private and local addresses are skipped too, including names that resolve to one (see [Troubleshooting](#troubleshooting))
@@ -362,7 +399,8 @@ Every scan is saved in the `state` folder (`STATE_DIR`) while it runs: the list,
 - **When the bot is back**, each scan carries on from where it got to. It posts `Scan resumed` with how far it had got, and its results include everything it found before and after the restart. The time in the results counts only the time it ran.
 - **A crash or a power cut** loses at most the last 10 seconds: the servers being checked at that moment are checked again.
 - **If the channel is gone,** or the bot can't post there any more, the scan carries on in its owner's DMs. If the bot can't send them a DM either, the scan is dropped, and the log says why.
-- **Finished scans** are kept with their results, the newest 5 per person (`KEEP_FINISHED_PER_USER`). Older ones are deleted.
+- **A campaign** carries on in the part it was in.
+- **Finished scans** are kept with their results, the newest 5 per person (`KEEP_FINISHED_PER_USER`), for [`/rescan` and `/diff`](#rescan-and-diff). Older ones are deleted.
 - **If the folder can't be written,** the log says `Scans can't be saved` with the fix. Scans still work, but stopping the bot ends them: each posts what it found so far, with a note that the bot is restarting.
 
 ## Configuration
@@ -371,7 +409,9 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 
 | Setting | Default | Allowed | What it does |
 | --- | --- | --- | --- |
-| `MAX_IPS_PER_SCAN` | `30000` | 1 to 1,000,000 | Most addresses one scan takes, after expanding range lines and targets. The largest file it reads grows with it: 64 bytes per line, at least 2 MB |
+| `MAX_IPS_PER_SCAN` | `30000` | 1 to 1,000,000 | Most addresses one scan takes, after expanding range lines and targets. A bigger list or target is a campaign, in parts of this size |
+| `MAX_CAMPAIGN_ADDRESSES` | `2000000` | 1 to 20,000,000 | Most addresses one [campaign](#campaigns) takes. At `MAX_IPS_PER_SCAN` or less, there are no campaigns. Serbia (`country:RS`, about 2.3 million) needs `3000000` |
+| `MAX_FILE_BYTES` | `20000000` | 100,000 to 1,000,000,000 | Largest list file the bot reads, in bytes. Discord's own limit is lower on most servers (10 MB) |
 | `MAX_CONCURRENT_SCANS` | `5` | 1 to 50 | Scans running at the same time (one per person); more wait in a queue |
 | `DIRECT_CONCURRENCY` | `300` | 1 to 2,000 | Direct pings in flight at the same time, per scan |
 | `DIRECT_CONCURRENCY_TOTAL` | twice `DIRECT_CONCURRENCY` | 1 to 20,000 | Direct pings in flight for all scans together |
@@ -637,7 +677,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Bot is online but ignores `!scan` | Message Content Intent is off | Use `/scan`, which doesn't need it, or turn the intent on in the Developer Portal → **Bot** → **Privileged Gateway Intents** and restart the bot |
-| `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 3 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
+| `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 5 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
 | `PrivilegedIntentsRequired` at startup | `SLASH_ONLY` is off but the Message Content Intent isn't enabled | Enable the intent, or set `SLASH_ONLY=1` |
 | Installer says `Your user can't talk to Docker` (or Docker says "permission denied") | Your account isn't in the `docker` group | Run the installer with `sudo` (the `sudo bash` command in [Quick start](#quick-start)), or run `sudo usermod -aG docker $USER`, log out and back in, and run it without `sudo` |
 | Installer says `docker-compose.yml was changed by hand, so it's kept as it is` | You edited `docker-compose.yml`, and a newer one has been published since | Keep yours, or take the new one: `mv docker-compose.yml docker-compose.yml.bak`, run the installer again, then copy your changes over from the `.bak` |
@@ -660,9 +700,16 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
 | `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP, hostname or range per line; IPv6 isn't supported |
-| `❌ Too many IPs: line N (...) has N addresses` or `takes the list past 30000 addresses` | A range line, or the whole list after expanding its ranges, has more addresses than a scan takes | Split the range into smaller ones, or the list into several files |
+| `📋 Campaign preview: ...` | The list or target has more addresses than one scan takes | Nothing is running yet: run the command the preview shows, with `confirm:yes`, to start the [campaign](#campaigns) |
+| `❌ Too many IPs: line N (...) has N addresses; a range line in a list may have at most 30000` | A range line in the file is bigger than one scan | Give it as `target:cidr:...` instead, which can run as a campaign, or split it into smaller ranges |
+| `❌ Too many IPs: line N (...) takes the list past 2000000 addresses` | The whole list, after expanding its ranges, is bigger than a campaign | Split it into several files |
 | `❌ Too many IPs: the range lines up to line N (...) cover N addresses` | The list repeats or overlaps big ranges, which cover more than twice `MAX_IPS_PER_SCAN` addresses together | Remove the repeated and overlapping range lines |
-| `❌ Too many IPs: asn:... (N prefixes) has N addresses` | The AS or country is bigger than one scan | Scan it one `cidr:` prefix at a time, or raise `MAX_IPS_PER_SCAN` |
+| `❌ Too many IPs: asn:... (N prefixes) has N addresses; a campaign takes at most 2000000` | The AS or country is bigger than a campaign | Scan it one `cidr:` prefix at a time, or raise `MAX_CAMPAIGN_ADDRESSES` in `.env` |
+| `❌ A campaign checks servers only with direct pings unless you add api:on` | Direct pings don't work right now (your network blocks port 25565, or the VPN is down), and a campaign skips the API by default | Add `api:on` (much slower: the preview says how much), or fix the direct pings |
+| A campaign's progress says `Waiting for direct pings` | Direct pings stopped working in the middle (the VPN is down), and the campaign has the API off | Nothing to do: it carries on when they work again. `/stop` ends it with what it found so far |
+| `❌ With !scan, yes comes after the edition and the API option` | `!scan asn:AS8400 yes` puts `yes` where the edition goes | Write all of them: `!scan asn:AS8400 java auto yes`, or use `/scan ... confirm:yes` |
+| `❌ This bot doesn't keep scan results` (for `/rescan` or `/diff`) | The `state` folder can't be written (the log says `Scans can't be saved`) | Fix the `state` folder (see `Scans can't be saved` below) |
+| `/diff` says `"gone" also counts servers the newer scan didn't check` | The two scans had different lists | Use `/rescan` right after a scan to see which servers really went offline |
 | `❌ RIPEstat answered HTTP ...` or `RIPEstat didn't answer` | RIPEstat (stat.ripe.net) had a problem or isn't reachable | Try again later. A big country can take RIPEstat several seconds to answer |
 | `❌ ASxxxx announces no IPv4 prefixes` or `No IPv4 space is registered to XX` | That AS announces nothing on the internet right now (or only IPv6), or the country code doesn't exist | Check the number or code |
 | `❌ api:off would check nothing` | Direct pings don't work: your network blocks port 25565, or the VPN is down | Scan with the API on, or fix the direct pings (see the row above and [VPN](#vpn)) |

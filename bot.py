@@ -129,12 +129,15 @@ try:
     CHECKPOINT_INTERVAL = env_int('CHECKPOINT_INTERVAL', 10, 2, 600)
     # Ended scans kept on disk per user, with their results
     KEEP_FINISHED_PER_USER = env_int('KEEP_FINISHED_PER_USER', 5, 2, 1000)
+    # The most addresses a campaign scans. A list or target bigger than MAX_IPS_PER_SCAN runs as a campaign: in
+    # parts of MAX_IPS_PER_SCAN, one after another in one slot, after a preview. Below MAX_IPS_PER_SCAN: no campaigns.
+    MAX_CAMPAIGN_ADDRESSES = env_int('MAX_CAMPAIGN_ADDRESSES', 2_000_000, 1, 20_000_000)
+    # Largest list file the bot reads. Discord's own limit is lower on most servers (10 MB); a plain list of
+    # 30,000 IPs is about 0.5 MB
+    MAX_FILE_BYTES = env_int('MAX_FILE_BYTES', 20_000_000, 100_000, 1_000_000_000)
 except ValueError as e:
     print(f"❌ Error: {e}")
     sys.exit(1)
-# Largest list file the bot reads: MAX_IPS_PER_SCAN lines of up to 64 bytes, and never less than 2 MB.
-# Ordinary IP lists are about 0.6 MB per 30,000 lines.
-MAX_FILE_BYTES = max(2_000_000, MAX_IPS_PER_SCAN * 64)
 UPLOAD_LIMIT = 10 * 1024 * 1024  # What Discord accepts per file, unless the server is boosted
 UPLOAD_HEADROOM = 0.9            # The bot stays this far under it
 # Pinged at startup to see if direct pings work from this network: one answer is enough. Direct pings
@@ -144,6 +147,7 @@ BEDROCK_PROBE_SERVERS = ('demo.mcstatus.io', 'play.cubecraft.net', 'geo.hivebedr
 INLINE_LIMIT = 1900       # Results longer than this are sent as files
 GEO_DB_CHECK = 86400      # Seconds between checks of the country database's age while the bot runs
 SHUTDOWN_GRACE = 35       # Seconds running scans get to post what they found when the bot is stopped (Docker allows 45)
+TARGET_CACHE_SECONDS = 600  # RIPEstat's answer for a target is kept this long, so confirming a campaign is instant
 # With the VPN, pings are sent by the pinger inside the VPN container; everything else uses this
 # machine's connection. Set by docker-compose.vpn.yml; empty means the bot pings servers itself.
 PINGER_URL = os.environ.get('PINGER_URL', '').strip().rstrip('/')
@@ -1172,6 +1176,42 @@ def expand_prefixes(networks, port=None):
     for network in networks:
         yield from range_entries(*network_bounds(network), port)
 
+# A target too big for one scan is kept as spans: [first, last] address ranges (as integers), scanned part by part
+# without ever listing every address. Positions count every address in the spans, private ones included.
+
+def network_spans(networks):
+    return [[int(first), int(last)] for first, last in map(network_bounds, networks)]
+
+def span_count(spans):
+    """Addresses in the spans, private ones included."""
+    return sum(last - first + 1 for first, last in spans)
+
+def special_count(first, last):
+    """How many addresses from first to last (integers) are private or local. The blocks don't overlap."""
+    total = 0
+    for block in SPECIAL_NETWORKS:
+        low, high = max(first, int(block.network_address)), min(last, int(block.broadcast_address))
+        if low <= high:
+            total += high - low + 1
+    return total
+
+def public_count(spans):
+    """The public addresses in the spans: what a campaign over them scans."""
+    return sum(last - first + 1 - special_count(first, last) for first, last in spans)
+
+def span_entries(spans, start, stop, port=None):
+    """The public addresses at positions start to stop - 1 of the spans, in order: one part of a campaign."""
+    position = 0
+    for first, last in spans:
+        size = last - first + 1
+        if position + size > start and position < stop:
+            low = first + max(0, start - position)
+            high = first + min(size, stop - position) - 1
+            yield from range_entries(low, high, port)
+        position += size
+        if position >= stop:
+            return
+
 async def batch_get_locations(session, ips, stop=None, networks=None):
     """
     Uses ip-api.com batch endpoint to get locations for a list of IPs.
@@ -1232,9 +1272,11 @@ class TooManyAddresses(Exception):
     `count` is set when that one line or target is too big on its own, and `covered` when the list's range lines
     together cover more than RANGE_WORK_FACTOR scans' worth of addresses (repeats and overlaps counted each time).
     """
-    def __init__(self, line_number, line, count=None, hint="", covered=None):
+    def __init__(self, line_number, line, count=None, hint="", covered=None, limit=None, rule=None):
         super().__init__(line)
         self.line_number, self.line, self.count, self.hint, self.covered = line_number, line, count, hint, covered
+        self.limit = MAX_IPS_PER_SCAN if limit is None else limit  # The most addresses the whole list may have
+        self.rule = rule or f"a scan takes at most {MAX_IPS_PER_SCAN}"  # What `count` broke
 
     def reply(self):
         where = f"line {self.line_number} (`{self.line}`)" if self.line_number else f"`{self.line}`"
@@ -1243,10 +1285,10 @@ class TooManyAddresses(Exception):
                     f"overlapping and repeated ranges each time; a list may cover at most "
                     f"{RANGE_WORK_FACTOR * MAX_IPS_PER_SCAN}, and a scan takes at most {MAX_IPS_PER_SCAN}.")
         if self.count is not None:
-            text = (f"❌ **Too many IPs:** {where} has {self.count:,} addresses; a scan takes at most "
-                    f"{MAX_IPS_PER_SCAN}.")
+            text = f"❌ **Too many IPs:** {where} has {self.count:,} addresses; {self.rule}."
         else:
-            text = f"❌ **Too many IPs:** {where} takes the list past {MAX_IPS_PER_SCAN} addresses, the most a scan takes."
+            what = "a campaign" if self.limit > MAX_IPS_PER_SCAN else "a scan"
+            text = f"❌ **Too many IPs:** {where} takes the list past {self.limit} addresses, the most {what} takes."
         return f"{text} {self.hint}".rstrip()
 
 # Range lines may cover at most this many scans' worth of addresses together, counting repeats and overlaps each
@@ -1254,14 +1296,26 @@ class TooManyAddresses(Exception):
 # file repeating a big range ("1.1.0.0/18" 100,000 times) would keep the bot busy for half an hour.
 RANGE_WORK_FACTOR = 2
 
-def parse_list(text, edition='java'):
+def campaign_cap():
+    """The most addresses one list or target may have: a campaign's, or a scan's when campaigns are off."""
+    return max(MAX_IPS_PER_SCAN, MAX_CAMPAIGN_ADDRESSES)
+
+def campaign_rule():
+    if campaign_cap() > MAX_IPS_PER_SCAN:
+        return f"a campaign takes at most {campaign_cap()}"
+    return f"a scan takes at most {MAX_IPS_PER_SCAN}"
+
+def parse_list(text, edition='java', limit=None):
     """
     The servers in a list file. Blank lines and lines starting with # are ignored. A line is an address (IP or
     hostname, optionally with a 1-65535 port) or a range line (network, range or wildcard), which stands for every
     public address in it. Of two lines for the same server (see dedupe_key) the first one is kept as it was
-    written. Raises TooManyAddresses as soon as the list passes MAX_IPS_PER_SCAN, or its range lines cover more than
-    RANGE_WORK_FACTOR times that, naming the line, without expanding the rest.
+    written. Raises TooManyAddresses as soon as the list passes `limit` addresses (MAX_IPS_PER_SCAN unless given;
+    the scan command gives the campaign cap), or a range line has more than MAX_IPS_PER_SCAN, or the range lines
+    together cover more than RANGE_WORK_FACTOR times that, naming the line, without expanding the rest. (Range lines
+    stay that small however big a campaign may be: a list is held in memory, a target isn't.)
     """
+    limit = MAX_IPS_PER_SCAN if limit is None else limit
     unique = {}
     invalid = duplicates = blocked = expanded_lines = expanded_addresses = 0
     covered = 0  # Addresses in the range lines expanded so far, repeats included
@@ -1271,8 +1325,8 @@ def parse_list(text, edition='java'):
         key = dedupe_key(entry, edition)
         if key in unique:
             duplicates += 1
-        elif len(unique) >= MAX_IPS_PER_SCAN:
-            raise TooManyAddresses(number, line)
+        elif len(unique) >= limit:
+            raise TooManyAddresses(number, line, limit=limit)
         else:
             unique[key] = entry
 
@@ -1300,7 +1354,10 @@ def parse_list(text, edition='java'):
             blocked += 1  # Like 10.0.0.0/8: nothing in it is scanned, however big it is
             continue
         if size > MAX_IPS_PER_SCAN:
-            raise TooManyAddresses(number, line, size)
+            hint = (f"Scan it with `/scan target:cidr:{line}` instead: a target that big runs as a campaign."
+                    if MAX_IPS_PER_SCAN < size <= MAX_CAMPAIGN_ADDRESSES else "")
+            raise TooManyAddresses(number, line, size, hint=hint,
+                                   rule=f"a range line in a list may have at most {MAX_IPS_PER_SCAN}")
         covered += size
         if covered > RANGE_WORK_FACTOR * MAX_IPS_PER_SCAN:
             raise TooManyAddresses(number, line, covered=covered)
@@ -1351,7 +1408,8 @@ async def update_presence():
 
 def progress_text(state):
     owner = f"{state['owner']} · " if state.get('owner') else ""
-    return f"🔎 {owner}**{state['phase']}:** {state['done']}/{state['total']} · **Found:** {state['found']}"
+    part = f"Part {state['part']}/{state['parts']} · " if state.get('parts', 1) > 1 else ""
+    return f"🔎 {owner}{part}**{state['phase']}:** {state['done']}/{state['total']} · **Found:** {state['found']}"
 
 async def report_progress(message, state):
     """Edits the progress message every few seconds while a scan runs."""
@@ -1689,9 +1747,9 @@ def speed_text(direct, api):
 
 async def send_results(ctx, results, locations, stopped, total_ips, duration, blocked=0, edition='java', owner=None,
                        vpn_down=False, direct=None, api=None, not_retried=0, stop_reason=None, error=False,
-                       networks=None, unchecked=0, resumed=0):
-    minutes = int(duration // 60)
-    seconds = int(duration % 60)
+                       networks=None, unchecked=0, resumed=0, parts=1, part=None, source=None):
+    hours, rest = divmod(int(duration), 3600)
+    minutes, seconds = divmod(rest, 60)
 
     populated = sorted((r for r in results if r['players'] > 0), key=lambda r: r['players'], reverse=True)
     empty = [r for r in results if r['players'] == 0]
@@ -1702,10 +1760,14 @@ async def send_results(ctx, results, locations, stopped, total_ips, duration, bl
         title = "🛑 **Scan stopped** — partial results" if stopped else "📊 **Scan Complete!**"
     if edition != 'java':
         title += f" ({EDITION_LABELS[edition]})"
+    if parts > 1:
+        where = f"{source}, " if source else ""
+        title += f" (campaign: {where}{parts} parts" + (f", stopped in part {part}/{parts})" if stopped and part else ")")
     if owner:
         title += f" · {owner}"  # Several people may be scanning in the same channel
+    took = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
     summary = (f"{title}\n🟢 {len(populated)} with players · ⚪ {len(empty)} empty · 🔎 {total_ips} IPs\n"
-               f"⏱️ **Time:** {minutes}m {seconds}s")
+               f"⏱️ **Time:** {took}")
     if resumed:
         summary += f" (resumed {'once' if resumed == 1 else f'{resumed} times'} after the bot restarted)"
     speed = speed_text(direct, api)
@@ -1952,7 +2014,10 @@ async def on_command_error(ctx, error):
         await ctx.send("❌ Please attach a `.txt` file.")
     elif isinstance(error, commands.BadLiteralArgument):
         if error.param.name == 'api':
-            await ctx.send("❌ The API option must be `on` or `off`, for example `!scan java off`.")
+            await ctx.send("❌ The API option must be `on`, `off` or `auto`, for example `!scan java off`.")
+        elif getattr(error, 'argument', '').lower() == 'yes':
+            await ctx.send("❌ With `!scan`, `yes` comes after the edition and the API option: "
+                           "`!scan asn:AS8400 java auto yes`.")
         else:
             await ctx.send("❌ The edition must be `java` or `bedrock`, for example `!scan bedrock`.")
     elif not isinstance(error, commands.CommandNotFound):
@@ -1972,16 +2037,31 @@ async def help(ctx):
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="/scan [file] [target] [edition] [api]  (or !scan [target] [edition] [api])",
+        name="/scan [file] [target] [edition] [api] [confirm]  (or !scan [target] [edition] [api] [yes])",
         value="Scans a list of Minecraft server IPs from a `.txt` file: one IP, hostname or range "
               "(`1.2.3.0/24`, `1.2.3.10-1.2.3.20`, `1.2.3.*`) per line. `edition` is `java` (default) or `bedrock`.\n"
               "Instead of a file, `target:` scans an AS number's or a country's addresses, or a range: "
               f"{TARGET_EXAMPLES} (`!scan asn:AS8400 bedrock`). At most {MAX_IPS_PER_SCAN} addresses.\n"
-              "`api` is `on` (default) or `off`: with `off`, a server that doesn't answer a direct ping counts as "
-              "offline instead of being retried through mcstatus.io, which is much faster for long lists of "
-              "mostly dead addresses.\n"
+              "`api` is `on`, `off` or `auto` (default: on for a scan, off for a campaign): with `off`, a server that "
+              "doesn't answer a direct ping counts as offline instead of being retried through mcstatus.io, which is "
+              "much faster for long lists of mostly dead addresses.\n"
               f"Up to {MAX_CONCURRENT_SCANS} people can scan at once, one scan each; more wait in a queue. If the "
               "bot restarts (for an update), scans carry on where they left off.",
+        inline=False
+    )
+    embed.add_field(
+        name="Campaigns: more than " + f"{MAX_IPS_PER_SCAN} addresses",
+        value=f"A list or target with up to {campaign_cap():,} addresses runs as a campaign: in parts of "
+              f"{MAX_IPS_PER_SCAN:,}, one after another, with one result at the end. `/scan` first shows how long "
+              "it may take; run it again with `confirm:yes` to start (`!scan asn:AS8400 java auto yes`)."
+              if campaign_cap() > MAX_IPS_PER_SCAN else
+              "Campaigns are switched off on this bot.",
+        inline=False
+    )
+    embed.add_field(
+        name="/rescan [edition] [api]  and  /diff",
+        value="`/rescan` checks again the servers your last scan found online. `/diff` compares your last two "
+              "scans of the same edition: which servers are new, gone or have more or fewer players.",
         inline=False
     )
     embed.add_field(
@@ -2071,11 +2151,16 @@ class Target(commands.Converter):
 @app_commands.describe(file="A .txt file with one IP, hostname or IP range per line",
                        target="Instead of a file: asn:AS8400, country:RS or cidr:1.2.3.0/24",
                        edition="Minecraft edition of the servers (default: java)",
-                       api="off: servers that don't answer a direct ping count as offline, no mcstatus.io retry (default: on)")
+                       api="off: no mcstatus.io retry for servers that don't answer a direct ping (auto: on, off for a campaign)",
+                       confirm="yes: start a campaign (a list or target bigger than one scan) after its preview")
 async def check(ctx, file: Optional[discord.Attachment] = None, target: Optional[Target] = None,
-                edition: Literal['java', 'bedrock'] = 'java', api: Literal['on', 'off'] = 'on'):
+                edition: Literal['java', 'bedrock'] = 'java', api: Literal['on', 'off', 'auto'] = 'auto',
+                confirm: Optional[Literal['yes']] = None):
     await ctx.defer()  # A slash command must be answered within 3 seconds
+    await start_scan(ctx, lambda scan: run_scan(ctx, scan, file, edition, api=api, target=target, confirm=confirm))
 
+async def start_scan(ctx, run):
+    """Registers the user's scan (one each) and runs `run(scan)`; /scan and /rescan both start scans this way."""
     # No await between these checks and registering the scan, so nobody can start two at once, and shutdown()
     # sees every scan that got past the first one
     if shutting_down:
@@ -2087,13 +2172,19 @@ async def check(ctx, file: Optional[discord.Attachment] = None, target: Optional
     scan = Scan(ctx.author, ctx.guild.id if ctx.guild else None)
     scans[ctx.author.id] = scan
     try:
-        await run_scan(ctx, scan, file, edition, api_retry=(api == 'on'), target=target)
+        await run(scan)
     finally:
         release(scan)
         await update_presence()
 
-def no_direct_reply():
+def no_direct_reply(campaign=False):
     """Why api:off can't run: it only checks servers with direct pings, and those don't work right now."""
+    if campaign:
+        # The user didn't ask for api:off: it's a campaign's default
+        why = ("the VPN is down, so direct pings aren't working right now" if PINGER_URL
+               else "direct pings don't work from this network")
+        return (f"❌ A campaign checks servers only with direct pings unless you add `api:on`, and {why}. "
+                "With `api:on` it checks every server through mcstatus.io instead, 5 a second.")
     if PINGER_URL:
         return ("❌ `api:off` would check nothing: the VPN is down, so direct pings aren't working right now. "
                 "Try again in a minute, or scan with the API on (slower).")
@@ -2120,8 +2211,51 @@ async def read_list_file(ctx, file):
         await ctx.send("❌ The file isn't UTF-8 text. Save it as plain UTF-8 text, one server per line.")
         return None
 
+class Loaded(NamedTuple):
+    """What to scan: a list of addresses, or for a target too big for one scan, spans expanded part by part."""
+    parsed: ParsedList            # The addresses (none for spans), and what was skipped
+    source: Optional[str]         # Where they came from, for the messages (None for a file)
+    spans: Optional[list] = None  # A big target's [first, last] address ranges
+    port: Optional[int] = None    # The port for every address in the spans (None for the default)
+
+    @property
+    def total(self):
+        """How many addresses get scanned."""
+        if self.spans is not None:
+            return span_count(self.spans) - self.parsed.blocked
+        return len(self.parsed.addresses)
+
+    @property
+    def parts(self):
+        """Scans' worth of addresses: more than one makes it a campaign."""
+        size = span_count(self.spans) if self.spans is not None else len(self.parsed.addresses)
+        return max(1, -(-size // MAX_IPS_PER_SCAN))
+
+target_cache = {}  # (kind, value) -> (time.monotonic() when fetched, networks)
+
+async def target_networks(target):
+    """An asn: or country: target's networks, from RIPEstat, or from its answer of the last few minutes."""
+    key = (target.kind, parse_asn(target.value) if target.kind == 'asn' else parse_country(target.value))
+    now = time.monotonic()
+    for old in [k for k, (fetched, _) in target_cache.items() if now - fetched > TARGET_CACHE_SECONDS]:
+        del target_cache[old]
+    if key in target_cache:
+        return target_cache[key][1]
+    async with api_session() as session:
+        if target.kind == 'asn':
+            networks = await prefixes_for_asn(session, target.value)
+        else:
+            networks = await prefixes_for_country(session, target.value)
+    if len(target_cache) >= 100:
+        target_cache.pop(next(iter(target_cache)))
+    target_cache[key] = (now, networks)
+    return networks
+
 async def expand_target(target):
-    """A target's addresses, as (ParsedList, where they came from). Raises TargetError or TooManyAddresses."""
+    """
+    A target's addresses, as a Loaded: the list itself, or spans when it's bigger than one scan (a campaign). Raises
+    TargetError, or TooManyAddresses when it's bigger than a campaign may be.
+    """
     if target.kind == 'invalid':
         raise TargetError(f"`{shown(target.value)}` isn't a scan target. Use {TARGET_EXAMPLES}.")
     if target.kind == 'cidr':
@@ -2133,33 +2267,31 @@ async def expand_target(target):
             raise TargetError(f"`{shown(target.value)}` isn't a network, range or wildcard "
                               "(like `1.2.3.0/24`, `1.2.3.10-1.2.3.20` or `1.2.3.*`).")
         first, last, port = bounds
-        size = range_size(first, last)
         if inside_special_network(first, last):
             raise TargetError(f"`{shown(target.value)}` is a private or local range: the bot only scans public servers.")
-        if size > MAX_IPS_PER_SCAN:
-            raise TooManyAddresses(None, f"cidr:{shown(target.value)}", size)
-        entries = list(range_entries(first, last, port))
-        return ParsedList(entries, blocked=size - len(entries)), f"`cidr:{shown(target.value)}`"
-
-    async with api_session() as session:
-        if target.kind == 'asn':
-            name = f"AS{parse_asn(target.value)}"
-            networks = await prefixes_for_asn(session, target.value)
-        else:
-            name = parse_country(target.value)
-            networks = await prefixes_for_country(session, target.value)
-    count = address_count(networks)
-    where = f"{name} ({len(networks)} prefix{'es' if len(networks) != 1 else ''})"
+        spans, where, label = [[int(first), int(last)]], f"`cidr:{shown(target.value)}`", f"cidr:{shown(target.value)}"
+        hint = ""
+    else:
+        name = f"AS{parse_asn(target.value)}" if target.kind == 'asn' else parse_country(target.value)
+        networks = await target_networks(target)
+        spans, port = network_spans(networks), None
+        where = f"{name} ({len(networks)} prefix{'es' if len(networks) != 1 else ''})"
+        label = f"{target.kind}:{where}"
+        hint = "Scan part of it with `cidr:`, one prefix at a time."
+    count = span_count(spans)
+    if count > campaign_cap():
+        if campaign_cap() > MAX_IPS_PER_SCAN:
+            hint = (hint + " The bot's owner can raise MAX_CAMPAIGN_ADDRESSES.").strip()
+        raise TooManyAddresses(None, label, count, hint=hint, rule=campaign_rule())
     if count > MAX_IPS_PER_SCAN:
-        raise TooManyAddresses(None, f"{target.kind}:{where}", count,
-                               hint="Scan part of it with `cidr:`, one prefix at a time.")
-    entries = list(expand_prefixes(networks))
-    return ParsedList(entries, blocked=count - len(entries)), where
+        return Loaded(ParsedList([], blocked=sum(special_count(a, b) for a, b in spans)), where, spans, port)
+    entries = list(span_entries(spans, 0, count, port))
+    return Loaded(ParsedList(entries, blocked=count - len(entries)), where)
 
 async def load_addresses(ctx, file, target, edition):
     """
-    What to scan, from the attached file or the target, as (ParsedList, where it came from or None for a file), or
-    None after telling the user what's wrong. Runs before the scan is queued, so mistakes are answered at once.
+    What to scan, from the attached file or the target, as a Loaded, or None after telling the user what's wrong.
+    Runs before the scan is queued, so mistakes are answered at once.
     """
     if file is None and target is None:
         await ctx.send(f"❌ Attach a `.txt` file, or give a target: {TARGET_EXAMPLES}.")
@@ -2175,25 +2307,85 @@ async def load_addresses(ctx, file, target, edition):
             return None
         # In a thread: a list near the size limit takes a second or so, which would hold up every other scan and
         # the connection to Discord
-        return await asyncio.to_thread(parse_list, text, edition), None
+        return Loaded(await asyncio.to_thread(parse_list, text, edition, campaign_cap()), None)
     except TooManyAddresses as e:
         await ctx.send(e.reply())
     except TargetError as e:
         await ctx.send(f"❌ {e}")
     return None
 
-async def run_scan(ctx, scan, file, edition, api_retry=True, target=None):
+def rough_duration(seconds):
+    """'3 h 26 m', '45 m', '2 d 4 h': how long something may take."""
+    minutes = max(1, round(seconds / 60))
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    if days:
+        return f"{days} d {hours} h"
+    return f"{hours} h {minutes} m" if hours else f"{minutes} m"
+
+def campaign_estimate(total, direct_ok, api_retry):
+    """
+    The most a campaign over `total` addresses may take, in seconds: as if no server answered, so every direct ping
+    waits out DIRECT_TIMEOUT (DIRECT_CONCURRENCY at a time) and, with the API, every server is checked through it too.
+    """
+    seconds = total * DIRECT_TIMEOUT / DIRECT_CONCURRENCY if direct_ok else 0
+    if api_retry or not direct_ok:
+        seconds += total * API_DELAY
+    return seconds
+
+def confirm_command(ctx, file, target, edition, api):
+    """The command that starts the campaign just previewed, written the way the user wrote theirs."""
+    what = f"{target.kind}:{target.value}".replace('`', '') if target is not None else None
+    if ctx.interaction is not None:
+        words = ['/scan', 'file:(the same file)' if file is not None else f"target:{what}"]
+        words += [f"edition:{edition}"] if edition != 'java' else []
+        words += [f"api:{api}"] if api != 'auto' else []
+        return " ".join(words + ['confirm:yes'])
+    prefix = getattr(ctx, 'clean_prefix', '!')
+    words = [f"{prefix}scan"] + ([what] if what else []) + [edition, api, 'yes']
+    return " ".join(words) + (" (with the same file attached)" if file is not None else "")
+
+async def campaign_preview(ctx, loaded, file, target, edition, api, api_retry):
+    """Says how big a campaign is and how long it may take, and how to start it. Nothing is started."""
+    direct_ok = await direct_pings_work(edition)
+    total, parts = loaded.total, loaded.parts
+    what = loaded.source or getattr(file, 'filename', 'Your list')
+    private = f" ({loaded.parsed.blocked:,} private or local ones are skipped)" if loaded.parsed.blocked else ""
+    lines = [f"📋 **Campaign preview:** {what} has {total:,} addresses{private}: {parts} parts of up to "
+             f"{MAX_IPS_PER_SCAN:,}, scanned one after another in one slot, with one result at the end."]
+    took = rough_duration(campaign_estimate(total, direct_ok, api_retry))
+    if not direct_ok:
+        lines.append(f"⏱️ Up to about **{took}**: direct pings don't work right now, so every server is checked "
+                     "through mcstatus.io, 5 a second shared with everyone's scans.")
+    elif api_retry:
+        lines.append(f"⏱️ Up to about **{took}**: direct pings, then a mcstatus.io check of every server that "
+                     "doesn't answer, 5 a second shared with everyone's scans (it slows their API checks).")
+    else:
+        lines.append(f"⏱️ Up to about **{took}** with direct pings only: a server that doesn't answer counts as "
+                     "offline.")
+    lines.append(f"▶️ To start it: `{confirm_command(ctx, file, target, edition, api)}`")
+    if direct_ok and not api_retry:
+        more = rough_duration(total * API_DELAY)
+        lines.append(f"ℹ️ With `api:on`, every server that doesn't answer would also be checked through mcstatus.io: "
+                     f"up to about {more} more, and it slows everyone's API checks while it runs.")
+    await ctx.send("\n".join(lines))
+
+async def run_scan(ctx, scan, file, edition, api='auto', target=None, confirm=None):
     # --- What to scan --- (checked before queueing, so a bad file or target is rejected right away)
     loaded = await load_addresses(ctx, file, target, edition)
     if loaded is None:
         return
-    parsed, source = loaded
+    parsed, source = loaded.parsed, loaded.source
     ips = parsed.addresses
-    if not ips:
+    total_ips = loaded.total
+    if not total_ips:
         note = f" ({parsed.blocked} private or local address(es) are never scanned)" if parsed.blocked else ""
         await ctx.send(f"⚠️ No valid IPs in {source or 'the file'}.{note}")
         return
-    total_ips = len(ips)
+    parts = loaded.parts
+    campaign = parts > 1
+    # auto: a scan retries through the API, a campaign doesn't (hours of API checks would slow everyone's scans)
+    api_retry = (api == 'on') if api != 'auto' else not campaign
 
     notes = []
     if parsed.expanded_lines:
@@ -2208,18 +2400,179 @@ async def run_scan(ctx, scan, file, edition, api_retry=True, target=None):
     # api:off only checks servers with direct pings, so there's nothing to do while they don't work. Checked before
     # queueing, so nobody waits in line for a refusal, and again once it's their turn.
     if not api_retry and not await direct_pings_work(edition):
-        await ctx.send(no_direct_reply())
+        await ctx.send(no_direct_reply(campaign and api == 'auto'))
+        return
+    if campaign and confirm != 'yes':
+        await campaign_preview(ctx, loaded, file, target, edition, api, api_retry)
         return
 
+    source_info = {'kind': 'file' if target is None else 'target',
+                   'description': source or getattr(file, 'filename', 'the file')}
+    if loaded.spans is not None:
+        source_info.update(spans=loaded.spans, port=loaded.port)
     job = jobs.new_job(ctx.author.id, ctx.author.mention, scan.guild_id, plain_id(getattr(ctx.channel, 'id', None)),
-                       edition, api_retry, {'kind': 'file' if target is None else 'target',
-                                            'description': source or getattr(file, 'filename', 'the file')},
-                       total_ips, extra)
+                       edition, api_retry, source_info, total_ips, extra)
+    job.parts, job.part_size = parts, MAX_IPS_PER_SCAN
     scan.job = job
-    # Saved before it's queued, so a restart while it waits doesn't lose it either
-    if store is not None and store.write_list(job, ips) and store.save(job):
+    # Saved before it's queued, so a restart while it waits doesn't lose it either. A big target saves its spans
+    # (in the job), not every address.
+    if store is not None and (loaded.spans is not None or store.write_list(job, ips)) and store.save(job):
         job.persistent = True
     await run_job(ctx, scan, job, ips)
+
+def part_entries(job, part, ips):
+    """The addresses of one part of a scan (a scan that isn't a campaign has one part: all of them)."""
+    spans = job.source.get('spans')
+    if spans is not None:
+        start = part * job.part_size
+        return list(span_entries(spans, start, start + job.part_size, job.source.get('port')))
+    if job.parts <= 1 or not job.part_size:
+        return ips
+    return ips[part * job.part_size:(part + 1) * job.part_size]
+
+# --- /rescan and /diff: the results of finished scans, kept in the state folder ---
+
+NO_STORE_REPLY = ("❌ This bot doesn't keep scan results (it has no state folder, see STATE_DIR), so there's "
+                  "nothing to {what}.")
+
+def discord_time(iso):
+    """A saved UTC time ('2026-10-01T03:15:00Z') as a Discord timestamp: each reader sees it in their own time zone."""
+    try:
+        moment = datetime.datetime.strptime(iso, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return 'an earlier time'
+    return f"<t:{int(moment.timestamp())}:f>"
+
+@bot.hybrid_command(name="rescan", description="Check again the servers your last scan found online")
+@app_commands.describe(edition="Rescan your last scan of this edition (default: your last scan)",
+                       api="off: no mcstatus.io retry for servers that don't answer a direct ping (auto: as last time)")
+async def rescan(ctx, edition: Optional[Literal['java', 'bedrock']] = None,
+                 api: Literal['on', 'off', 'auto'] = 'auto'):
+    await ctx.defer()
+    if store is None:
+        await ctx.send(NO_STORE_REPLY.format(what="rescan"))
+        return
+    await start_scan(ctx, lambda scan: run_rescan(ctx, scan, edition, api))
+
+async def run_rescan(ctx, scan, edition, api):
+    """Scans again the servers the user's last finished scan (of that edition) found online."""
+    parent = next((j for j in store.finished_for(ctx.author.id) if edition in (None, j.edition)), None)
+    if parent is None:
+        which = f"{EDITION_LABELS[edition]} " if edition else ""
+        await ctx.send(f"⚠️ You have no finished {which}scan to rescan. (The bot keeps your last "
+                       f"{KEEP_FINISHED_PER_USER} scans.)")
+        return
+    when = discord_time(parent.finished_at or parent.created_at)
+    entries = list(parent.results)  # The entries as they were in its list (names and ports as written)
+    if not entries:
+        await ctx.send(f"⚠️ Your scan of {when} found no online servers, so there's nothing to rescan.")
+        return
+    api_retry = parent.api_retry if api == 'auto' else api == 'on'
+    if not api_retry and not await direct_pings_work(parent.edition):
+        await ctx.send(no_direct_reply())
+        return
+    job = jobs.new_job(ctx.author.id, ctx.author.mention, scan.guild_id, plain_id(getattr(ctx.channel, 'id', None)),
+                       parent.edition, api_retry,
+                       {'kind': 'rescan', 'description': f"rescan of {when}", 'parent': parent.id},
+                       len(entries), f" (the servers your scan of {when} found online)")
+    # More online servers than one scan takes (a big campaign's): parts, without a preview, since they're known servers
+    job.parts, job.part_size = max(1, -(-len(entries) // MAX_IPS_PER_SCAN)), MAX_IPS_PER_SCAN
+    scan.job = job
+    if store.write_list(job, entries) and store.save(job):
+        job.persistent = True
+    await run_job(ctx, scan, job, entries)
+
+DIFF_MARKS = {'new': '🆕', 'gone': '💤', 'changed': '🔁', 'unchanged': '⚪'}
+DIFF_ORDER = ('new', 'gone', 'changed', 'unchanged')
+
+def player_count(result):
+    return (result or {}).get('players') or 0
+
+def diff_rows(newer, older):
+    """Every server online in either scan, as (entry, change, before, after): new, gone, changed or unchanged."""
+    rows = []
+    for key in list(newer.results) + [k for k in older.results if k not in newer.results]:
+        before, after = older.results.get(key), newer.results.get(key)
+        if before is None:
+            change = 'new'
+        elif after is None:
+            change = 'gone'
+        elif player_count(before) != player_count(after):
+            change = 'changed'
+        else:
+            change = 'unchanged'
+        rows.append((key, change, before, after))
+    return sorted(rows, key=lambda r: (DIFF_ORDER.index(r[1]), -player_count(r[3] or r[2])))
+
+def scan_label(job):
+    """'<time> (asn:AS8400, 412 online of 823,420)': which scan, for /diff."""
+    what = 'rescan' if job.source.get('kind') == 'rescan' else job.source.get('description') or 'scan'
+    stopped = ", stopped early" if job.status == 'stopped' else ""
+    return (f"{discord_time(job.finished_at or job.created_at)} ({what}, {len(job.results)} online of "
+            f"{job.total:,}{stopped})")
+
+def build_diff(newer, older, limit, owner=None):
+    """/diff's message and its diff.csv, as (text, batches of discord.File)."""
+    rows = diff_rows(newer, older)
+    counts = {change: 0 for change in DIFF_ORDER}
+    for row in rows:
+        counts[row[1]] += 1
+    title = f"📊 **Diff** · {owner}" if owner else "📊 **Diff**"
+    lines = [title, f"**Newer:** {scan_label(newer)}", f"**Older:** {scan_label(older)}",
+             " · ".join(f"{DIFF_MARKS[change]} {counts[change]} {change}" for change in DIFF_ORDER)]
+    if newer.status == 'stopped' or older.status == 'stopped':
+        which = ("Both scans were" if newer.status == older.status else
+                 "The newer scan was" if newer.status == 'stopped' else "The older scan was")
+        lines.append(f"⚠️ {which} stopped early, so the comparison is partial.")
+    if (newer.source.get('parent') != older.id
+            and newer.source.get('description') != older.source.get('description')):
+        lines.append("ℹ️ The two scans had different lists, so \"gone\" also counts servers the newer scan didn't "
+                     "check.")
+    moved = sorted((r for r in rows if r[1] != 'unchanged'),
+                   key=lambda r: abs(player_count(r[3]) - player_count(r[2])), reverse=True)[:10]
+    if moved:
+        lines.append("\n**Biggest player changes:**")
+        for key, change, before, after in moved:
+            was = '—' if before is None else player_count(before)
+            now = '—' if after is None else player_count(after)
+            delta = player_count(after) - player_count(before)
+            lines.append(f"{DIFF_MARKS[change]} **{discord.utils.escape_markdown(key)}** {was} → {now} ({delta:+d})")
+
+    header = csv_line(["ip", "change", "players_before", "players_after", "max", "version", "country"])
+    csv_rows = []
+    for key, change, before, after in rows:
+        latest = after or before
+        address = latest.get('address')
+        country = newer.locations.get(address) or older.locations.get(address)
+        csv_rows.append(csv_line([csv_value(v) for v in (
+            key, change, None if before is None else player_count(before),
+            None if after is None else player_count(after), latest.get('max'), latest.get('version'), country)]))
+    files = split_rows("diff.csv", header, csv_rows, limit)
+    batches = [[discord.File(io.BytesIO(data), filename=name) for name, data in batch]
+               for batch in batch_files(files, limit)]
+    return "\n".join(lines)[:2000], batches
+
+@bot.hybrid_command(name="diff", description="Compare your last two scans: which servers are new, gone or changed")
+async def diff(ctx):
+    await ctx.defer()
+    if store is None:
+        await ctx.send(NO_STORE_REPLY.format(what="compare"))
+        return
+    finished = store.finished_for(ctx.author.id)
+    if not finished:
+        await ctx.send("⚠️ You have no finished scans to compare yet.")
+        return
+    newer = finished[0]
+    older = next((j for j in finished[1:] if j.edition == newer.edition), None)
+    if older is None:
+        edition = EDITION_LABELS[newer.edition]
+        await ctx.send(f"⚠️ Your last scan is your only finished {edition} scan, so there's nothing to compare it "
+                       "with yet. Scan again (or use `/rescan`), then try `/diff`.")
+        return
+    text, batches = build_diff(newer, older, upload_limit(ctx), ctx.author.mention)
+    await ctx.send(text, files=batches[0])
+    for number, files in enumerate(batches[1:], 2):
+        await ctx.send(f"📎 Diff, continued ({number}/{len(batches)})", files=files)
 
 def plain_id(value):
     """A Discord ID worth saving: an int (tests pass mocks)."""
@@ -2242,7 +2595,9 @@ def forget_job(job):
 
 def has_progress(job):
     """Whether a scan got anywhere before a restart."""
-    return bool(job.results or job.blocked) or job.cursor != {'phase': 'direct', 'index': 0}
+    cursor = job.cursor
+    return (bool(job.results or job.blocked) or cursor.get('part', 0) > 0 or cursor.get('phase') != 'direct'
+            or cursor.get('index', 0) > 0)
 
 def retry_list(ips, results, blocked):
     """
@@ -2255,20 +2610,38 @@ def retry_list(ips, results, blocked):
 def resume_note(job, ips):
     """How far a resumed scan had got, for its start message."""
     found = len(job.results)
-    phase, index = job.cursor['phase'], job.cursor['index']
+    phase, index, part = job.cursor['phase'], job.cursor['index'], job.cursor.get('part', 0)
+    if phase not in ('direct', 'api'):
+        return f"Every server was checked before the restart; {found} found."
+    ips = part_entries(job, part, ips)
+    where = f"In part {part + 1} of {job.parts}: " if job.parts > 1 else ""
     if phase == 'direct':
-        return f"{index:,} of {len(ips):,} were pinged before the restart, {found} found so far."
-    if phase == 'api':
-        return (f"Direct pings were done before the restart, and {index:,} of "
-                f"{len(retry_list(ips, job.results, job.blocked)):,} API checks; {found} found so far.")
-    return f"Every server was checked before the restart; {found} found."
+        return f"{where}{index:,} of {len(ips):,} were pinged before the restart, {found} found so far."
+    return (f"{where}direct pings were done before the restart, and {index:,} of "
+            f"{len(retry_list(ips, job.results, job.blocked)):,} API checks; {found} found so far.")
+
+async def wait_for_direct_pings(edition, stop, state):
+    """
+    A campaign with api:off checks nothing while direct pings don't work (the VPN is down): it waits, checking again
+    every VPN_CHECK_DOWN seconds, instead of giving up hours of work. True once they work, False if stopped first.
+    """
+    while not await direct_pings_work(edition):
+        state['phase'] = ("Waiting for direct pings (the VPN is down)" if PINGER_URL
+                          else "Waiting for direct pings to work again")
+        try:
+            await asyncio.wait_for(stop.wait(), VPN_CHECK_DOWN)
+        except asyncio.TimeoutError:
+            continue
+        return False
+    return True
 
 async def checkpoints(job, state, sync):
     """Saves a running scan's progress every CHECKPOINT_INTERVAL seconds, when it has changed."""
     last = None
     while True:
         await asyncio.sleep(CHECKPOINT_INTERVAL)
-        key = (job.cursor['phase'], state.get('cursor'), len(job.results), state['blocked'], state.get('unchecked'))
+        key = (job.cursor.get('part'), job.cursor['phase'], state.get('cursor'), len(job.results), state['blocked'],
+               state.get('unchecked'))
         if key != last:
             sync()
             store.save(job)
@@ -2281,6 +2654,7 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
     if it already has one (register_resumable), None to claim a slot here.
     """
     edition, api_retry, total_ips = job.edition, job.api_retry, job.total
+    parts = max(1, job.parts)
     owner = ctx.author.mention  # Renders as a name without pinging (mentions are switched off)
 
     async def tell(text, channel=False):
@@ -2330,7 +2704,7 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
     # while it's down, every server is checked through the API instead.
     direct_ok = await direct_pings_work(edition)
     refused = False
-    if not api_retry and not direct_ok and not scan.stop.is_set():
+    if not api_retry and not direct_ok and not scan.stop.is_set() and parts == 1:  # A campaign waits instead (below)
         # They stopped working while this scan was queued (or the bot was down)
         await tell(no_direct_reply(), channel=bool(place))
         if not has_progress(job):
@@ -2339,15 +2713,21 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
         refused = True  # Post what it found before the restart
     no_vpn = bool(PINGER_URL) and not direct_ok
     label = "Bedrock " if edition == 'bedrock' else ""
+    kind = "campaign" if parts > 1 else "scan"
     if resumed and has_progress(job):
-        started = (f"🔄 **Scan resumed** after a restart: {owner}'s scan of {total_ips} {label}IPs{job.notes}. "
-                   f"{resume_note(job, ips)}")
+        started = (f"🔄 **{kind.capitalize()} resumed** after a restart: {owner}'s {kind} of {total_ips} "
+                   f"{label}IPs{job.notes}. {resume_note(job, ips)}")
+    elif parts > 1:
+        started = (f"🚀 **Campaign started** by {owner}: {total_ips:,} {label}IPs{job.notes}, in {parts} parts of "
+                   f"up to {job.part_size:,}, one after another...")
     else:
         started = f"🚀 **Scan started** by {owner} on {total_ips} {label}IPs{job.notes}..."
     if not api_retry:
         started += "\nℹ️ **API retry is off:** a server that doesn't answer a direct ping counts as offline."
-    if no_vpn:
+    if no_vpn and (api_retry or parts == 1):
         started += "\n⚠️ **The VPN is down:** checking every server through the API only, so this is slower."
+    elif no_vpn:
+        started += "\n⏸️ **The VPN is down:** the campaign waits for it before pinging."
     if not refused and not scan.stop.is_set():
         await tell(started, channel=bool(place))
     await update_presence()
@@ -2360,14 +2740,15 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
 
     state = {"phase": "Starting", "done": 0, "total": total_ips, "found": len(job.results),
              "blocked": len(job.blocked), "owner": owner, "unchecked": job.unchecked,
-             "blocked_entries": list(job.blocked), "cursor": job.cursor['index']}
+             "blocked_entries": list(job.blocked), "cursor": job.cursor['index'],
+             "part": job.cursor.get('part', 0) + 1, "parts": parts}
     progress = await send_channel(ctx, progress_text(state))
     job.progress_message_id = plain_id(getattr(progress, 'id', None)) if progress is not None else None
     results = job.results
     locations = {}
     networks = {}
-    retry = []
     error = False
+    vpn_was_down = no_vpn
     elapsed_before = job.elapsed
     segment = time.monotonic()  # Not time.time(): a clock adjustment mid-scan must not change the duration
     # The phase running now, for the speed line: (name, its figures from earlier runs, the index this run started
@@ -2392,8 +2773,8 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
         job.elapsed = elapsed_before + (time.monotonic() - segment)
         measure()
 
-    def enter(phase):
-        job.cursor = {'phase': phase, 'index': 0}
+    def enter(phase, part=None):
+        job.cursor = {'part': job.cursor.get('part', 0) if part is None else part, 'phase': phase, 'index': 0}
         state['cursor'] = 0
         sync()
         save_job(job)
@@ -2403,21 +2784,39 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
     saver = asyncio.create_task(checkpoints(job, state, sync)) if saving(job) else None
     try:
         async with api_session() as session:
-            # 1. Direct pings, many at once
-            if not refused and not scan.stop.is_set() and job.cursor['phase'] == 'direct':
-                if direct_ok:
-                    start = job.cursor['index']
-                    phase_run = ('direct', job.timings.get('direct'), start, state['blocked'], time.monotonic())
-                    await run_direct(ips[start:], results, state, edition, stop=scan.stop, offset=start)
-                    measure(None if scan.stop.is_set() else len(ips))  # Stopped: as far as it got
-                    phase_run = None
-                if not scan.stop.is_set():
+            # A campaign runs part by part; any other scan is one part. Each part: direct pings, then the API.
+            first_part = True
+            while not refused and not scan.stop.is_set() and job.cursor['phase'] in ('direct', 'api'):
+                part = job.cursor.get('part', 0)
+                part_ips = part_entries(job, part, ips)
+                state['part'] = part + 1
+                if parts > 1:
+                    if not first_part:
+                        direct_ok = await direct_pings_work(edition)
+                    if not api_retry and not direct_ok:
+                        # api:off checks nothing without direct pings: wait for them (the VPN reconnecting)
+                        direct_ok = await wait_for_direct_pings(edition, scan.stop, state)
+                        if not direct_ok:
+                            break  # Stopped while waiting
+                    no_vpn = bool(PINGER_URL) and not direct_ok
+                    vpn_was_down = vpn_was_down or no_vpn
+                first_part = False
+
+                # 1. Direct pings, many at once
+                if job.cursor['phase'] == 'direct':
+                    if direct_ok:
+                        start = job.cursor['index']
+                        phase_run = ('direct', job.timings.get('direct'), start, state['blocked'], time.monotonic())
+                        await run_direct(part_ips[start:], results, state, edition, stop=scan.stop, offset=start)
+                        measure(None if scan.stop.is_set() else len(part_ips))  # Stopped: as far as it got
+                        phase_run = None
+                    if scan.stop.is_set():
+                        break
                     enter('api')
 
-            # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans (Java servers it
-            # can't check go to mcsrvstat.us)
-            retry = retry_list(ips, results, state['blocked_entries'])
-            if not refused and not scan.stop.is_set() and job.cursor['phase'] == 'api':
+                # 2. mcstatus.io API for everything that didn't answer, 5 per second shared by all scans (Java servers
+                # it can't check go to mcsrvstat.us)
+                retry = retry_list(part_ips, results, state['blocked_entries'])
                 if retry and api_retry:
                     start = job.cursor['index']
                     retrying = job.timings.get('direct') is not None
@@ -2426,7 +2825,13 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
                                   stop=scan.stop, vpn_down=no_vpn, offset=start)
                     measure(None if scan.stop.is_set() else len(retry))
                     phase_run = None
-                if not scan.stop.is_set():
+                if scan.stop.is_set():
+                    break
+                if part + 1 < parts:
+                    enter('direct', part + 1)
+                    log.info("Campaign by %s: part %d of %d done, %d found so far", ctx.author, part + 1, parts,
+                             len(results))
+                else:
                     enter('geo')
 
             # 3. Countries and networks: offline databases first (instant), ip-api.com for what they don't know.
@@ -2483,9 +2888,12 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
         except discord.HTTPException:
             pass
 
-    # With api:off, the servers that didn't answer a direct ping are offline as far as this scan knows. (A stopped
-    # scan doesn't know how many never got pinged, so it says nothing.)
-    not_retried = len(retry) if not api_retry and not stopped else 0
+    # With api:off, the servers that didn't answer a direct ping are offline as far as this scan knows: every one
+    # that wasn't found or skipped. (A stopped scan doesn't know how many never got pinged, so it says nothing.)
+    not_retried = 0
+    if not api_retry and not stopped:
+        found_direct = sum(1 for r in results.values() if r.get('source') == 'direct')
+        not_retried = max(0, total_ips - len(state['blocked_entries']) - found_direct)
     job.locations = dict(locations)
     job.networks = {address: list(network) for address, network in networks.items()}
     job.stopped_by = plain_id(getattr(scan.stopped_by, 'id', None))
@@ -2494,10 +2902,11 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
         save_job(job, 'stopped')  # Ended before posting: a crash now doesn't make a stopped scan carry on
     timings = {phase: tuple(t) if t else None for phase, t in job.timings.items()}
     await send_results(ctx, list(results.values()), locations, stopped, total_ips, job.elapsed,
-                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=no_vpn,
+                       blocked=state['blocked'], edition=edition, owner=owner, vpn_down=vpn_was_down,
                        direct=timings.get('direct'), api=timings.get('api'), not_retried=not_retried,
                        stop_reason=stop_reason, error=error, networks=networks, unchecked=state.get('unchecked', 0),
-                       resumed=job.resumed)
+                       resumed=job.resumed, parts=parts, part=job.cursor.get('part', 0) + 1,
+                       source=job.source.get('description'))
     if not stopped:
         job.finished_at = jobs.now()
         save_job(job, 'done')
@@ -2576,10 +2985,13 @@ async def run_resumed(scan, job, place):
         ctx = await resume_context(job)
         if ctx is None:
             return
-        ips = store.read_list(job)
-        if not ips:
-            abandon(job, "its list of addresses is gone")
-            return
+        if job.source.get('spans') is not None:
+            ips = []  # A big target: its parts come from the spans saved in the job
+        else:
+            ips = store.read_list(job)
+            if not ips:
+                abandon(job, "its list of addresses is gone")
+                return
         job.resumed += 1
         await run_job(ctx, scan, job, ips, place=place, resumed=True)
     except Exception:

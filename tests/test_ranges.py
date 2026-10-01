@@ -97,8 +97,8 @@ class LimitTests(unittest.TestCase):
         self.assertLess(time.monotonic() - began, 0.5)
         e = caught.exception
         self.assertEqual((e.line_number, e.line, e.count), (3, '11.0.0.0/8', 16_777_214))
-        self.assertEqual(e.reply(), "❌ **Too many IPs:** line 3 (`11.0.0.0/8`) has 16,777,214 addresses; a scan takes "
-                                    f"at most {scanbot.MAX_IPS_PER_SCAN}.")
+        self.assertEqual(e.reply(), "❌ **Too many IPs:** line 3 (`11.0.0.0/8`) has 16,777,214 addresses; a range line "
+                                    f"in a list may have at most {scanbot.MAX_IPS_PER_SCAN}.")
 
     def test_the_line_that_takes_the_list_past_the_limit_is_named(self):
         with mock.patch.object(scanbot, 'MAX_IPS_PER_SCAN', 10):

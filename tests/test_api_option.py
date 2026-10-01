@@ -22,11 +22,11 @@ import bot as scanbot  # noqa: E402
 
 
 class ApiOptionCommandTests(unittest.IsolatedAsyncioTestCase):
-    def test_slash_command_offers_on_and_off_and_defaults_to_on(self):
+    def test_slash_command_offers_on_off_and_auto(self):
         params = {p.name: p for p in scanbot.bot.tree.get_command('scan').parameters}
-        self.assertEqual(list(params), ['file', 'target', 'edition', 'api'])
+        self.assertEqual(list(params), ['file', 'target', 'edition', 'api', 'confirm'])
         self.assertFalse(params['api'].required)
-        self.assertEqual([c.value for c in params['api'].choices], ['on', 'off'])
+        self.assertEqual([c.value for c in params['api'].choices], ['on', 'off', 'auto'])
         self.assertIn('mcstatus.io', params['api'].description)
 
     async def parse(self, content):
@@ -43,13 +43,14 @@ class ApiOptionCommandTests(unittest.IsolatedAsyncioTestCase):
             await ctx.command._parse_arguments(ctx)
         except commands.BadLiteralArgument as e:
             return 'bad', e.param.name
-        return ctx.args[3:]  # after (self-less) ctx, file and target
+        return ctx.args[3:]  # after (self-less) ctx, file and target: edition, api, confirm
 
     async def test_prefix_command_takes_the_api_option_after_the_edition(self):
-        self.assertEqual(await self.parse('!scan bedrock off'), ['bedrock', 'off'])
-        self.assertEqual(await self.parse('!scan java on'), ['java', 'on'])
-        self.assertEqual(await self.parse('!scan java'), ['java', 'on'])
-        self.assertEqual(await self.parse('!scan'), ['java', 'on'])
+        self.assertEqual(await self.parse('!scan bedrock off'), ['bedrock', 'off', None])
+        self.assertEqual(await self.parse('!scan java on'), ['java', 'on', None])
+        self.assertEqual(await self.parse('!scan java'), ['java', 'auto', None])
+        self.assertEqual(await self.parse('!scan'), ['java', 'auto', None])
+        self.assertEqual(await self.parse('!scan java auto yes'), ['java', 'auto', 'yes'])
 
     async def test_a_bad_value_names_the_option_that_was_wrong(self):
         self.assertEqual(await self.parse('!scan java maybe'), ('bad', 'api'))
