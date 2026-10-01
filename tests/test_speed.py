@@ -107,7 +107,7 @@ class ScanSpeedTests(unittest.IsolatedAsyncioTestCase):
             self.clock.advance(self.api_seconds)
             results.update({ip: online(ip) for ip in ips})
 
-        async def fake_locations(session, ips, stop=None):
+        async def fake_locations(session, ips, stop=None, **kwargs):
             self.clock.advance(self.geo_seconds)
             return {}
 
