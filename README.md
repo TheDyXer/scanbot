@@ -20,7 +20,7 @@ If it stops with `Your user can't talk to Docker` (Docker says "permission denie
 curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | sudo bash
 ```
 
-With `sudo`, the `scanbot` folder belongs to root and the bot runs as root, so later `docker compose` commands in that folder need `sudo` too (Docker needs root or the `docker` group, the same reason the first command failed). To avoid that, run `sudo usermod -aG docker $USER` once, log out and back in, and use the first command instead.
+With `sudo`, the files still belong to you and the bot runs as your user, not as root. Docker itself still needs root or the `docker` group, the same reason the first command failed, so later `docker compose` commands in that folder need `sudo` too; the installer prints them that way. To avoid that, run `sudo usermod -aG docker $USER` once, log out and back in, and use the first command instead.
 
 Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windows and macOS) or [without Docker](#without-docker).
 
@@ -128,7 +128,30 @@ The installer:
 2. Asks for your bot token (hidden while you type) and saves it to `data/token.txt`, readable only by you.
 3. Starts the bot, waits until it has logged in to Discord, and tells you if the token was rejected.
 
-Running it again is safe: it keeps your files and pulls the latest version. It also brings `docker-compose.yml` up to date, unless you changed it: the old copy is kept as `docker-compose.yml.bak`, and a file you edited is left alone (the installer tells you a newer one exists). Deleting the `watchtower:` block, as described in [Automatic updates](#automatic-updates), doesn't count as a change: the updated file leaves it out too. To skip the question, pass the token in: `curl -fsSL … | DISCORD_TOKEN=your-token bash`. With `sudo`, just answer the prompt: a token written on `sudo`'s command line would show up in `ps` and in sudo's log. To use a different folder name, set `SCANBOT_DIR` (with sudo: `… | sudo SCANBOT_DIR=name bash`).
+Running it again is safe: it keeps your files and pulls the latest version. It also brings `docker-compose.yml` up to date, unless you changed it: the old copy is kept as `docker-compose.yml.bak`, and a file you edited is left alone (the installer tells you a newer one exists). Deleting the `watchtower:` block, as described in [Automatic updates](#automatic-updates), doesn't count as a change: the updated file leaves it out too.
+
+**A new token:** run it again with `--token`. It asks for the new one (hidden; Enter keeps the current one), saves it and restarts the bot:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | bash -s -- --token
+```
+
+**Installed with `sudo` by an older installer?** Then the bot runs as root. Run the installer again with `sudo`: it moves the bot to your user and gives you the files.
+
+**Answers in advance:** these variables answer the installer's questions, for example `curl -fsSL … | SCANBOT_VPN=warp bash`. With `sudo`, put them after it: `… | sudo SCANBOT_VPN=warp bash`.
+
+| Variable | What it does |
+| --- | --- |
+| `DISCORD_TOKEN` | The bot token, instead of being asked. It replaces a saved one. With `sudo`, answer the prompt instead: a token on `sudo`'s command line shows up in `ps` and in sudo's log |
+| `SCANBOT_DIR` | The install folder (default `scanbot`) |
+| `SCANBOT_REF` | The branch or tag to download the compose files from (default `main`) |
+| `SCANBOT_IMAGE` | The image to run instead of `ghcr.io/thedyxer/scanbot:latest` |
+| `SCANBOT_VPN` | `none`, `mullvad`, `protonvpn` or `warp`: the VPN, without being asked |
+| `SCANBOT_VPN_FREE` | `yes` or `no`: whether your Proton account is on the free plan |
+| `SCANBOT_VPN_CITY` | The VPN city by name, like `Belgrade` or `Paris, France`; skips the ping test |
+| `WIREGUARD_PRIVATE_KEY`, `WIREGUARD_ADDRESSES` | The VPN key and address, instead of being asked |
+
+`GLUETUN_IMAGE` in `.env` picks another gluetun image (default `qmcgaw/gluetun:v3`).
 
 ### Docker Compose by hand
 
@@ -527,6 +550,10 @@ If you installed with `sudo`, run it with `sudo` too: `curl -fsSL … | sudo bas
 
 Running `--vpn` again with the same provider tests the cities again; press Enter to keep your key.
 
+- **Your own lines in `vpn.env` are kept**, like `WIREGUARD_ENDPOINT_PORT=53`, when you run `--vpn` again with the same provider. Another provider starts a new `vpn.env`. WARP keeps its keys even when you changed the port or the MTU.
+- **Choosing 0 (no VPN)** asks whether to delete the VPN files too: `vpn.env` with your key, `vpn/` and `docker-compose.vpn.yml`. Enter keeps them for next time.
+- **`/dev/net/tun`:** the VPN needs it, and some VPS and LXC containers don't have it. The installer checks before it asks for keys; see [Troubleshooting](#troubleshooting).
+
 ### How the fastest location is picked
 
 The installer pings two servers in every city your provider has, from your machine and outside the VPN. That takes a few seconds. Then it lists the five fastest:
@@ -540,6 +567,14 @@ Choose [1-5] (Enter = 1):
 ```
 
 With Proton and WARP, the VPN then connects to any server in that city, and moves to another one there if a server fails. With Mullvad, the bot picks the server itself; see below.
+
+**If pings don't get through** (some networks block ping), the installer lists the provider's cities and asks for one by name. To skip the ping test, or to install without a terminal, name the city yourself:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | SCANBOT_VPN_CITY=Belgrade bash -s -- --vpn
+```
+
+When a name is in two countries, add the country: `SCANBOT_VPN_CITY="Paris, France"`. With Mullvad, the bot then switches servers only within that city, because no other city was tested.
 
 ### Mullvad: switching servers when one is down
 
@@ -680,13 +715,15 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `/scan` doesn't appear | The commands haven't synced yet, or Discord has an old list | Check the log for `Synced 5 slash command(s)`, wait a minute, then restart Discord (Ctrl+R) |
 | `PrivilegedIntentsRequired` at startup | `SLASH_ONLY` is off but the Message Content Intent isn't enabled | Enable the intent, or set `SLASH_ONLY=1` |
 | Installer says `Your user can't talk to Docker` (or Docker says "permission denied") | Your account isn't in the `docker` group | Run the installer with `sudo` (the `sudo bash` command in [Quick start](#quick-start)), or run `sudo usermod -aG docker $USER`, log out and back in, and run it without `sudo` |
+| Installer says `This machine has no /dev/net/tun` | The TUN module isn't loaded, or your VPS or LXC container doesn't allow it | `sudo modprobe tun` (to keep it after a reboot: `echo tun \| sudo tee /etc/modules-load.d/tun.conf`). On a VPS, ask the provider to turn on TUN/TAP. Or run the installer with `--vpn` and choose 0 |
+| Installer says `Couldn't test the ... locations` | Your network blocks ping (ICMP) | Choose the city by name when asked, or set `SCANBOT_VPN_CITY`; see [How the fastest location is picked](#how-the-fastest-location-is-picked) |
 | Installer says `docker-compose.yml was changed by hand, so it's kept as it is` | You edited `docker-compose.yml`, and a newer one has been published since | Keep yours, or take the new one: `mv docker-compose.yml docker-compose.yml.bak`, run the installer again, then copy your changes over from the `.bak` |
 | Installer says `The scanbot image isn't public yet` | The image on GitHub's registry is still private | Repo owner: open the package's settings and set visibility to **Public** |
 | `Error: can't read /data/token.txt: Permission denied` | The container runs as a different user than the owner of `token.txt` | Put `SCANBOT_UID` and `SCANBOT_GID` in `.env` (from `id -u` and `id -g`), then `docker compose up -d` |
 | `Error: no Discord token` | `data/token.txt` is missing or empty, and `DISCORD_TOKEN` isn't set | Put the token in `data/token.txt`, then `docker compose up -d` |
 | Log says `Mullvad server switching is off: there's no GLUETUN_API_KEY` | The install is older than server switching | Run the installer again |
 | Log says `gluetun refused the API key` | `GLUETUN_API_KEY` in `.env` and `vpn/auth/config.toml` don't match, or gluetun hasn't restarted since the file changed | Run the installer again, or `docker compose restart gluetun` |
-| Installer says `The VPN didn't connect` | Wrong key, or your network blocks the VPN's UDP port | Check the key in `vpn.env`, or run the installer again with `--vpn`. For a blocked port, add `WIREGUARD_ENDPOINT_PORT=53` (Mullvad also takes `123`) to `vpn.env`, then `docker compose up -d` |
+| Installer says `The VPN didn't connect` | Wrong key, or your network blocks the VPN's UDP port | Check the key in `vpn.env`, or run the installer again with `--vpn`. For a blocked port, add `WIREGUARD_ENDPOINT_PORT=53` (Mullvad also takes `123`) to `vpn.env`, then `docker compose up -d`. Running `--vpn` again keeps that line |
 | `⚠️ The VPN is down: checking every server through the API only` | The VPN dropped or hasn't connected yet. Pings never use your own connection, so the scan uses the API | `docker compose logs gluetun`; it reconnects by itself, usually within seconds. With Mullvad server switching, the bot reconnects it instead, within about a minute, and then tries other servers. The bot checks again every minute |
 | Bot's status says `· VPN down` | Same as above | Same as above |
 | WARP connects but every scan says the VPN is down | The packet size (MTU) is too big for your network | Lower `WIREGUARD_MTU=1280` to `1200` in `vpn.env`, then `docker compose up -d` |
@@ -695,7 +732,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Direct pings to ... all failed` at startup | Your network blocks outbound port 25565 | Nothing to fix: scans use the API instead (5 servers/second), and the bot tries direct pings again every 5 minutes. Run the bot on another network for full speed |
 | `DNS lookups failed, so the bot can't reach Discord` | Neither TLS (853) nor HTTPS (443) reaches Quad9: the machine or its containers have no internet | Fix the connection (the message shows both reasons), then `docker compose up -d`; see [DNS](#dns-quad9-over-tls) |
 | `Quad9 over TLS (port 853) ...; using Quad9 over HTTPS` in the log | Port 853 is blocked on your network | Nothing to fix: the bot switched to HTTPS by itself. Set `DNS_TRANSPORT=doh` to skip the failed try on every start |
-| `Improper token has been passed` | Wrong or reset token | Copy a fresh token from the Developer Portal |
+| `Improper token has been passed`, or the installer says `Discord rejected the token` | Wrong or reset token | Copy a fresh token from the Developer Portal, then run the installer again with `--token` (see [One-line installer](#one-line-installer)) |
 | `⏳ You already have a scan running or queued` | Everyone gets one scan at a time | Wait for it to finish, or `/stop` it first |
 | `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
 | `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |

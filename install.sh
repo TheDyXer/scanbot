@@ -6,18 +6,22 @@
 # Creates ./scanbot with docker-compose.yml and data/token.txt, then starts the bot.
 # Running it again is safe: it keeps your files and pulls the latest image. It also updates
 # docker-compose.yml, unless you changed it (the old one is kept as docker-compose.yml.bak).
+# Run with sudo ("| sudo bash") when your user can't use Docker: the files still belong to you, and
+# the bot runs as you, not as root.
 #
 # Options (after "bash -s --" when piping from curl):
 #   --vpn           set up, change or remove the VPN (asked automatically on the first install)
+#   --token         replace the saved Discord token (asked for, hidden)
 #
 # Optional environment variables:
-#   DISCORD_TOKEN   use this token instead of asking for it
+#   DISCORD_TOKEN   use this token instead of asking for it; it replaces a saved one
 #   SCANBOT_DIR     install folder (default: scanbot)
 #   SCANBOT_REF     git branch or tag to download the compose files from (default: main)
 #   SCANBOT_IMAGE   image to run instead of ghcr.io/thedyxer/scanbot:latest
 #   SCANBOT_VPN     none, mullvad, protonvpn or warp: choose the VPN without being asked
 #   WIREGUARD_PRIVATE_KEY, WIREGUARD_ADDRESSES   VPN keys, instead of being asked
 #   SCANBOT_VPN_FREE   yes or no: whether a Proton account is on the free plan
+#   SCANBOT_VPN_CITY   the VPN city, like Belgrade (or "Paris, France"): skips the ping test
 set -euo pipefail
 
 REPO="TheDyXer/scanbot"
@@ -151,16 +155,123 @@ make_state_dir() {
   fi
 }
 
+# --- sudo ---
+# Under sudo, the files belong to and the bot runs as the user who ran sudo (SUDO_UID), not root. Plain root
+# stays root. DC is how the commands this installer prints start: with sudo when it was run with sudo.
+detect_sudo() {
+  RUN_UID="$(id -u)"; RUN_GID="$(id -g)"; SUDO_PREFIX=""
+  if [ "${RUN_UID}" = 0 ] && [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID}" != 0 ]; then
+    RUN_UID="${SUDO_UID}"; RUN_GID="${SUDO_GID:-${SUDO_UID}}"; SUDO_PREFIX="sudo "
+  fi
+  DC="${SUDO_PREFIX}docker compose"
+}
+
+# Under sudo, what the installer made is given to the user who ran it, even when the run stops early (it runs
+# on exit). A list, never "chown -R .": SCANBOT_DIR=. installs into a folder with other things in it. gluetun
+# writes root-owned files into vpn/, so a chown that fails is skipped.
+own_files() {
+  [ -n "${SUDO_PREFIX:-}" ] || return 0
+  local f
+  if [ -n "${CREATED_DIR:-}" ]; then chown "${RUN_UID}:${RUN_GID}" . 2>/dev/null || true; fi
+  for f in .env docker-compose.yml docker-compose.yml.bak docker-compose.vpn.yml docker-compose.vpn.yml.bak vpn.env; do
+    if [ -e "${f}" ]; then chown "${RUN_UID}:${RUN_GID}" "${f}" 2>/dev/null || true; fi
+  done
+  for f in data vpn state; do
+    if [ -e "${f}" ]; then chown -R "${RUN_UID}:${RUN_GID}" "${f}" 2>/dev/null || true; fi
+  done
+}
+
+# Installs made with sudo by older installers run the bot as root: move them to the user who ran sudo
+migrate_from_root() {
+  if [ -n "${SUDO_PREFIX:-}" ] && [ "$(env_get SCANBOT_UID)" = 0 ]; then
+    env_set SCANBOT_UID "${RUN_UID}"; env_set SCANBOT_GID "${RUN_GID}"
+    ok "The bot now runs as ${SUDO_USER:-user ${RUN_UID}} instead of root"
+  fi
+}
+
+# --- vpn.env ---
+# Written into WARP's vpn.env, so a later run knows the keys are the installer's (a vpn.env written by hand can
+# use VPN_SERVICE_PROVIDER=custom too)
+WARP_MARKER="# Cloudflare WARP keys made by install.sh"
+
+vpn_env_kind() {  # The VPN in vpn.env: its VPN_SERVICE_PROVIDER, or warp for WARP keys made by this installer
+  [ -f vpn.env ] || return 0
+  if grep -qxF "${WARP_MARKER}" vpn.env \
+     || { grep -q '^VPN_SERVICE_PROVIDER=custom$' vpn.env && grep -q '^WIREGUARD_ENDPOINT_PORT=2408$' vpn.env; }; then
+    echo warp  # The second test: WARP keys from before the marker existed
+  else
+    grep -m1 '^VPN_SERVICE_PROVIDER=' vpn.env | cut -d= -f2- || true
+  fi
+}
+
+# write_vpn_env <kind> < new settings: writes vpn.env (readable only by you). For the same VPN as before, the
+# lines you added yourself (WIREGUARD_ENDPOINT_PORT=53, for example) are kept: every old KEY=value whose key
+# the new settings don't have. HEALTH_RESTART_VPN isn't one: the installer sets it itself.
+write_vpn_env() {
+  local tmp kept="" old_kind line key
+  tmp="$(mktemp)"
+  cat > "${tmp}"
+  old_kind="$(vpn_env_kind)"
+  if [ -n "${old_kind}" ] && [ "${old_kind}" = "$1" ]; then
+    while IFS= read -r line || [ -n "${line}" ]; do
+      [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] || continue
+      key="${BASH_REMATCH[1]}"
+      if [ "${key}" = HEALTH_RESTART_VPN ] || grep -q "^${key}=" "${tmp}"; then continue; fi
+      if [ -z "${kept}" ]; then echo "# Kept from your previous vpn.env" >> "${tmp}"; fi
+      printf '%s\n' "${line}" >> "${tmp}"
+      kept="${kept:+${kept}, }${key}"
+    done < vpn.env
+  elif [ -n "${old_kind}" ]; then
+    info "vpn.env was for ${old_kind}, so it now has only the new settings"
+  fi
+  rm -f vpn.env
+  (umask 077; cat "${tmp}" > vpn.env)
+  rm -f "${tmp}"
+  if [ -n "${kept}" ]; then ok "Kept your own vpn.env settings: ${kept}"; fi
+}
+
+# find_city "<country TAB city lines>" "<City or City, Country>": sets PICK_COUNTRY and PICK_CITY, ignoring case.
+# Returns 1 when no city matches, and 2 when the name is in more than one country (FOUND lists them).
+find_city() {
+  local matches count
+  matches="$(printf '%s\n' "$1" | awk -F'\t' -v want="$2" '
+    function norm(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return tolower(s) }
+    BEGIN { n = index(want, ","); if (n) { city = norm(substr(want, 1, n - 1)); country = norm(substr(want, n + 1)) }
+            else city = norm(want) }
+    NF >= 2 && city != "" && norm($2) == city && (country == "" || norm($1) == country)')"
+  count="$(printf '%s' "${matches}" | grep -c . || true)"
+  FOUND="$(printf '%s\n' "${matches}" | awk -F'\t' 'NF >= 2 { printf "%s%s, %s", (NR > 1 ? "; " : ""), $2, $1 }')"
+  if [ "${count}" = 1 ]; then
+    PICK_COUNTRY="$(printf '%s' "${matches}" | cut -f1)"; PICK_CITY="$(printf '%s' "${matches}" | cut -f2)"
+    return 0
+  fi
+  if [ "${count}" = 0 ]; then return 1; fi
+  return 2
+}
+
+# gluetun needs /dev/net/tun. Some VPS and LXC containers don't have it: say so before asking for keys.
+check_tun() {
+  local out
+  out="$(docker run --rm --device /dev/net/tun:/dev/net/tun --entrypoint true "${IMAGE}" 2>&1)" && return 0
+  if printf '%s' "${out}" | grep -q '/dev/net/tun'; then
+    die "This machine has no /dev/net/tun, which the VPN needs. Try: sudo modprobe tun (to keep it after a reboot: echo tun | sudo tee /etc/modules-load.d/tun.conf). On a VPS or in an LXC container, ask the provider to turn on TUN/TAP. Or run this again with --vpn and choose 0 (no VPN)."
+  fi
+  die "Couldn't check for /dev/net/tun, which the VPN needs: ${out}"
+}
+
 # tests/test_installer.py sources this file for the functions above; nothing below runs then
 if (return 0 2>/dev/null); then return 0; fi
 
 VPN_SETUP=""
+NEW_TOKEN=""
 for arg in "$@"; do
   case "${arg}" in
     --vpn) VPN_SETUP="yes" ;;
+    --token) NEW_TOKEN="yes" ;;
     -h|--help)
-      echo "Usage: curl -fsSL ${RAW}/install.sh | bash [-s -- --vpn]"
-      echo "  --vpn   set up, change or remove the VPN (asked automatically on the first install)"
+      echo "Usage: curl -fsSL ${RAW}/install.sh | bash [-s -- --vpn --token]"
+      echo "  --vpn     set up, change or remove the VPN (asked automatically on the first install)"
+      echo "  --token   replace the saved Discord token"
       exit 0 ;;
     *) die "Unknown option: ${arg}" ;;
   esac
@@ -179,8 +290,12 @@ if ! docker_error=$(docker info 2>&1 >/dev/null); then
 fi
 
 # --- Folder and files ---
+detect_sudo
+CREATED_DIR=""
+if [ ! -d "${DIR}" ]; then CREATED_DIR="yes"; fi
 mkdir -p "${DIR}/data"
 cd "${DIR}"
+trap own_files EXIT
 info "Installing into $(pwd)"
 
 if [ -f .env ]; then
@@ -188,45 +303,72 @@ if [ -f .env ]; then
 else
   {
     echo "# Scanbot settings (read by docker compose)"
-    echo "SCANBOT_UID=$(id -u)"
-    echo "SCANBOT_GID=$(id -g)"
+    echo "SCANBOT_UID=${RUN_UID}"
+    echo "SCANBOT_GID=${RUN_GID}"
     echo "# Time zone for the bot's log and the daily 4 AM update check, e.g. Europe/Budapest"
     echo "TZ=UTC"
     if [ -n "${SCANBOT_IMAGE:-}" ]; then echo "SCANBOT_IMAGE=${SCANBOT_IMAGE}"; fi
   } > .env
   ok "Created .env"
   VPN_SETUP="${VPN_SETUP:-yes}"  # First install: ask about the VPN too
+  if [ "${RUN_UID}" = 0 ]; then
+    warn "You're installing as root, so the bot runs as root. To run it as your own user, run the installer as that user (with sudo if it can't use Docker)."
+  fi
 fi
+migrate_from_root  # Before make_state_dir, which reads SCANBOT_UID
 fetch_compose  # After .env, which keeps its digest
 make_state_dir
 IMAGE="$(env_get SCANBOT_IMAGE)"; IMAGE="${IMAGE:-ghcr.io/thedyxer/scanbot:latest}"
 GLUETUN_IMAGE="$(env_get GLUETUN_IMAGE)"; GLUETUN_IMAGE="${GLUETUN_IMAGE:-qmcgaw/gluetun:v3}"
 
 # --- Token ---
+# A saved token is kept unless DISCORD_TOKEN or --token gives another one; the bot reads it when it starts,
+# so a changed token restarts it below (TOKEN_CHANGED)
 TOKEN_FILE="data/token.txt"
-if [ -s "${TOKEN_FILE}" ] && [ -n "$(tr -d '[:space:]' < "${TOKEN_FILE}")" ]; then
+TOKEN_CHANGED=""
+saved_token=""
+if [ -s "${TOKEN_FILE}" ]; then saved_token="$(tr -d '[:space:]' < "${TOKEN_FILE}")"; fi
+token="$(printf '%s' "${DISCORD_TOKEN:-}" | tr -d '[:space:]')"
+if [ -z "${token}" ] && [ -z "${saved_token}" ]; then
+  token="$(ask_secret 'Paste your Discord bot token (hidden, Enter to skip): ' | tr -d '[:space:]')"
+elif [ -z "${token}" ] && [ -n "${NEW_TOKEN}" ]; then
+  token="$(ask_secret 'Paste the new Discord bot token (hidden, Enter = keep the current one): ' | tr -d '[:space:]')"
+fi
+if [ -n "${token}" ] && [ "${token}" != "${saved_token}" ]; then
+  rm -f "${TOKEN_FILE}"
+  (umask 077; printf '%s\n' "${token}" > "${TOKEN_FILE}")
+  if [ -n "${saved_token}" ]; then
+    TOKEN_CHANGED="yes"
+    ok "Replaced the token in ${TOKEN_FILE}"
+  else
+    ok "Saved the token to ${TOKEN_FILE}"
+  fi
+elif [ -n "${saved_token}" ]; then
   ok "Keeping your existing ${TOKEN_FILE}"
 else
-  token="${DISCORD_TOKEN:-}"
-  if [ -z "${token}" ]; then
-    token="$(ask_secret 'Paste your Discord bot token (hidden, Enter to skip): ')"
-  fi
-  token="$(printf '%s' "${token}" | tr -d '[:space:]')"
-  if [ -z "${token}" ]; then
-    warn "No token yet. Put it in $(pwd)/${TOKEN_FILE}, then start the bot with:"
-    echo "    cd $(pwd) && docker compose up -d"
-    exit 0
-  fi
-  (umask 077; printf '%s\n' "${token}" > "${TOKEN_FILE}")
-  ok "Saved the token to ${TOKEN_FILE}"
+  warn "No token yet. Put it in $(pwd)/${TOKEN_FILE}, then start the bot with:"
+  echo "    cd $(pwd) && ${DC} up -d"
+  exit 0
 fi
 
 # --- VPN ---
+DELETE_VPN_FILES=""
 disable_vpn() {
   # Drop the override from .env first, so "up --remove-orphans" below removes gluetun and the pinger
   env_unset COMPOSE_FILE; env_unset VPN_PROVIDER; env_unset VPN_LOCATION
   clear_mullvad_switch
   ok "No VPN: the bot uses this machine's connection"
+  # The files go after "up" below: gluetun has vpn/ mounted until then
+  if [ -e vpn.env ] || [ -e vpn ] || [ -e docker-compose.vpn.yml ] || [ -e docker-compose.vpn.yml.bak ]; then
+    if has_tty; then
+      case "$(ask 'Also delete the VPN files (vpn.env with your key, vpn/, docker-compose.vpn.yml)? [y/N]: ')" in
+        [yY]*) DELETE_VPN_FILES="yes" ;;
+      esac
+    fi
+    if [ -z "${DELETE_VPN_FILES}" ]; then
+      ok "Kept the VPN files (vpn.env, vpn/, docker-compose.vpn.yml), so --vpn can use them again"
+    fi
+  fi
 }
 
 # docker-compose.vpn.yml belongs to the installer, so it's replaced on every run: older versions sent
@@ -251,22 +393,68 @@ enable_vpn() {  # enable_vpn "<provider label>" "<location label>"
 
 valid_key() { [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 
-rank_cities() {  # rank_cities <provider> <on|off free only> <label>; sets RANKED: the 10 fastest cities, tab-separated rows
-  info "Finding the fastest $3 locations from here..."
+server_list() {  # server_list <provider>: gluetun writes its own server list into vpn/, so city names match it
   mkdir -p vpn
-  # gluetun writes its own server list into vpn/, so the city names match what it expects
   docker run --rm -v "$(pwd)/vpn:/gluetun" "${GLUETUN_IMAGE}" format-servers "-$1" >/dev/null 2>&1 \
     || warn "Couldn't read gluetun's server list; using the online copy"
   docker pull -q "${IMAGE}" >/dev/null 2>&1 || true
+}
+
+# rank_cities <provider> <on|off free only> <label>: sets RANKED, the 10 fastest cities as tab-separated rows.
+# Fails, with RANKED empty, when the ping test doesn't work (a network that blocks ping, for example).
+rank_cities() {
+  info "Finding the fastest $3 locations from here..."
+  server_list "$1"
   local args=(--provider "$1" --top 10)
   if [ "$2" = on ]; then args+=(--free); fi
-  RANKED="$(docker run --rm -v "$(pwd)/vpn:/gluetun:ro" "${IMAGE}" python /app/vpn_select.py "${args[@]}")" \
-    || die "Couldn't test the $3 locations (see above)."
+  RANKED="$(docker run --rm -v "$(pwd)/vpn:/gluetun:ro" "${IMAGE}" python /app/vpn_select.py "${args[@]}")" || {
+    RANKED=""; warn "Couldn't test the $3 locations (see above)."; return 1; }
+}
+
+# city_by_name <provider> <on|off free only> <label>: the city named in SCANBOT_VPN_CITY, or asked for by name.
+# Sets PICK_COUNTRY and PICK_CITY. For when the ping test is skipped or doesn't work.
+city_by_name() {
+  local cities answer rc
+  local args=(--provider "$1" --cities)
+  if [ "$2" = on ]; then args+=(--free); fi
+  cities="$(docker run --rm -v "$(pwd)/vpn:/gluetun:ro" "${IMAGE}" python /app/vpn_select.py "${args[@]}" 2>/dev/null)" \
+    || cities=""
+  [ -n "${cities}" ] || die "Couldn't get the list of $3 cities from ${IMAGE}. Update it (docker pull ${IMAGE}) and run again with --vpn."
+  if [ -n "${SCANBOT_VPN_CITY:-}" ]; then
+    rc=0; find_city "${cities}" "${SCANBOT_VPN_CITY}" || rc=$?
+    case "${rc}" in
+      0) ok "Using ${PICK_CITY}, ${PICK_COUNTRY}"; return 0 ;;
+      2) die "SCANBOT_VPN_CITY=${SCANBOT_VPN_CITY} is in more than one country (${FOUND}). Add the country, like SCANBOT_VPN_CITY=\"City, Country\"." ;;
+      *) die "SCANBOT_VPN_CITY=${SCANBOT_VPN_CITY} isn't a $3 city. The cities: $(printf '%s\n' "${cities}" | cut -f2 | sort -u | paste -sd, - | sed 's/,/, /g')" ;;
+    esac
+  fi
+  has_tty || die "No $3 city chosen, and there's no terminal to ask. Set SCANBOT_VPN_CITY (like SCANBOT_VPN_CITY=Belgrade) and run again with --vpn, or choose 0 (no VPN)."
+  echo "$3 cities: $(printf '%s\n' "${cities}" | cut -f2 | sort -u | paste -sd, - | sed 's/,/, /g')"
+  for _ in 1 2 3; do
+    answer="$(ask 'City (like Belgrade; add the country when a name is in two, like "Paris, France"): ')"
+    rc=0; find_city "${cities}" "${answer}" || rc=$?
+    case "${rc}" in
+      0) ok "Using ${PICK_CITY}, ${PICK_COUNTRY}"; return 0 ;;
+      2) warn "There's a ${answer} in more than one country (${FOUND}). Add the country." ;;
+      *) warn "There's no $3 city called '${answer}'." ;;
+    esac
+  done
+  die "No $3 city chosen. Run again with --vpn."
 }
 
 pick_city() {  # pick_city <provider> <on|off free only> <label>; sets PICK_COUNTRY, PICK_CITY and RANKED
   local rows choice line count
-  rank_cities "$1" "$2" "$3"
+  RANKED=""
+  if [ -n "${SCANBOT_VPN_CITY:-}" ]; then
+    server_list "$1"  # A named city: no ping test
+    city_by_name "$1" "$2" "$3"
+    return 0
+  fi
+  if ! rank_cities "$1" "$2" "$3"; then
+    warn "Choose the city by name instead."
+    city_by_name "$1" "$2" "$3"
+    return 0
+  fi
   rows="$(printf '%s\n' "${RANKED}" | head -n 5)"
   count="$(printf '%s\n' "${rows}" | wc -l | tr -d ' ')"
   echo "Fastest $3 locations from here:"
@@ -302,7 +490,11 @@ set_fallback_cities() {  # set_fallback_cities <chosen city>; uses RANKED
   local cities
   cities="$( { printf '%s\n' "$1"; printf '%s\n' "${RANKED}" | cut -f3; } | awk 'NF && !seen[$0]++' | head -n 10 | paste -sd, -)"
   env_set VPN_FALLBACK_CITIES "\"${cities}\""
-  ok "If a Mullvad server goes down, the bot switches to another one in: ${cities//,/, }"
+  if [ -z "${RANKED}" ]; then
+    ok "If a Mullvad server goes down, the bot switches to another one in ${cities}. Without the ping test it stays in that city."
+  else
+    ok "If a Mullvad server goes down, the bot switches to another one in: ${cities//,/, }"
+  fi
 }
 
 setup_mullvad_switch() {
@@ -340,6 +532,7 @@ clear_mullvad_switch() {
 setup_provider() {  # setup_provider mullvad|protonvpn
   local provider="$1" label key address="" free="off"
   if [ "${provider}" = mullvad ]; then label="Mullvad"; else label="Proton VPN"; fi
+  check_tun
   if [ "${provider}" = protonvpn ]; then
     warn "Proton's terms forbid 'attempting to access, probe, or connect to computing devices without proper"
     warn "authorization'. Big scans of servers you don't run may count; Mullvad's terms have no such rule."
@@ -370,7 +563,7 @@ setup_provider() {  # setup_provider mullvad|protonvpn
     [[ "${address}" =~ ^[0-9.]+/[0-9]+$ ]] || die "That doesn't look like an IPv4 address like 10.64.12.34/32. Run again with --vpn."
   fi
   pick_city "${provider}" "${free}" "${label}"
-  (umask 077; {
+  write_vpn_env "${provider}" < <(
     echo "VPN_SERVICE_PROVIDER=${provider}"
     echo "VPN_TYPE=wireguard"
     echo "WIREGUARD_PRIVATE_KEY=${key}"
@@ -380,7 +573,7 @@ setup_provider() {  # setup_provider mullvad|protonvpn
     if [ "${provider}" = protonvpn ]; then echo "FREE_ONLY=${free}"; fi
     echo "# Refresh gluetun's server list every 20 days"
     echo "UPDATER_PERIOD=480h"
-  } > vpn.env)
+  )
   enable_vpn "${label}" "${PICK_CITY}, ${PICK_COUNTRY}"
   if [ "${provider}" = mullvad ]; then
     set_fallback_cities "${PICK_CITY}"
@@ -391,8 +584,15 @@ setup_provider() {  # setup_provider mullvad|protonvpn
 }
 
 setup_warp() {
-  local arch sha profile endpoint host port endpoint_ip address
-  if grep -q "^WIREGUARD_ENDPOINT_PORT=2408$" vpn.env 2>/dev/null; then
+  local arch sha profile endpoint host port endpoint_ip address tmp
+  check_tun
+  # The keys are kept even when you changed the port or the MTU in vpn.env
+  if [ "$(vpn_env_kind)" = warp ] && grep -q '^WIREGUARD_PRIVATE_KEY=.' vpn.env; then
+    if ! grep -qxF "${WARP_MARKER}" vpn.env; then  # Made before the marker existed: add it
+      tmp="$(mktemp)"
+      { echo "${WARP_MARKER}"; cat vpn.env; } > "${tmp}"
+      cat "${tmp}" > vpn.env; rm -f "${tmp}"  # cat keeps vpn.env's permissions (600)
+    fi
     ok "Keeping your existing Cloudflare WARP keys"
     enable_vpn "Cloudflare WARP" "nearest (automatic)"
     clear_mullvad_switch
@@ -418,7 +618,8 @@ setup_warp() {
   # gluetun needs the endpoint as an IP address
   endpoint_ip="$(docker run --rm alpine:3 getent hosts "${host}" 2>/dev/null | awk '{print $1}' | grep -m1 -F . || true)"
   address="$(field Address | tr ',' '\n' | tr -d ' ' | grep -m1 -F . || true)"
-  (umask 077; {
+  write_vpn_env warp < <(
+    echo "${WARP_MARKER}"
     echo "VPN_SERVICE_PROVIDER=custom"
     echo "VPN_TYPE=wireguard"
     echo "WIREGUARD_ENDPOINT_IP=${endpoint_ip:-${WARP_ENDPOINT_FALLBACK}}"
@@ -427,7 +628,7 @@ setup_warp() {
     echo "WIREGUARD_PRIVATE_KEY=$(field PrivateKey)"
     echo "WIREGUARD_ADDRESSES=${address}"
     echo "WIREGUARD_MTU=1280"
-  } > vpn.env)
+  )
   rm -rf vpn/warp  # The account file isn't needed once the keys are in vpn.env
   ok "Cloudflare WARP keys saved to vpn.env"
   enable_vpn "Cloudflare WARP" "nearest (automatic)"
@@ -460,11 +661,12 @@ EOF
   esac
 elif vpn_enabled; then
   fetch_vpn_compose
+  check_tun
   ok "Keeping your VPN: $(env_get VPN_PROVIDER | tr -d '"'), $(env_get VPN_LOCATION | tr -d '"')"
   # Installs from before Mullvad server switching get it now
   if grep -q '^VPN_SERVICE_PROVIDER=mullvad$' vpn.env 2>/dev/null; then
     if [ -z "$(env_get VPN_FALLBACK_CITIES)" ]; then
-      rank_cities mullvad off Mullvad
+      rank_cities mullvad off Mullvad || true
       set_fallback_cities "$(grep -m1 '^SERVER_CITIES=' vpn.env | cut -d= -f2- | cut -d, -f1)"
     fi
     setup_mullvad_switch
@@ -512,13 +714,38 @@ if vpn_enabled; then info "Starting the VPN, its pinger and the bot..."; fi
 vpn_failed=""
 # A gluetun that's already running must restart to read a new server-switching key; a new one reads it anyway
 gluetun_running="$(docker compose ps -q --status running gluetun 2>/dev/null || true)"
+# The same goes for the bot and a new token. Its log may still hold an older run's verdict, so a bot this run
+# starts or restarts is judged only by what it logs from now on.
+bot_running="$(docker compose ps -q --status running scanbot 2>/dev/null || true)"
+since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker compose up -d --remove-orphans || die "docker compose up failed."
+fresh_log="yes"
+if [ -n "${bot_running}" ] && [ "$(docker compose ps -q scanbot 2>/dev/null || true)" = "${bot_running}" ]; then
+  if [ -n "${TOKEN_CHANGED}" ]; then
+    info "Restarting the bot with the new token..."
+    docker compose restart scanbot >/dev/null 2>&1 || warn "Couldn't restart the bot. Run: ${DC} restart scanbot"
+  else
+    fresh_log=""  # Already running and left alone: its whole log counts
+  fi
+fi
+bot_log() {
+  if [ -n "${fresh_log}" ]; then docker compose logs --since "${since}" scanbot 2>&1 || true
+  else docker compose logs scanbot 2>&1 || true; fi
+}
+if [ -n "${DELETE_VPN_FILES}" ]; then
+  rm -f vpn.env docker-compose.vpn.yml docker-compose.vpn.yml.bak
+  if rm -rf vpn 2>/dev/null; then
+    ok "Deleted the VPN files"
+  else
+    warn "Deleted vpn.env, but some files in vpn/ belong to root. Delete them with: sudo rm -rf $(pwd)/vpn"
+  fi
+fi
 if vpn_enabled; then
   if [ -n "${GLUETUN_RESTART}" ] && [ -n "${gluetun_running}" ] \
      && [ "$(docker compose ps -q gluetun 2>/dev/null || true)" = "${gluetun_running}" ]; then
     # Still the same gluetun, so it hasn't read vpn/auth/config.toml yet (the pinger restarts with it)
     info "Restarting the VPN so it picks up the server-switching key..."
-    docker compose restart gluetun >/dev/null 2>&1 || warn "Couldn't restart gluetun. Run: docker compose restart gluetun"
+    docker compose restart gluetun >/dev/null 2>&1 || warn "Couldn't restart gluetun. Run: ${DC} restart gluetun"
   fi
   # The bot doesn't wait for the VPN: it runs anyway and checks servers through the API until the VPN is up.
   # gluetun checks its connection every 5 s, so a working VPN is healthy within about 15 s.
@@ -533,7 +760,7 @@ if vpn_enabled; then
     vpn_failed="yes"
     warn "The VPN didn't connect. Last gluetun log lines:"
     docker compose logs --tail 15 gluetun 2>&1 || true
-    warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: docker compose up -d"
+    warn "Check the key in $(pwd)/vpn.env, or run again with --vpn. If your network blocks the VPN's UDP port, add WIREGUARD_ENDPOINT_PORT to vpn.env (Mullvad also accepts 53 or 123). Then: ${DC} up -d"
     if [ -n "$(env_get GLUETUN_API_KEY)" ]; then
       warn "With Mullvad, the bot also keeps trying: it reconnects, then moves to other servers."
     fi
@@ -557,14 +784,14 @@ if vpn_enabled && [ -z "${vpn_failed}" ]; then
   if [ -n "${pinger_up}" ]; then
     ok "Pinger ready: server pings go through the VPN; Discord, the APIs and DNS use this machine's connection"
   else
-    warn "The pinger hasn't started yet. Check it with: docker compose logs pinger"
+    warn "The pinger hasn't started yet. Check it with: ${DC} logs pinger"
   fi
 fi
 
 info "Waiting for the bot to log in..."
 status="unknown"
 for _ in $(seq 1 30); do
-  logs="$(docker compose logs scanbot 2>&1 || true)"
+  logs="$(bot_log)"
   if printf '%s' "${logs}" | grep -q "Logged in as"; then status="ok"; break; fi
   if printf '%s' "${logs}" | grep -qE "Improper token|LoginFailure"; then status="bad-token"; break; fi
   if printf '%s' "${logs}" | grep -q "Error: "; then status="error"; break; fi
@@ -572,7 +799,7 @@ for _ in $(seq 1 30); do
 done
 
 echo
-docker compose logs --tail 5 scanbot 2>&1 || true
+bot_log | tail -n 5
 echo
 
 case "${status}" in
@@ -585,7 +812,7 @@ case "${status}" in
       if [ -z "${vpn_failed}" ] && ! vpn_verdict | grep -q "^Pings through the VPN work"; then
         info "Waiting for the bot's first ping through the VPN..."
         for _ in $(seq 1 60); do
-          logs="$(docker compose logs scanbot 2>&1 || true)"
+          logs="$(bot_log)"
           if vpn_verdict | grep -q "^Pings through the VPN work"; then break; fi
           sleep 1
         done
@@ -599,27 +826,28 @@ case "${status}" in
   bad-token)
     # Stop it so it doesn't keep retrying a bad login (Discord blocks IPs that do that a lot)
     docker compose stop scanbot >/dev/null 2>&1 || true
-    die "Discord rejected the token. Put the right one in $(pwd)/${TOKEN_FILE}, then: docker compose up -d"
+    die "Discord rejected the token. Give it the right one: curl -fsSL ${RAW}/install.sh | ${SUDO_PREFIX}bash -s -- --token"
     ;;
   error)
     docker compose stop scanbot >/dev/null 2>&1 || true
     if printf '%s' "${logs}" | grep -q "DNS lookups failed"; then
-      die "The bot can't look up any names over TLS or HTTPS (see above), so its container probably has no internet access. Fix that, then: docker compose up -d"
+      die "The bot can't look up any names over TLS or HTTPS (see above), so its container probably has no internet access. Fix that, then: ${DC} up -d"
     fi
-    die "The bot stopped with an error (see above). Fix it, then: docker compose up -d"
+    die "The bot stopped with an error (see above). Fix it, then: ${DC} up -d"
     ;;
   *)
-    warn "The bot hasn't logged in yet. Check the log with: docker compose logs -f scanbot"
+    warn "The bot hasn't logged in yet. Check the log with: ${DC} logs -f scanbot"
     ;;
 esac
 
-cat <<EOF
-
-Useful commands (run them in $(pwd)):
-  docker compose logs -f scanbot                   follow the log
-  docker compose restart scanbot                   restart the bot
-  docker compose pull && docker compose up -d      update now (Watchtower also does it daily at 4 AM)
-  docker compose down                              stop the bot
-  curl -fsSL ${RAW}/install.sh | bash -s -- --vpn
-                                                   set up, change or remove the VPN
-EOF
+hint() { printf '  %-54s %s\n' "$1" "$2"; }
+echo
+echo "Useful commands (run them in $(pwd)):"
+hint "${DC} logs -f scanbot" "follow the log"
+hint "${DC} restart scanbot" "restart the bot"
+hint "${DC} pull && ${DC} up -d" "update now (Watchtower also does it daily at 4 AM)"
+hint "${DC} down" "stop the bot"
+echo "  curl -fsSL ${RAW}/install.sh | ${SUDO_PREFIX}bash -s -- --vpn"
+hint "" "set up, change or remove the VPN"
+echo "  curl -fsSL ${RAW}/install.sh | ${SUDO_PREFIX}bash -s -- --token"
+hint "" "replace the Discord token"

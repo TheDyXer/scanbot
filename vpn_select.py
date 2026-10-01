@@ -9,6 +9,9 @@ network to each VPN city:
 
 It pings up to two WireGuard servers in every city the provider has and prints the
 fastest cities as tab-separated lines: rank, country, city, median ping in ms.
+
+With --cities it pings nothing and prints every city instead (country, city), for
+choosing one by name when pings don't get through.
 """
 import argparse
 import concurrent.futures
@@ -53,6 +56,11 @@ def group_by_city(servers, free_only=False, per_city=2, rng=random):
         if ipv4:
             cities.setdefault((s['country'], s['city']), []).append(ipv4[0])
     return {key: rng.sample(ips, min(per_city, len(ips))) for key, ips in cities.items()}
+
+def city_rows(servers, free_only=False):
+    """Every (country, city) with a WireGuard server, sorted, as tab-separated lines."""
+    cities = group_by_city(servers, free_only, per_city=1)
+    return '\n'.join(f"{country}\t{city}" for country, city in sorted(cities))
 
 def icmp_checksum(data):
     if len(data) % 2:
@@ -148,12 +156,17 @@ def main(argv=None):
     parser.add_argument('--per-city', type=int, default=2, help='servers to ping per city (default 2)')
     parser.add_argument('--count', type=int, default=3, help='pings per server (default 3)')
     parser.add_argument('--timeout', type=float, default=1.0, help='seconds to wait for each reply')
+    parser.add_argument('--cities', action='store_true', help='print every city (country, city) without pinging')
     args = parser.parse_args(argv)
 
-    cities = group_by_city(load_servers(args.provider, args.servers_file), args.free, args.per_city)
+    servers = load_servers(args.provider, args.servers_file)
+    cities = group_by_city(servers, args.free, args.per_city)
     if not cities:
         print(f"No WireGuard servers found for {args.provider}.", file=sys.stderr)
         return 1
+    if args.cities:
+        print(city_rows(servers, args.free))
+        return 0
     print(f"Pinging {sum(len(ips) for ips in cities.values())} servers in {len(cities)} cities...", file=sys.stderr)
     rows = rank(measure(cities, args.count, args.timeout))
     if rows[0][2] is None:
