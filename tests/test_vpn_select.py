@@ -96,6 +96,29 @@ class LoadServersTests(unittest.TestCase):
         self.assertIn('scanbot', request.get_header('User-agent'))
 
 
+class CityListTests(unittest.TestCase):
+    SERVERS = [
+        {'vpn': 'wireguard', 'country': 'Serbia', 'city': 'Belgrade', 'ips': ['1.1.1.1'], 'free': True},
+        {'vpn': 'wireguard', 'country': 'Serbia', 'city': 'Belgrade', 'ips': ['1.1.1.2']},
+        {'vpn': 'wireguard', 'country': 'Austria', 'city': 'Vienna', 'ips': ['2.2.2.2']},
+        {'vpn': 'openvpn', 'country': 'Germany', 'city': 'Berlin', 'ips': ['3.3.3.3']},
+        {'vpn': 'wireguard', 'country': 'Japan', 'city': 'Tokyo', 'ips': ['2001:db8::1']},
+    ]
+
+    def test_every_wireguard_city_once_sorted_by_country(self):
+        self.assertEqual(vpn_select.city_rows(self.SERVERS), "Austria\tVienna\nSerbia\tBelgrade")
+
+    def test_free_only(self):
+        self.assertEqual(vpn_select.city_rows(self.SERVERS, free_only=True), "Serbia\tBelgrade")
+
+    def test_main_prints_the_list_without_pinging(self):
+        with mock.patch.object(vpn_select, 'load_servers', return_value=self.SERVERS), \
+             mock.patch.object(vpn_select, 'ping', side_effect=AssertionError('pinged')), \
+             mock.patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertEqual(vpn_select.main(['--provider', 'mullvad', '--cities']), 0)
+        self.assertEqual(out.getvalue(), "Austria\tVienna\nSerbia\tBelgrade\n")
+
+
 class MainTests(unittest.TestCase):
     def test_prints_the_fastest_cities(self):
         with mock.patch.object(vpn_select, 'load_servers', return_value=SERVERS), \

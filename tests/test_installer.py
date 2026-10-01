@@ -261,5 +261,170 @@ chown() { echo "chown $*" >> calls; }
         self.assertIn(f"sudo chown {os.getuid()}:{os.getgid()}", done.stdout)
 
 
+class SudoTests(InstallerTestCase):
+    """detect_sudo, own_files and migrate_from_root: under sudo the files and the bot belong to the user."""
+
+    # Stand-ins for id and chown: the tests don't run as root
+    ROOT = """
+id() { case "$1" in -u|-g) echo 0 ;; esac; }
+chown() { echo "chown $*" >> calls; }
+"""
+
+    def run_as_root(self, script, sudo_uid='1234', sudo_gid='1235', sudo_user='alice'):
+        setup = (f'export SUDO_UID={sudo_uid} SUDO_GID={sudo_gid} SUDO_USER={sudo_user}\n' if sudo_uid
+                 else 'unset SUDO_UID SUDO_GID SUDO_USER\n')
+        done = self.bash(self.ROOT + setup + 'detect_sudo\n' + script)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done
+
+    def calls(self):
+        path = self.install_dir / 'calls'
+        return read(path).splitlines() if path.exists() else []
+
+    def test_under_sudo_the_user_who_ran_it_runs_the_bot(self):
+        done = self.run_as_root('echo "$RUN_UID:$RUN_GID|$SUDO_PREFIX|$DC"')
+        self.assertEqual(done.stdout.strip(), "1234:1235|sudo |sudo docker compose")
+
+    def test_plain_root_stays_root(self):
+        done = self.run_as_root('echo "$RUN_UID:$RUN_GID|$SUDO_PREFIX|$DC"', sudo_uid=None)
+        self.assertEqual(done.stdout.strip(), "0:0||docker compose")
+
+    def test_sudo_to_another_user_runs_as_that_user(self):
+        # sudo -u bob: SUDO_UID is the one who ran sudo, but the installer runs as bob
+        script = 'id() { case "$1" in -u|-g) echo 1001 ;; esac; }\ndetect_sudo\necho "$RUN_UID|$SUDO_PREFIX"'
+        done = self.run_as_root(script)
+        self.assertEqual(done.stdout.strip(), "1001|")
+
+    def test_the_installers_files_are_given_to_the_user_and_nothing_else(self):
+        for name in ('.env', 'docker-compose.yml', 'vpn.env', 'notes.txt'):
+            write(self.install_dir / name, 'x\n')
+        for name in ('data', 'state', 'vpn'):
+            (self.install_dir / name).mkdir()
+        self.run_as_root('own_files')
+        self.assertEqual(self.calls(), ["chown 1234:1235 .env", "chown 1234:1235 docker-compose.yml",
+                                        "chown 1234:1235 vpn.env", "chown -R 1234:1235 data",
+                                        "chown -R 1234:1235 vpn", "chown -R 1234:1235 state"])
+
+    def test_a_folder_the_installer_made_is_given_to_the_user_too(self):
+        self.run_as_root('CREATED_DIR=yes\nown_files')
+        self.assertEqual(self.calls()[0], "chown 1234:1235 .")
+
+    def test_without_sudo_nothing_changes_hands(self):
+        write(self.install_dir / 'vpn.env', 'x\n')
+        self.run_as_root('own_files', sudo_uid=None)
+        self.assertEqual(self.calls(), [])
+
+    def test_an_install_running_as_root_moves_to_the_user(self):
+        write(self.install_dir / '.env', "TZ=UTC\nSCANBOT_UID=0\nSCANBOT_GID=0\n")
+        done = self.run_as_root('migrate_from_root')
+        self.assertIn("SCANBOT_UID=1234\n", self.env())
+        self.assertIn("SCANBOT_GID=1235\n", self.env())
+        self.assertNotIn("SCANBOT_UID=0", self.env())
+        self.assertIn("The bot now runs as alice instead of root", done.stdout)
+
+    def test_plain_root_keeps_running_as_root(self):
+        write(self.install_dir / '.env', "SCANBOT_UID=0\nSCANBOT_GID=0\n")
+        done = self.run_as_root('migrate_from_root', sudo_uid=None)
+        self.assertEqual(self.env(), "SCANBOT_UID=0\nSCANBOT_GID=0\n")
+        self.assertEqual(done.stdout, '')
+
+
+class VpnEnvTests(InstallerTestCase):
+    """write_vpn_env and vpn_env_kind: rewriting vpn.env for the same VPN keeps the lines you added."""
+
+    MULLVAD = ("VPN_SERVICE_PROVIDER=mullvad\nWIREGUARD_PRIVATE_KEY=new\nSERVER_COUNTRIES=Serbia\n"
+               "SERVER_CITIES=Belgrade\n")
+
+    def vpn_env(self):
+        return read(self.install_dir / 'vpn.env')
+
+    def write_new(self, kind, new):
+        write(self.dir / 'new.env', new)
+        done = self.bash(f'write_vpn_env {kind} < "{(self.dir / "new.env").as_posix()}"')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done
+
+    def kind(self):
+        done = self.bash('vpn_env_kind')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip()
+
+    def test_the_same_provider_keeps_your_own_lines(self):
+        write(self.install_dir / 'vpn.env', "VPN_SERVICE_PROVIDER=mullvad\nWIREGUARD_PRIVATE_KEY=old\n"
+                                            "SERVER_CITIES=Vienna\n# my port\nWIREGUARD_ENDPOINT_PORT=53\n"
+                                            "HEALTH_RESTART_VPN=off\nWIREGUARD_MTU=1300")  # No newline at the end
+        done = self.write_new('mullvad', self.MULLVAD)
+        self.assertEqual(self.vpn_env(), self.MULLVAD + "# Kept from your previous vpn.env\n"
+                                                        "WIREGUARD_ENDPOINT_PORT=53\nWIREGUARD_MTU=1300\n")
+        self.assertIn("Kept your own vpn.env settings: WIREGUARD_ENDPOINT_PORT, WIREGUARD_MTU", done.stdout)
+
+    def test_nothing_of_your_own_means_no_kept_section(self):
+        write(self.install_dir / 'vpn.env', "VPN_SERVICE_PROVIDER=mullvad\nWIREGUARD_PRIVATE_KEY=old\n"
+                                            "HEALTH_RESTART_VPN=off\n")
+        done = self.write_new('mullvad', self.MULLVAD)
+        self.assertEqual(self.vpn_env(), self.MULLVAD)
+        self.assertNotIn("Kept", done.stdout)
+
+    def test_another_provider_starts_fresh_and_says_so(self):
+        write(self.install_dir / 'vpn.env', "VPN_SERVICE_PROVIDER=protonvpn\nWIREGUARD_ENDPOINT_PORT=53\n")
+        done = self.write_new('mullvad', self.MULLVAD)
+        self.assertEqual(self.vpn_env(), self.MULLVAD)
+        self.assertIn("vpn.env was for protonvpn", done.stdout)
+
+    def test_a_first_vpn_env_is_just_the_new_settings(self):
+        done = self.write_new('mullvad', self.MULLVAD)
+        self.assertEqual((self.vpn_env(), done.stdout), (self.MULLVAD, ''))
+
+    @unittest.skipIf(os.name == 'nt', "needs Unix permissions")
+    def test_only_you_can_read_it(self):
+        self.write_new('mullvad', self.MULLVAD)
+        self.assertEqual((self.install_dir / 'vpn.env').stat().st_mode & 0o777, 0o600)
+
+    def test_warp_keys_are_recognised_by_the_marker_whatever_the_port(self):
+        write(self.install_dir / 'vpn.env', "# Cloudflare WARP keys made by install.sh\nVPN_SERVICE_PROVIDER=custom\n"
+                                            "WIREGUARD_ENDPOINT_PORT=500\n")
+        self.assertEqual(self.kind(), 'warp')
+
+    def test_warp_keys_from_before_the_marker_are_recognised_by_their_port(self):
+        write(self.install_dir / 'vpn.env', "VPN_SERVICE_PROVIDER=custom\nWIREGUARD_ENDPOINT_PORT=2408\n")
+        self.assertEqual(self.kind(), 'warp')
+
+    def test_a_custom_vpn_env_you_wrote_is_not_warp(self):
+        write(self.install_dir / 'vpn.env', "VPN_SERVICE_PROVIDER=custom\nWIREGUARD_ENDPOINT_PORT=51820\n"
+                                            "WIREGUARD_PRESHARED_KEY=mine\n")
+        self.assertEqual(self.kind(), 'custom')
+        self.write_new('warp', "# Cloudflare WARP keys made by install.sh\nVPN_SERVICE_PROVIDER=custom\n")
+        self.assertNotIn("PRESHARED", self.vpn_env())
+
+    def test_no_vpn_env_has_no_kind(self):
+        self.assertEqual(self.kind(), '')
+
+
+class FindCityTests(InstallerTestCase):
+    """find_city: a VPN city by name, for when the ping test is skipped or doesn't work."""
+
+    CITIES = "Serbia\\tBelgrade\\nFrance\\tParis\\nUSA\\tParis\\nAustria\\tVienna\\n"
+
+    def find(self, name):
+        done = self.bash(f'rc=0\nfind_city "$(printf \'{self.CITIES}\')" "{name}" || rc=$?\n'
+                         'echo "$rc|${PICK_COUNTRY:-}|${PICK_CITY:-}|${FOUND:-}"')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip()
+
+    def test_a_city_by_name_in_any_case(self):
+        self.assertEqual(self.find('belgrade'), "0|Serbia|Belgrade|Belgrade, Serbia")
+
+    def test_a_city_and_its_country_with_spaces_around(self):
+        self.assertEqual(self.find(' Vienna , austria '), "0|Austria|Vienna|Vienna, Austria")
+
+    def test_a_name_in_two_countries_needs_the_country(self):
+        self.assertEqual(self.find('Paris'), "2|||Paris, France; Paris, USA")
+        self.assertEqual(self.find('paris, usa'), "0|USA|Paris|Paris, USA")
+
+    def test_an_unknown_or_empty_name_matches_nothing(self):
+        self.assertEqual(self.find('Atlantis'), "1|||")
+        self.assertEqual(self.find(''), "1|||")
+
+
 if __name__ == '__main__':
     unittest.main()
