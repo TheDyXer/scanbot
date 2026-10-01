@@ -228,7 +228,7 @@ class EditionErrorTests(unittest.IsolatedAsyncioTestCase):
 class EditionOptionTests(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_offers_the_two_editions(self):
         params = {p.name: p for p in scanbot.bot.tree.get_command('scan').parameters}
-        self.assertEqual(list(params), ['file', 'edition', 'api'])
+        self.assertEqual(list(params), ['file', 'target', 'edition', 'api'])
         self.assertFalse(params['edition'].required)
         self.assertEqual([c.value for c in params['edition'].choices], ['java', 'bedrock'])
 
@@ -246,7 +246,7 @@ class EditionOptionTests(unittest.IsolatedAsyncioTestCase):
             await ctx.command._parse_arguments(ctx)
         except commands.BadLiteralArgument:
             return 'bad'
-        return ctx.args[2:]  # after self-less (ctx, file)
+        return ctx.args[3:]  # after self-less (ctx, file, target)
 
     async def test_prefix_command_takes_the_edition_as_text(self):
         self.assertEqual(await self.parse('!scan bedrock'), ['bedrock', 'on'])
@@ -286,7 +286,7 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Bedrock', self.ctx.send.await_args_list[0].args[0])
 
     async def test_bedrock_scan_uses_the_bedrock_path_and_says_so(self):
-        await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment(), 'bedrock')
+        await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment(), edition='bedrock')
         self.assertEqual(set(self.editions_asked), {'bedrock'})
         self.assertIn('Bedrock', self.ctx.send.await_args_list[0].args[0])
         channel_texts = [c.args[0] for c in self.ctx.channel.send.await_args_list if c.args]
@@ -297,9 +297,9 @@ class ScanCommandTests(unittest.IsolatedAsyncioTestCase):
         scanbot.bot.direct_ok, scanbot.bot.direct_ok_bedrock = False, True
         direct = mock.AsyncMock(return_value=[])
         with mock.patch.object(scanbot, 'run_direct', direct):
-            await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment(), 'java')
+            await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment(), edition='java')
             direct.assert_not_awaited()
-            await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment(), 'bedrock')
+            await scanbot.bot.get_command('scan').callback(self.ctx, self.attachment(), edition='bedrock')
             direct.assert_awaited_once()
             self.assertEqual(direct.await_args.args[-1], 'bedrock')
 
