@@ -2,7 +2,7 @@
 
 A Discord bot that checks a list of Minecraft servers (Java or Bedrock Edition) and tells you which ones are online, how many players they have, and where they are.
 
-Drop a `.txt` file of IPs into Discord with `/scan` (or `!scan`), watch the progress message count up, and get the results in chat or as a `.txt` / `.csv` file.
+Drop a `.txt` file of IPs into Discord with `/scan` (or `!scan`), watch the progress message count up, and get the results in chat or as `.txt`, `.csv` and `.json` files.
 
 ## Quick start
 
@@ -26,8 +26,22 @@ Other options: [Docker Compose by hand](#docker-compose-by-hand) (also for Windo
 
 First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-setup). Skipping the **Message Content** switch is the most common reason the bot ignores `!` commands. The slash commands (`/scan`) don't need it.
 
+## What's new (October 2026)
+
+- **Scans survive restarts.** An update, a crash or a reboot pauses a running scan, and it carries on where it left off ([Restarts and updates](#restarts-and-updates)).
+- **No file needed:** `/scan target:asn:AS8400`, `target:country:RS` or `target:cidr:1.2.3.0/24`, and range lines like `1.2.3.0/24` in a list ([Scanning without a file](#scanning-without-a-file)).
+- **Campaigns:** a whole ISP or country, up to 2,000,000 addresses, in parts of 30,000, after a preview with a time estimate. One runs at a time, so normal scans keep their slots ([Campaigns](#campaigns)).
+- **`/rescan` and `/diff`:** check the servers your last scan found online again, and compare your last two scans ([Rescan and diff](#rescan-and-diff)).
+- **About 6 times faster on dead ranges:** 300 direct pings at a time instead of 50. The limits are settings in `.env` now ([Configuration](#configuration)).
+- **More per server:** its network (AS number and name), latency, software, plugins, mods and more, and a `scan_results.json` ([What you'll see](#what-youll-see)).
+- **A second status service:** Java servers that mcstatus.io can't check go to mcsrvstat.us, the bot slows down when it's rate-limited, and servers neither service could check are counted as unchecked, not offline ([How scanning works](#how-scanning-works)).
+- **Installer:** a rerun updates `docker-compose.yml`, `sudo` installs belong to your user, `--token` replaces the token, your own `vpn.env` lines are kept, and the VPN city can be picked by name ([One-line installer](#one-line-installer)).
+
+**Installed before October 2026?** Watchtower updates the bot but not `docker-compose.yml`, so run the [installer](#one-line-installer) once more. Until you do, the bot can't save scans (the log says `Scans can't be saved`), Docker gives it 10 seconds or less to stop, and the new settings in `.env` don't reach it.
+
 ## Contents
 
+- [What's new (October 2026)](#whats-new-october-2026)
 - [Features](#features)
 - [Discord bot setup](#discord-bot-setup)
 - [Installation](#installation)
@@ -49,14 +63,14 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 
 - **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
 - **Ranges, networks and whole ISPs:** list lines like `1.2.3.0/24`, `1.2.3.10-1.2.3.20` or `1.2.3.*`, or no file at all: `/scan target:asn:AS8400`, `target:country:RS` or `target:cidr:1.2.3.0/24` (AS and country address lists come from RIPEstat)
-- **Campaigns:** a list or target bigger than one scan (up to 2,000,000 addresses) runs in parts of 30,000, one after another, with one result at the end. The bot first says how long it may take, and starts it when you confirm (see [Campaigns](#campaigns))
+- **Campaigns:** a list or target bigger than one scan (up to 2,000,000 addresses) runs in parts of 30,000, one after another, with one result at the end. The bot first says how long it may take, and starts it when you confirm. One runs at a time, so normal scans keep their slots (see [Campaigns](#campaigns))
 - **Rescan and diff:** `/rescan` checks again the servers your last scan found online; `/diff` compares your last two scans: new servers, gone ones and player changes
 - **Fast scans:** pings servers directly, 300 at a time, and retries the ones that don't answer through `api.mcstatus.io`, with `api.mcsrvstat.us` as a second opinion for Java servers when mcstatus.io can't answer
 - **Skip the retry when it isn't worth it:** `/scan file:<.txt> api:off` counts only servers that answer a direct ping, which is much faster for long lists of mostly dead addresses (see [Skipping the API retry](#skipping-the-api-retry))
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
-- **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
-- **Several people can scan at once:** up to 5 scans run side by side, one per person, and more wait in a queue
+- **Slash commands** (`/scan`, `/rescan`, `/diff`, `/stop`, `/help`) and the older `!scan`, `!rescan`, `!diff`, `!stop`, `!help`; both do the same thing
+- **Several people can scan at once:** up to 5 scans run side by side, one per person and at most one of them a campaign, and more wait in a queue
 - **`/stop` at any point**, which posts what was found so far. It stops your own scan; moderators can stop anyone's
 - **Survives restarts:** a scan is saved as it runs, so an update, a crash or a reboot pauses it, and it carries on where it left off once the bot is back
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs stay on your machine (only the few the database doesn't know are looked up at ip-api.com)
@@ -87,7 +101,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
    | --- | --- |
    | View Channels | Seeing the command |
    | Send Messages | Replies and the progress message |
-   | Embed Links | `!help` |
+   | Embed Links | `/help` and `!help` |
    | Attach Files | `scan_results.txt` / `.csv` / `.json` |
 
 Commands also work in a direct message to the bot.
@@ -197,7 +211,7 @@ The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchto
 
 ### Without Docker
 
-Requires **Python 3.10+** (the tests run on 3.10 and 3.13 in CI).
+Requires **Python 3.10+**. The tests run on 3.10 and 3.13 in CI, and the Docker image uses 3.14.
 
 ```bash
 git clone https://github.com/TheDyXer/scanbot.git
@@ -226,17 +240,18 @@ The log (`docker compose logs scanbot`, or the terminal without Docker) says whi
 [2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings work; scans use direct pings with API fallback.
 ```
 
-Before that, it shows the direct ping and API settings (see [Configuration](#configuration)):
+Before that, it shows the direct ping and API settings (see [Configuration](#configuration)) and where scans are saved (see [Restarts and updates](#restarts-and-updates)):
 
 ```
 [2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings: up to 300 per scan (600 for all scans together), 3 s timeout
 [2026-01-01 12:00:00] [INFO    ] scanbot: API checks: mcstatus.io every 0.2 s (query on, 3 s server timeout); Java servers it can't check go to mcsrvstat.us, every 0.5 s
+[2026-01-01 12:00:00] [INFO    ] scanbot: Scans are saved in /state
 ```
 
 or, if your network blocks Minecraft's port:
 
 ```
-[2026-01-01 12:00:00] [WARNING ] scanbot: Direct pings to demo.mcstatus.io, play.cubecraft.net, play.wynncraft.com all failed; scans use the mcstatus.io API only (5 checks/second).
+[2026-01-01 12:00:00] [WARNING ] scanbot: Direct pings to demo.mcstatus.io, play.cubecraft.net, play.wynncraft.com all failed; scans use the mcstatus.io API only (5 checks/second), trying again every 5 minutes.
 ```
 
 ## Usage
@@ -410,7 +425,7 @@ flowchart TD
    - **Unchecked:** a server neither service could check is counted on its own line in the results, not as offline.
 3. **Countries and networks.** Online servers are looked up in two free [DB-IP Lite](https://db-ip.com/db/lite.php) databases, which the bot keeps on disk: one for the country, one for the network (AS number and name). Thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs they don't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the databases are built into the image. The weekly image rebuild picks up DB-IP's new monthly editions.
-   - **Without Docker:** the bot downloads them (about 8 MB and 10 MB) next to `bot.py` on first start. It checks their age once a day, and downloads new ones when they're more than 40 days old. If the network database can't be downloaded, networks come from ip-api.com for the IPs it's asked about anyway, and the rest have none.
+   - **Without Docker:** the bot downloads them next to `bot.py` on first start (about 4 MB and 5 MB, or 8 MB and 10 MB unpacked). It checks their age once a day, and downloads new ones when they're more than 40 days old. If the network database can't be downloaded, networks come from ip-api.com for the IPs it's asked about anyway, and the rest have none.
 
 `/stop` works in every phase. Direct pings already in flight finish (at most 3 seconds), API checks in flight are dropped, and nothing new starts.
 
@@ -445,7 +460,7 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 | `MCSRVSTAT_DELAY` | `0.5` | 0.1 to 60 | Seconds between mcsrvstat.us requests (it publishes no limit), shared by all scans |
 | `GEO_DELAY` | `4` | 0 to 600 | Seconds between ip-api.com batches (15/minute allowed), shared by all scans |
 | `PROGRESS_INTERVAL` | `3` | 2 to 600 | Seconds between progress message updates |
-| `GEO_DB_MAX_AGE_DAYS` | `40` | 1 to 3,650 | Download a new country database when the current one is older than this (without Docker) |
+| `GEO_DB_MAX_AGE_DAYS` | `40` | 1 to 3,650 | Download new country and network databases when the ones on disk are older than this (without Docker) |
 | `DIRECT_RECHECK` | `300` | 10 to 86,400 | Without the VPN: seconds between new tries of direct pings while they don't work |
 | `CHECKPOINT_INTERVAL` | `10` | 2 to 600 | Seconds between saves of a running scan's progress: a crash loses at most this much |
 | `KEEP_FINISHED_PER_USER` | `5` | 2 to 1,000 | Finished scans kept per person, with their results |
@@ -508,7 +523,7 @@ With Docker, the bot can send its pings to the servers you scan through a VPN. T
 - **Privacy:** the scanned servers see the VPN's address, not yours.
 - **Blocked port:** if your router or ISP blocks Minecraft's port 25565, the tunnel gets around it and the fast direct pings work again.
 
-**Only the pings go through the VPN.** Discord, mcstatus.io, mcsrvstat.us, ip-api.com, DNS (Quad9) and the country-database download all use your own connection. mcstatus.io and ip-api.com limit requests per IP address, and a VPN address is shared with many other people, so API checks from it would be rate-limited much sooner.
+**Only the pings go through the VPN.** Discord, mcstatus.io, mcsrvstat.us, ip-api.com, RIPEstat, DNS (Quad9) and the database downloads all use your own connection. mcstatus.io and ip-api.com limit requests per IP address, and a VPN address is shared with many other people, so API checks from it would be rate-limited much sooner.
 
 How it's built:
 
@@ -754,7 +769,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `❌ api:off would check nothing` | Direct pings don't work: your network blocks port 25565, or the VPN is down | Scan with the API on, or fix the direct pings (see the row above and [VPN](#vpn)) |
 | `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
-| `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
+| `No country database` or `No network database` at startup | A database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com, and so do networks for the IPs it's asked about |
 | Many known-online servers missing | mcstatus.io rate-limited the bot, or both status services called them offline | The log shows `mcstatus.io is rate-limiting the bot` when it happened. Don't run other tools using the API from the same IP, and leave `API_DELAY` at `0.2` or higher. Servers that only answer by hostname need their hostname in the list |
 | `❔ N couldn't be checked` in the results | mcstatus.io (and, for Java, mcsrvstat.us) didn't answer about those servers: rate limits, outages or timeouts | Scan them again later. The log says when mcstatus.io failed often enough for Java checks to switch to mcsrvstat.us |
 | Results say `The bot is restarting`, or `your queued scan was cancelled because the bot is restarting` | The bot was stopped or updated while the scan ran or waited, and it couldn't save the scan to resume it (the log says `Scans can't be saved`) | Start the scan again; the results show what was already found. Then fix the `state` folder (next row), so the next restart resumes scans instead |
