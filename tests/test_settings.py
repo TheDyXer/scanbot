@@ -21,7 +21,8 @@ import pinger  # noqa: E402
 
 SETTINGS = ('MAX_IPS_PER_SCAN', 'MAX_CONCURRENT_SCANS', 'DIRECT_CONCURRENCY', 'DIRECT_CONCURRENCY_TOTAL',
             'DIRECT_TIMEOUT', 'API_DELAY', 'GEO_DELAY', 'PROGRESS_INTERVAL', 'GEO_DB_MAX_AGE_DAYS', 'DIRECT_RECHECK',
-            'API_QUERY', 'MCSRVSTAT_DELAY', 'CHECKPOINT_INTERVAL', 'KEEP_FINISHED_PER_USER', 'STATE_DIR')
+            'API_QUERY', 'MCSRVSTAT_DELAY', 'CHECKPOINT_INTERVAL', 'KEEP_FINISHED_PER_USER', 'STATE_DIR',
+            'MAX_CAMPAIGN_ADDRESSES', 'MAX_FILE_BYTES')
 
 
 def import_bot(env, show):
@@ -71,7 +72,8 @@ class EnvNumberTests(unittest.TestCase):
 
     def test_the_defaults(self):
         self.assertEqual((scanbot.MAX_IPS_PER_SCAN, scanbot.MAX_CONCURRENT_SCANS, scanbot.MAX_FILE_BYTES),
-                         (30000, 5, 2_000_000))
+                         (30000, 5, 20_000_000))
+        self.assertEqual(scanbot.MAX_CAMPAIGN_ADDRESSES, 2_000_000)
         self.assertEqual(scanbot.DIRECT_CONCURRENCY_TOTAL, 2 * scanbot.DIRECT_CONCURRENCY)
         self.assertEqual((scanbot.DIRECT_TIMEOUT, scanbot.API_DELAY, scanbot.GEO_DELAY), (3, 0.2, 4))
         self.assertEqual((scanbot.PROGRESS_INTERVAL, scanbot.GEO_DB_MAX_AGE_DAYS), (3, 40))
@@ -110,15 +112,17 @@ class StartupTests(unittest.TestCase):
     """bot.py imported with settings in the environment, the way the container starts it."""
 
     def test_settings_from_the_environment_are_used(self):
-        done = import_bot({'DIRECT_CONCURRENCY': '300', 'MAX_IPS_PER_SCAN': '100000', 'API_DELAY': '0.5'},
-                          'bot.DIRECT_CONCURRENCY, bot.DIRECT_CONCURRENCY_TOTAL, bot.MAX_FILE_BYTES, bot.API_DELAY')
+        done = import_bot({'DIRECT_CONCURRENCY': '300', 'MAX_IPS_PER_SCAN': '100000', 'API_DELAY': '0.5',
+                           'MAX_CAMPAIGN_ADDRESSES': '500000'},
+                          'bot.DIRECT_CONCURRENCY, bot.DIRECT_CONCURRENCY_TOTAL, bot.API_DELAY, bot.campaign_cap()')
         self.assertEqual(done.returncode, 0, done.stderr)
-        # The bot-wide limit follows the per-scan one, and the file size limit follows the list limit
-        self.assertEqual(done.stdout.strip(), '300 600 6400000 0.5')
+        # The bot-wide limit follows the per-scan one
+        self.assertEqual(done.stdout.strip(), '300 600 0.5 500000')
 
-    def test_the_file_size_limit_never_drops_below_2_mb(self):
-        done = import_bot({'MAX_IPS_PER_SCAN': '100'}, 'bot.MAX_FILE_BYTES')
-        self.assertEqual(done.stdout.strip(), '2000000', done.stderr)
+    def test_the_file_size_limit_is_a_setting_and_campaigns_can_be_switched_off(self):
+        done = import_bot({'MAX_FILE_BYTES': '5000000', 'MAX_CAMPAIGN_ADDRESSES': '1'},
+                          'bot.MAX_FILE_BYTES, bot.campaign_cap()')
+        self.assertEqual(done.stdout.strip(), '5000000 30000', done.stderr)
 
     def test_a_bad_value_stops_the_bot_with_a_clear_message(self):
         done = import_bot({'DIRECT_CONCURRENCY': 'lots'}, '"started"')

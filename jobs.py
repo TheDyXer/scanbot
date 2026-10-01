@@ -33,14 +33,20 @@ class Job:
     channel_id: Optional[int]     # Where its messages go
     edition: str
     api_retry: bool
-    source: dict                  # {'kind': 'file' or 'target', 'description': ...}
+    # {'kind': 'file', 'target' or 'rescan', 'description': ...}. A target too big for one scan (a campaign) also has
+    # 'spans', the [first, last] address ranges to scan, and 'port'; a rescan has 'parent', the scan it repeats.
+    source: dict
     total: int                    # Addresses in the list
     notes: str = ''               # The start message's notes: expanded ranges, skipped lines, duplicates
     status: str = 'queued'        # queued, running, interrupted, done, stopped or abandoned
     progress_message_id: Optional[int] = None
-    # How far it got: the phase ('direct', 'api', 'geo' or 'send') and, in the first two, how many entries of that
-    # phase's list are done (every entry before `index` is, some after it may be too)
-    cursor: dict = dataclasses.field(default_factory=lambda: {'phase': 'direct', 'index': 0})
+    # A campaign (a list or target bigger than one scan) runs in `parts` of `part_size` addresses, one after another
+    parts: int = 1
+    part_size: int = 0
+    # How far it got: the part, the phase ('direct', 'api', 'geo' or 'send') and, in the first two, how many entries
+    # of that phase's list are done (every entry before `index` is, some after it may be too). Direct pings and API
+    # checks run part by part; 'geo' and 'send' once, at the end.
+    cursor: dict = dataclasses.field(default_factory=lambda: {'part': 0, 'phase': 'direct', 'index': 0})
     blocked: list = dataclasses.field(default_factory=list)   # Entries skipped: names of private addresses
     unchecked: int = 0            # Servers no API could check
     results: dict = dataclasses.field(default_factory=dict)   # Entry -> online server, as bot.make_result makes it

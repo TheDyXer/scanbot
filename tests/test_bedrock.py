@@ -228,7 +228,7 @@ class EditionErrorTests(unittest.IsolatedAsyncioTestCase):
 class EditionOptionTests(unittest.IsolatedAsyncioTestCase):
     def test_slash_command_offers_the_two_editions(self):
         params = {p.name: p for p in scanbot.bot.tree.get_command('scan').parameters}
-        self.assertEqual(list(params), ['file', 'target', 'edition', 'api'])
+        self.assertEqual(list(params), ['file', 'target', 'edition', 'api', 'confirm'])
         self.assertFalse(params['edition'].required)
         self.assertEqual([c.value for c in params['edition'].choices], ['java', 'bedrock'])
 
@@ -249,9 +249,9 @@ class EditionOptionTests(unittest.IsolatedAsyncioTestCase):
         return ctx.args[3:]  # after self-less (ctx, file, target)
 
     async def test_prefix_command_takes_the_edition_as_text(self):
-        self.assertEqual(await self.parse('!scan bedrock'), ['bedrock', 'on'])
-        self.assertEqual(await self.parse('!scan java'), ['java', 'on'])
-        self.assertEqual(await self.parse('!scan'), ['java', 'on'])
+        self.assertEqual(await self.parse('!scan bedrock'), ['bedrock', 'auto', None])
+        self.assertEqual(await self.parse('!scan java'), ['java', 'auto', None])
+        self.assertEqual(await self.parse('!scan'), ['java', 'auto', None])
         self.assertEqual(await self.parse('!scan pocket'), 'bad')
 
 

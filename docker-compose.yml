@@ -41,6 +41,8 @@ services:
       DIRECT_RECHECK: ${DIRECT_RECHECK:-}
       CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-}
       KEEP_FINISHED_PER_USER: ${KEEP_FINISHED_PER_USER:-}
+      MAX_CAMPAIGN_ADDRESSES: ${MAX_CAMPAIGN_ADDRESSES:-}
+      MAX_FILE_BYTES: ${MAX_FILE_BYTES:-}
       # Running and recent scans are saved here, so an update or restart resumes them
       STATE_DIR: /state
     volumes:

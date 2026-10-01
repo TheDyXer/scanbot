@@ -28,17 +28,17 @@ def http_error(cls, status):
 class RegistrationTests(unittest.TestCase):
     def test_slash_commands_exist(self):
         names = {c.name for c in scanbot.bot.tree.get_commands()}
-        self.assertEqual(names, {'scan', 'stop', 'help'})
+        self.assertEqual(names, {'scan', 'stop', 'help', 'rescan', 'diff'})
 
     def test_prefix_commands_still_work(self):
-        for name in ('scan', 'check', 'stop', 'help'):
+        for name in ('scan', 'check', 'stop', 'help', 'rescan', 'diff'):
             with self.subTest(name=name):
                 self.assertIsNotNone(scanbot.bot.get_command(name))
         self.assertIs(scanbot.bot.get_command('check'), scanbot.bot.get_command('scan'))
 
     def test_scan_takes_an_attachment_or_a_target_both_optional(self):
         params = scanbot.bot.tree.get_command('scan').parameters
-        self.assertEqual([p.name for p in params], ['file', 'target', 'edition', 'api'])
+        self.assertEqual([p.name for p in params], ['file', 'target', 'edition', 'api', 'confirm'])
         self.assertEqual(params[0].type, discord.AppCommandOptionType.attachment)
         self.assertEqual(params[1].type, discord.AppCommandOptionType.string)
         self.assertFalse(any(p.required for p in params))

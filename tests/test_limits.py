@@ -86,8 +86,18 @@ class ScanLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('30000 IPs', self.texts(self.ctx.send)[0])
         self.assertTrue(any('No working servers' in t and '30000 IPs' in t for t in self.texts(self.ctx.channel.send)))
 
-    async def test_one_more_is_refused_with_the_limit_in_the_message(self):
-        await self.scan(self.ctx, self.attachment(30001))
+    async def test_one_more_is_a_campaign_that_waits_for_confirmation(self):
+        # Direct pings on for the preview, but never sent: a broken preview must fail here, not ping 30,001 addresses
+        with mock.patch.object(scanbot.bot, 'direct_ok', True), mock.patch.object(scanbot, 'check_direct', mock.AsyncMock(side_effect=AssertionError('a preview pings nothing'))):
+            await self.scan(self.ctx, self.attachment(30001))
+        reply = self.texts(self.ctx.send)[-1]
+        self.assertIn('Campaign preview:** ips.txt has 30,001 addresses: 2 parts of up to 30,000', reply)
+        self.assertIn('confirm:yes', reply)
+        self.ctx.channel.send.assert_not_awaited()
+
+    async def test_with_campaigns_off_one_more_is_refused_with_the_limit_in_the_message(self):
+        with mock.patch.object(scanbot, 'MAX_CAMPAIGN_ADDRESSES', 1):
+            await self.scan(self.ctx, self.attachment(30001))
         self.assertIn('Too many IPs', self.texts(self.ctx.send)[-1])
         self.assertIn('30000', self.texts(self.ctx.send)[-1])
         self.ctx.channel.send.assert_not_awaited()
@@ -99,7 +109,7 @@ class ScanLimitTests(unittest.IsolatedAsyncioTestCase):
         message = self.texts(self.ctx.send)[-1]
         self.assertIn('too big', message)
         self.assertNotIn('100 KB', message)
-        self.assertIn('2 MB', message)
+        self.assertIn('20 MB', message)
 
 
 class RunDirectScaleTests(unittest.IsolatedAsyncioTestCase):
