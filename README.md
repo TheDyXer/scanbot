@@ -48,7 +48,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 ## Features
 
 - **Java and Bedrock Edition:** `/scan file:<.txt> edition:bedrock` checks Bedrock servers the same way
-- **Fast scans:** pings servers directly, 300 at a time, and retries the ones that don't answer through `api.mcstatus.io`
+- **Fast scans:** pings servers directly, 300 at a time, and retries the ones that don't answer through `api.mcstatus.io`, with `api.mcsrvstat.us` as a second opinion for Java servers when mcstatus.io can't answer
 - **Skip the retry when it isn't worth it:** `/scan file:<.txt> api:off` counts only servers that answer a direct ping, which is much faster for long lists of mostly dead addresses (see [Skipping the API retry](#skipping-the-api-retry))
 - **Works on restricted networks:** if direct pings are blocked, the bot notices at startup and uses the API for everything
 - **Live progress** in one message that updates itself
@@ -198,10 +198,11 @@ The log (`docker compose logs scanbot`, or the terminal without Docker) says whi
 [2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings work; scans use direct pings with API fallback.
 ```
 
-Before that, it shows the direct ping settings (see [Configuration](#configuration)):
+Before that, it shows the direct ping and API settings (see [Configuration](#configuration)):
 
 ```
 [2026-01-01 12:00:00] [INFO    ] scanbot: Direct pings: up to 300 per scan (600 for all scans together), 3 s timeout
+[2026-01-01 12:00:00] [INFO    ] scanbot: API checks: mcstatus.io every 0.2 s (query on, 3 s server timeout); Java servers it can't check go to mcsrvstat.us, every 0.5 s
 ```
 
 or, if your network blocks Minecraft's port:
@@ -292,12 +293,18 @@ Then the results, sorted by player count. Example from a test run:
 - **direct** is how fast your connection pings: about 100 a second (`DIRECT_CONCURRENCY` ÷ `DIRECT_TIMEOUT`) when most servers don't answer, faster when they do.
 - **API** is at most 5 a second, shared by every scan running at the same time, so two scans that use the API show about 2.5 each. When direct pings are blocked, every server goes through the API and the line ends with `(API)`.
 
+If the status services couldn't check some servers, the summary says so on its own line. Those servers aren't counted as offline: scan them again later.
+
+```text
+❔ 12 couldn't be checked: mcstatus.io and mcsrvstat.us didn't answer, so they aren't counted as offline
+```
+
 If the results don't fit in one Discord message, you get the summary and the top 10 servers in chat, with the full list attached:
 
 - `scan_results.txt`: the same report as plain text, with one more line per server for its network and details (`└ 🌐 AS8400 TELEKOM SRBIJA a.d. · protocol 767 · Paper · 12 mods`)
 - `scan_results.csv`: one row per online server. `players_online` is the number of players; `players` lists the names the server shows, separated by `; `. The columns:
   - `ip, resolved_ip, country, players_online, players_max, version, motd, players, edition`: these first nine never move, so older spreadsheets keep working
-  - `latency_ms, protocol, secure_chat, modded, mod_count, software, plugins, eula_blocked, gamemode, map, brand, asn, as_name, source`: empty when unknown. A direct ping reports latency, secure chat and Forge mods; mcstatus.io reports software, plugins and `eula_blocked` (blocked by Mojang). `source` is `direct` or `mcstatus.io`
+  - `latency_ms, protocol, secure_chat, modded, mod_count, software, plugins, eula_blocked, gamemode, map, brand, asn, as_name, source`: empty when unknown. A direct ping reports latency, secure chat and Forge mods; mcstatus.io and mcsrvstat.us report software, plugins and `eula_blocked` (blocked by Mojang). `source` is `direct`, `mcstatus.io` or `mcsrvstat.us`
 - `scan_results.json`: the same rows and names as the CSV, as a JSON array, with numbers, `true`/`false`, lists for `players` and `plugins`, and `null` when unknown. Each part of a split file is a complete array
 
 In chat, a server's line also shows its latency (`· 45 ms`) when a direct ping measured it.
@@ -308,7 +315,7 @@ In chat, a server's line also shows its latency (`· 45 ms`) when a direct ping 
 flowchart TD
     A[Bot starts] --> B{Direct ping to a probe<br/>server works?}
     B -- yes --> C[Ping every server directly<br/>300 at a time, 3 s timeout]
-    B -- no --> D[Check via api.mcstatus.io<br/>5 per second]
+    B -- no --> D[Check via api.mcstatus.io<br/>5 per second; Java servers it<br/>can't check: api.mcsrvstat.us]
     C -- no answer --> D
     C -- online --> E[Look up countries<br/>offline DB-IP database,<br/>ip-api.com for the rest]
     D -- online --> E
@@ -317,6 +324,11 @@ flowchart TD
 
 1. **Direct pings.** When the bot starts it pings three well-known servers (`PROBE_SERVERS`, and `BEDROCK_PROBE_SERVERS` for Bedrock, which uses UDP instead of TCP). Each edition is checked separately, since a network can block one and not the other. If any probe answers, scans of that edition ping each server directly, 300 at a time, waiting up to 3 seconds each. That covers 30,000 IPs in at most about 5 minutes. An IP address is pinged right away; for a hostname, the bot first looks for an SRV record that points the name at another host or port. If no probe answers, the bot tries again every 5 minutes (`DIRECT_RECHECK`) and switches direct pings on as soon as one does. (With the [VPN](#vpn), the VPN checks do this instead.)
 2. **API fallback.** Servers that don't answer a direct ping are retried through `api.mcstatus.io`, which allows 5 requests per second, so lists with many dead IPs still take a while. If the startup ping failed, every server goes through the API, and 30,000 IPs take about 100 minutes. The 5 per second are for the whole bot: [scans running at the same time](#several-people-at-once) take turns.
+   - **Timeout:** the bot asks mcstatus.io to give up on a server after 3 seconds instead of its default 5. The API phase still starts one request every `API_DELAY`, so it takes as long as before, but fewer checks pile up waiting, and fewer slow servers run into the bot's own 10-second limit and count as offline.
+   - **Query:** for Java servers, mcstatus.io also asks over the query protocol, which some servers answer with their software, plugins and full player list. `API_QUERY=off` turns that off.
+   - **Rate limits:** if mcstatus.io answers "too many requests" anyway, every scan's requests slow down to twice the spacing (up to 8 times while it keeps refusing), and go back to normal after a minute without one. The refused server is asked again in turn, up to twice.
+   - **Second opinion:** when mcstatus.io can't answer about a Java server (it kept refusing, had a server error, or timed out), the bot asks `api.mcsrvstat.us`, at most twice a second (`MCSRVSTAT_DELAY`). After 5 such failures in a row, Java servers go straight to mcsrvstat.us for a minute, then mcstatus.io gets the next one again. mcsrvstat.us has no second opinion for Bedrock: its Bedrock checks call some online servers offline. Like mcstatus.io, it misses some servers that only answer by hostname, and it keeps answers for 5 minutes.
+   - **Unchecked:** a server neither service could check is counted on its own line in the results, not as offline.
 3. **Countries and networks.** Online servers are looked up in two free [DB-IP Lite](https://db-ip.com/db/lite.php) databases, which the bot keeps on disk: one for the country, one for the network (AS number and name). Thousands of lookups take milliseconds, and nothing is sent anywhere. The few IPs they don't know are asked from `ip-api.com` in batches of 100, 4 seconds apart to stay under its limit of 15 requests per minute.
    - **Docker:** the databases are built into the image. The weekly image rebuild picks up DB-IP's new monthly editions.
    - **Without Docker:** the bot downloads them (about 8 MB and 10 MB) next to `bot.py` on first start. It checks their age once a day, and downloads new ones when they're more than 40 days old. If the network database can't be downloaded, networks come from ip-api.com for the IPs it's asked about anyway, and the rest have none.
@@ -335,6 +347,8 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 | `DIRECT_CONCURRENCY_TOTAL` | twice `DIRECT_CONCURRENCY` | 1 to 20,000 | Direct pings in flight for all scans together |
 | `DIRECT_TIMEOUT` | `3` | 0.5 to 10 | Seconds to wait for a server to answer a direct ping |
 | `API_DELAY` | `0.2` | 0.05 to 60 | Seconds between API requests (mcstatus.io allows 5/second), shared by all scans |
+| `API_QUERY` | `on` | `on` or `off` | Whether mcstatus.io also asks Java servers over the query protocol (software, plugins, full player lists) |
+| `MCSRVSTAT_DELAY` | `0.5` | 0.1 to 60 | Seconds between mcsrvstat.us requests (it publishes no limit), shared by all scans |
 | `GEO_DELAY` | `4` | 0 to 600 | Seconds between ip-api.com batches (15/minute allowed), shared by all scans |
 | `PROGRESS_INTERVAL` | `3` | 2 to 600 | Seconds between progress message updates |
 | `GEO_DB_MAX_AGE_DAYS` | `40` | 1 to 3,650 | Download a new country database when the current one is older than this (without Docker) |
@@ -397,7 +411,7 @@ With Docker, the bot can send its pings to the servers you scan through a VPN. T
 - **Privacy:** the scanned servers see the VPN's address, not yours.
 - **Blocked port:** if your router or ISP blocks Minecraft's port 25565, the tunnel gets around it and the fast direct pings work again.
 
-**Only the pings go through the VPN.** Discord, mcstatus.io, ip-api.com, DNS (Quad9) and the country-database download all use your own connection. mcstatus.io and ip-api.com limit requests per IP address, and a VPN address is shared with many other people, so API checks from it would be rate-limited much sooner.
+**Only the pings go through the VPN.** Discord, mcstatus.io, mcsrvstat.us, ip-api.com, DNS (Quad9) and the country-database download all use your own connection. mcstatus.io and ip-api.com limit requests per IP address, and a VPN address is shared with many other people, so API checks from it would be rate-limited much sooner.
 
 How it's built:
 
@@ -617,7 +631,8 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `skipped N private or local address(es)` | The list has addresses like `127.0.0.1`, `10.x.x.x`, `192.168.x.x`, `172.16-31.x.x`, `100.64.x.x`, `localhost` or `.lan` / `.local` names, or a hostname that resolves to one | By design: the bot only scans public servers. Scan your own LAN servers with a different tool |
 | Servers show 🏳️ instead of a flag | The IP isn't in the country database and ip-api.com didn't know it either, or was rate-limited | Scan again in a minute |
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
-| Many known-online servers missing | mcstatus.io rate-limited the bot | Don't run other tools using the API from the same IP; leave `API_DELAY` at `0.2` or higher |
+| Many known-online servers missing | mcstatus.io rate-limited the bot, or both status services called them offline | The log shows `mcstatus.io is rate-limiting the bot` when it happened. Don't run other tools using the API from the same IP, and leave `API_DELAY` at `0.2` or higher. Servers that only answer by hostname need their hostname in the list |
+| `❔ N couldn't be checked` in the results | mcstatus.io (and, for Java, mcsrvstat.us) didn't answer about those servers: rate limits, outages or timeouts | Scan them again later. The log says when mcstatus.io failed often enough for Java checks to switch to mcsrvstat.us |
 | Results say `The bot is restarting`, or `your queued scan was cancelled because the bot is restarting` | The bot was stopped or updated while the scan ran or waited (Watchtower checks daily at 4 AM) | Start the scan again; the results show what was already found. Start very large scans outside the update time |
 | `Error: DIRECT_CONCURRENCY must be a whole number from 1 to 2,000, not '...'` at startup (or another setting) | A setting in `.env` isn't a number, or is out of range | Fix it or delete the line: an empty or missing value means the default. The message gives the allowed range |
 | Log says `Only N files can be open at once` | The system's open-file limit is lower than `DIRECT_CONCURRENCY` needs, so some pings fail and count as offline | Run the [installer](#one-line-installer) again (its `docker-compose.yml` raises the limit), add `LimitNOFILE=65536` to the systemd unit, or lower `DIRECT_CONCURRENCY` |
@@ -630,6 +645,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 - [discord.py](https://github.com/Rapptz/discord.py): Discord API wrapper
 - [mcstatus](https://github.com/py-mine/mcstatus): direct Minecraft server pings
 - [mcstatus.io](https://mcstatus.io): server status API (5 requests/second per IP)
+- [mcsrvstat.us](https://mcsrvstat.us): second server status API for Java servers. It keeps answers for 5 minutes and needs a User-Agent
 - [IP Geolocation by DB-IP](https://db-ip.com): the offline country and network (ASN) databases (DB-IP Lite), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 - [ip-api.com](https://ip-api.com): fallback IP geolocation and networks. The free batch endpoint is HTTP-only, limited to 15 requests per minute, and [not for commercial use](https://ip-api.com/docs/api:batch)
 - [dnspython](https://www.dnspython.org) and [Quad9](https://quad9.net): encrypted DNS

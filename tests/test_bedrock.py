@@ -143,12 +143,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         session = mock.MagicMock()
-        session.get = lambda url, **kwargs: (urls.append(url), FakeResponse())[1]
+        session.get = lambda url, **kwargs: (urls.append((url, kwargs.get('params'))), FakeResponse())[1]
 
-        await scanbot.check_api(session, 'demo.mcstatus.io', 'bedrock')
-        await scanbot.check_api(session, 'demo.mcstatus.io')
-        self.assertEqual(urls, ['https://api.mcstatus.io/v2/status/bedrock/demo.mcstatus.io',
-                                'https://api.mcstatus.io/v2/status/java/demo.mcstatus.io'])
+        with mock.patch.object(scanbot, 'api_health', scanbot.ApiHealth()):
+            await scanbot.check_api(session, 'demo.mcstatus.io', 'bedrock')
+            await scanbot.check_api(session, 'demo.mcstatus.io')
+        # mcstatus.io gives up on a server after 3 s instead of its default 5
+        self.assertEqual(urls, [('https://api.mcstatus.io/v2/status/bedrock/demo.mcstatus.io', {'timeout': '3'}),
+                                ('https://api.mcstatus.io/v2/status/java/demo.mcstatus.io', {'timeout': '3'})])
 
 
 class RunTests(unittest.IsolatedAsyncioTestCase):

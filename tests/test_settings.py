@@ -19,7 +19,8 @@ import bot as scanbot  # noqa: E402
 import pinger  # noqa: E402
 
 SETTINGS = ('MAX_IPS_PER_SCAN', 'MAX_CONCURRENT_SCANS', 'DIRECT_CONCURRENCY', 'DIRECT_CONCURRENCY_TOTAL',
-            'DIRECT_TIMEOUT', 'API_DELAY', 'GEO_DELAY', 'PROGRESS_INTERVAL', 'GEO_DB_MAX_AGE_DAYS', 'DIRECT_RECHECK')
+            'DIRECT_TIMEOUT', 'API_DELAY', 'GEO_DELAY', 'PROGRESS_INTERVAL', 'GEO_DB_MAX_AGE_DAYS', 'DIRECT_RECHECK',
+            'API_QUERY', 'MCSRVSTAT_DELAY')
 
 
 def import_bot(env, show):
@@ -73,6 +74,33 @@ class EnvNumberTests(unittest.TestCase):
         self.assertEqual(scanbot.DIRECT_CONCURRENCY_TOTAL, 2 * scanbot.DIRECT_CONCURRENCY)
         self.assertEqual((scanbot.DIRECT_TIMEOUT, scanbot.API_DELAY, scanbot.GEO_DELAY), (3, 0.2, 4))
         self.assertEqual((scanbot.PROGRESS_INTERVAL, scanbot.GEO_DB_MAX_AGE_DAYS), (3, 40))
+        self.assertEqual((scanbot.API_QUERY, scanbot.MCSRVSTAT_DELAY), (True, 0.5))
+
+
+class EnvSwitchTests(unittest.TestCase):
+    def switch(self, value, default=True):
+        with mock.patch.dict(os.environ, {'API_QUERY': value}):
+            return scanbot.env_switch('API_QUERY', default)
+
+    def test_unset_and_blank_mean_the_default(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop('API_QUERY', None)
+            self.assertIs(scanbot.env_switch('API_QUERY', True), True)
+        self.assertIs(self.switch(''), True)
+        self.assertIs(self.switch('  ', default=False), False)
+
+    def test_on_and_off_words(self):
+        for value in ('1', 'true', 'Yes', 'ON'):
+            with self.subTest(value=value):
+                self.assertIs(self.switch(value, default=False), True)
+        for value in ('0', 'false', 'No', 'off '):
+            with self.subTest(value=value):
+                self.assertIs(self.switch(value), False)
+
+    def test_anything_else_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.switch('maybe')
+        self.assertEqual(str(caught.exception), "API_QUERY must be on or off, not 'maybe'")
 
 
 class StartupTests(unittest.TestCase):
@@ -95,6 +123,15 @@ class StartupTests(unittest.TestCase):
         self.assertNotIn('started', done.stdout)
         self.assertIn("Error: DIRECT_CONCURRENCY must be a whole number from 1 to 2,000, not 'lots'", done.stdout)
 
+    def test_the_api_settings_come_from_the_environment(self):
+        done = import_bot({'API_QUERY': 'off', 'MCSRVSTAT_DELAY': '2'}, 'bot.API_QUERY, bot.MCSRVSTAT_DELAY')
+        self.assertEqual(done.stdout.strip(), 'False 2.0', done.stderr)
+
+    def test_a_bad_api_query_stops_the_bot(self):
+        done = import_bot({'API_QUERY': 'sometimes'}, '"started"')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("Error: API_QUERY must be on or off, not 'sometimes'", done.stdout)
+
     def test_a_timeout_longer_than_the_pinger_allows_is_refused(self):
         done = import_bot({'DIRECT_TIMEOUT': '11'}, '"started"')
         self.assertEqual(done.returncode, 1)
@@ -109,7 +146,9 @@ class CheckSettingsTests(unittest.TestCase):
             scanbot.check_settings()
         self.assertIn(f"Direct pings: up to {scanbot.DIRECT_CONCURRENCY} per scan "
                       f"({scanbot.DIRECT_CONCURRENCY_TOTAL} for all scans together), 3 s timeout", logs.output[0])
-        self.assertEqual(len(logs.output), 1)
+        self.assertIn("API checks: mcstatus.io every 0.2 s (query on, 3 s server timeout); Java servers it can't "
+                      "check go to mcsrvstat.us, every 0.5 s", logs.output[1])
+        self.assertEqual(len(logs.output), 2)
 
     def test_a_short_api_delay_is_warned_about(self):
         with mock.patch.object(scanbot, 'API_DELAY', 0.1), \
