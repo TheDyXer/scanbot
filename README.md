@@ -256,7 +256,7 @@ Progress and results are posted as normal messages in the channel, not as replie
 
 ### Several people at once
 
-- **Up to 5 scans run at the same time** (`MAX_CONCURRENT_SCANS`), one per person. Start messages, progress and results name whose scan they belong to, so several scans can share a channel.
+- **Up to 5 scans run at the same time** (`MAX_CONCURRENT_SCANS`), one per person, and at most one of them a [campaign](#campaigns) (`MAX_CONCURRENT_CAMPAIGNS`). Start messages, progress and results name whose scan they belong to, so several scans can share a channel.
 - **When all 5 are busy,** a new scan waits in a queue and starts on its own when a slot frees up. The bot says where you are in line; `/stop` takes you out of it.
 - **Moderators** are people with the **Manage Messages** permission. They can stop someone else's scan, or every scan, in their own server. In DMs, everyone can only stop their own.
 - **Scans share the API limits.** mcstatus.io and ip-api.com count requests per bot, not per scan, so scans that use the API take turns. With direct pings working, that rarely matters: only the servers that didn't answer go through the API. When everything goes through the API, 5 checks per second are split between the running scans: two scans get about 2.5 each.
@@ -302,7 +302,7 @@ A list or target with more than 30,000 addresses (`MAX_IPS_PER_SCAN`), up to 2,0
 - **A restart** pauses it like any scan, and it carries on in the same part (see [Restarts and updates](#restarts-and-updates)).
 - **If direct pings stop working** in the middle (the VPN is down) and the API is off, the campaign waits for them, checking again every minute, instead of giving up. Its progress says `Waiting for direct pings`; `/stop` still works.
 - **A list file** may be up to 20 MB (`MAX_FILE_BYTES`), but Discord itself takes at most 10 MB on most servers: about 600,000 IPs. A big target needs no file and takes no memory for its addresses: each part is worked out when it starts.
-- A campaign takes one of the 5 scan slots for as long as it runs, like any scan.
+- **One campaign runs at a time** (`MAX_CONCURRENT_CAMPAIGNS`), in one of the 5 scan slots, for as long as it runs. Another campaign waits in the queue (`🕒 Queued (#N). A campaign is already running`) and starts when it ends, while normal scans keep the other slots: a normal scan queued after a waiting campaign may start first. The preview says when a campaign would have to wait. After a restart, campaigns resume within the same limit.
 
 ### Rescan and diff
 
@@ -436,6 +436,7 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 | `MAX_CAMPAIGN_ADDRESSES` | `2000000` | 1 to 20,000,000 | Most addresses one [campaign](#campaigns) takes. At `MAX_IPS_PER_SCAN` or less, there are no campaigns. Serbia (`country:RS`, about 2.3 million) needs `3000000` |
 | `MAX_FILE_BYTES` | `20000000` | 100,000 to 1,000,000,000 | Largest list file the bot reads, in bytes. Discord's own limit is lower on most servers (10 MB) |
 | `MAX_CONCURRENT_SCANS` | `5` | 1 to 50 | Scans running at the same time (one per person); more wait in a queue |
+| `MAX_CONCURRENT_CAMPAIGNS` | `1` | 1 to 50 | [Campaigns](#campaigns) running at the same time; more wait in the queue while normal scans keep the other slots. At `MAX_CONCURRENT_SCANS` or more, campaigns can take every slot for hours, and the log warns about it |
 | `DIRECT_CONCURRENCY` | `300` | 1 to 2,000 | Direct pings in flight at the same time, per scan |
 | `DIRECT_CONCURRENCY_TOTAL` | twice `DIRECT_CONCURRENCY` | 1 to 20,000 | Direct pings in flight for all scans together |
 | `DIRECT_TIMEOUT` | `3` | 0.5 to 10 | Seconds to wait for a server to answer a direct ping |
@@ -735,6 +736,7 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `Improper token has been passed`, or the installer says `Discord rejected the token` | Wrong or reset token | Copy a fresh token from the Developer Portal, then run the installer again with `--token` (see [One-line installer](#one-line-installer)) |
 | `⏳ You already have a scan running or queued` | Everyone gets one scan at a time | Wait for it to finish, or `/stop` it first |
 | `🕒 Queued (#N)` | All `MAX_CONCURRENT_SCANS` slots are busy | Nothing to do: it starts on its own. `/stop` cancels it |
+| `🕒 Queued (#N). A campaign is already running` | Another campaign runs, and only `MAX_CONCURRENT_CAMPAIGNS` run at a time | Nothing to do: it starts when that one ends. To run more at once, raise `MAX_CONCURRENT_CAMPAIGNS` in `.env` |
 | `❌ Only moderators ... can stop other people's scans` | `/stop` named someone else, or `all`, without the **Manage Messages** permission | Ask a moderator, or `/stop` without options to stop your own |
 | `⚠️ No valid IPs in the file` | Every line was blank, a comment, or not an address | One IP, hostname or range per line; IPv6 isn't supported |
 | `📋 Campaign preview: ...` | The list or target has more addresses than one scan takes | Nothing is running yet: run the command the preview shows, with `confirm:yes`, to start the [campaign](#campaigns) |
