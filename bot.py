@@ -132,6 +132,9 @@ try:
     # The most addresses a campaign scans. A list or target bigger than MAX_IPS_PER_SCAN runs as a campaign: in
     # parts of MAX_IPS_PER_SCAN, one after another in one slot, after a preview. Below MAX_IPS_PER_SCAN: no campaigns.
     MAX_CAMPAIGN_ADDRESSES = env_int('MAX_CAMPAIGN_ADDRESSES', 2_000_000, 1, 20_000_000)
+    # Campaigns running at the same time. Each holds a scan slot for hours, so the other slots stay free for normal
+    # scans: a campaign over the limit waits in the queue, and normal scans queued after it may start first
+    MAX_CONCURRENT_CAMPAIGNS = env_int('MAX_CONCURRENT_CAMPAIGNS', 1, 1, 50)
     # Largest list file the bot reads. Discord's own limit is lower on most servers (10 MB); a plain list of
     # 30,000 IPs is about 0.5 MB
     MAX_FILE_BYTES = env_int('MAX_FILE_BYTES', 20_000_000, 100_000, 1_000_000_000)
@@ -474,25 +477,61 @@ store = None  # The jobs.JobStore that scans are saved in, or None when they can
 def running_count():
     return sum(1 for s in scans.values() if s.running)
 
+def is_campaign(scan):
+    """A campaign scans in more than one part, so it holds its slot for hours (a /rescan that big counts too)."""
+    job = getattr(scan, 'job', None)
+    return job is not None and (job.parts or 0) > 1
+
+def running_campaigns():
+    return sum(1 for s in scans.values() if s.running and is_campaign(s))
+
+def may_start(scan):
+    """Whether a scan could take a slot now: one is free, and for a campaign, fewer than MAX_CONCURRENT_CAMPAIGNS run."""
+    if running_count() >= MAX_CONCURRENT_SCANS:
+        return False
+    return not is_campaign(scan) or running_campaigns() < MAX_CONCURRENT_CAMPAIGNS
+
 def claim_slot(scan):
     """
-    Starts the scan right away if a slot is free and nobody is waiting, otherwise queues it.
-    Returns its place in the queue, or 0 if it can start now.
+    Starts the scan right away if it may take a slot and no queued scan could take it first, otherwise queues it.
+    Returns its place in the queue, or 0 if it can start now. A queued campaign that is only waiting for a campaign
+    slot doesn't hold up a normal scan.
     """
-    if not queue and running_count() < MAX_CONCURRENT_SCANS:
+    if may_start(scan) and not any(may_start(s) for s in queue):
         scan.running = True
         return 0
     queue.append(scan)
     return len(queue)
 
 def start_queued():
-    """Hands free slots to queued scans, oldest first. Not while shutting down: they're being cancelled."""
+    """
+    Hands free slots to queued scans, oldest first, passing over campaigns while MAX_CONCURRENT_CAMPAIGNS are
+    running. Not while shutting down: they're being cancelled.
+    """
     if shutting_down:
         return
-    while queue and running_count() < MAX_CONCURRENT_SCANS:
-        scan = queue.pop(0)
-        scan.running = True
-        scan.turn.set()
+    for scan in list(queue):
+        if running_count() >= MAX_CONCURRENT_SCANS:
+            break
+        if may_start(scan):
+            queue.remove(scan)
+            scan.running = True
+            scan.turn.set()
+
+def campaigns_running_text():
+    """How many campaigns are running and how many may, for the queue message and the preview."""
+    running = running_campaigns()
+    now = "A campaign is already running" if running == 1 else f"{running} campaigns are already running"
+    if MAX_CONCURRENT_CAMPAIGNS == 1:
+        return now + " (only one runs at a time)"
+    return now + f" (at most {MAX_CONCURRENT_CAMPAIGNS} at a time)"
+
+def campaign_slots_text():
+    """The campaign limit, for /help."""
+    if MAX_CONCURRENT_CAMPAIGNS == 1:
+        return "Only one campaign runs at a time; others wait in the queue while normal scans go on."
+    return (f"At most {MAX_CONCURRENT_CAMPAIGNS} campaigns run at a time; others wait in the queue while normal "
+            "scans go on.")
 
 def request_stop(scan, by=None, reason='user'):
     scan.stopped_by = by
@@ -2053,7 +2092,8 @@ async def help(ctx):
         name="Campaigns: more than " + f"{MAX_IPS_PER_SCAN} addresses",
         value=f"A list or target with up to {campaign_cap():,} addresses runs as a campaign: in parts of "
               f"{MAX_IPS_PER_SCAN:,}, one after another, with one result at the end. `/scan` first shows how long "
-              "it may take; run it again with `confirm:yes` to start (`!scan asn:AS8400 java auto yes`)."
+              "it may take; run it again with `confirm:yes` to start (`!scan asn:AS8400 java auto yes`). "
+              + campaign_slots_text()
               if campaign_cap() > MAX_IPS_PER_SCAN else
               "Campaigns are switched off on this bot.",
         inline=False
@@ -2363,6 +2403,8 @@ async def campaign_preview(ctx, loaded, file, target, edition, api, api_retry):
     else:
         lines.append(f"⏱️ Up to about **{took}** with direct pings only: a server that doesn't answer counts as "
                      "offline.")
+    if running_campaigns() >= MAX_CONCURRENT_CAMPAIGNS:
+        lines.append(f"🕒 {campaigns_running_text()}: this one would wait in the queue until one ends.")
     lines.append(f"▶️ To start it: `{confirm_command(ctx, file, target, edition, api)}`")
     if direct_ok and not api_retry:
         more = rough_duration(total * API_DELAY)
@@ -2672,6 +2714,10 @@ async def run_job(ctx, scan, job, ips, place=None, resumed=False):
         if resumed:
             await tell(f"🕒 {owner}, your scan is back in the queue (#{place}) after the restart. It carries on when "
                        "a slot frees up; `/stop` cancels it.")
+        elif is_campaign(scan) and running_campaigns() >= MAX_CONCURRENT_CAMPAIGNS:
+            await tell(f"🕒 **Queued** (#{place}). {campaigns_running_text()}, so your campaign of {total_ips} IPs "
+                       "starts automatically when one ends; normal scans keep their slots meanwhile. `/stop` "
+                       "cancels it.")
         else:
             await tell(f"🕒 **Queued** (#{place}). All {MAX_CONCURRENT_SCANS} scan slots are busy; your scan of "
                        f"{total_ips} IPs starts automatically when one frees up. `/stop` cancels it.")
@@ -3073,6 +3119,9 @@ def check_settings():
     if API_DELAY < 0.2:
         log.warning("API_DELAY is %s: below 0.2, mcstatus.io rate-limits the bot, which makes scans slower, not faster",
                     show_number(API_DELAY))
+    if 1 < MAX_CONCURRENT_SCANS <= MAX_CONCURRENT_CAMPAIGNS:
+        log.warning("MAX_CONCURRENT_CAMPAIGNS is %d: campaigns can take all %d scan slots for hours, and normal scans "
+                    "then wait in the queue", MAX_CONCURRENT_CAMPAIGNS, MAX_CONCURRENT_SCANS)
     # Each ping in flight holds a socket, and with the VPN a connection to the pinger as well
     wanted = 2 * min(DIRECT_CONCURRENCY_TOTAL, MAX_CONCURRENT_SCANS * DIRECT_CONCURRENCY) + 1024
     limits = pinger.raise_file_limit(wanted)

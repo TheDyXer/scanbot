@@ -22,7 +22,7 @@ import pinger  # noqa: E402
 SETTINGS = ('MAX_IPS_PER_SCAN', 'MAX_CONCURRENT_SCANS', 'DIRECT_CONCURRENCY', 'DIRECT_CONCURRENCY_TOTAL',
             'DIRECT_TIMEOUT', 'API_DELAY', 'GEO_DELAY', 'PROGRESS_INTERVAL', 'GEO_DB_MAX_AGE_DAYS', 'DIRECT_RECHECK',
             'API_QUERY', 'MCSRVSTAT_DELAY', 'CHECKPOINT_INTERVAL', 'KEEP_FINISHED_PER_USER', 'STATE_DIR',
-            'MAX_CAMPAIGN_ADDRESSES', 'MAX_FILE_BYTES')
+            'MAX_CAMPAIGN_ADDRESSES', 'MAX_FILE_BYTES', 'MAX_CONCURRENT_CAMPAIGNS')
 
 
 def import_bot(env, show):
@@ -123,6 +123,13 @@ class StartupTests(unittest.TestCase):
         done = import_bot({'MAX_FILE_BYTES': '5000000', 'MAX_CAMPAIGN_ADDRESSES': '1'},
                           'bot.MAX_FILE_BYTES, bot.campaign_cap()')
         self.assertEqual(done.stdout.strip(), '5000000 30000', done.stderr)
+
+    def test_the_campaign_limit_is_a_setting(self):
+        done = import_bot({'MAX_CONCURRENT_CAMPAIGNS': '2'}, 'bot.MAX_CONCURRENT_CAMPAIGNS')
+        self.assertEqual(done.stdout.strip(), '2', done.stderr)
+        done = import_bot({'MAX_CONCURRENT_CAMPAIGNS': '0'}, '"started"')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('MAX_CONCURRENT_CAMPAIGNS', done.stdout)
 
     def test_a_bad_value_stops_the_bot_with_a_clear_message(self):
         done = import_bot({'DIRECT_CONCURRENCY': 'lots'}, '"started"')
