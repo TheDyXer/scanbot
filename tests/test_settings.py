@@ -13,6 +13,7 @@ from unittest import mock
 # bot.py exits at import time without a token
 os.environ.setdefault('DISCORD_TOKEN', 'test-token')
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+ROOT_ABS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import bot as scanbot  # noqa: E402
@@ -20,7 +21,7 @@ import pinger  # noqa: E402
 
 SETTINGS = ('MAX_IPS_PER_SCAN', 'MAX_CONCURRENT_SCANS', 'DIRECT_CONCURRENCY', 'DIRECT_CONCURRENCY_TOTAL',
             'DIRECT_TIMEOUT', 'API_DELAY', 'GEO_DELAY', 'PROGRESS_INTERVAL', 'GEO_DB_MAX_AGE_DAYS', 'DIRECT_RECHECK',
-            'API_QUERY', 'MCSRVSTAT_DELAY')
+            'API_QUERY', 'MCSRVSTAT_DELAY', 'CHECKPOINT_INTERVAL', 'KEEP_FINISHED_PER_USER', 'STATE_DIR')
 
 
 def import_bot(env, show):
@@ -75,6 +76,8 @@ class EnvNumberTests(unittest.TestCase):
         self.assertEqual((scanbot.DIRECT_TIMEOUT, scanbot.API_DELAY, scanbot.GEO_DELAY), (3, 0.2, 4))
         self.assertEqual((scanbot.PROGRESS_INTERVAL, scanbot.GEO_DB_MAX_AGE_DAYS), (3, 40))
         self.assertEqual((scanbot.API_QUERY, scanbot.MCSRVSTAT_DELAY), (True, 0.5))
+        self.assertEqual((scanbot.CHECKPOINT_INTERVAL, scanbot.KEEP_FINISHED_PER_USER), (10, 5))
+        self.assertEqual(scanbot.STATE_DIR, os.path.join(ROOT_ABS, 'state'))  # Next to bot.py without Docker
 
 
 class EnvSwitchTests(unittest.TestCase):
@@ -126,6 +129,16 @@ class StartupTests(unittest.TestCase):
     def test_the_api_settings_come_from_the_environment(self):
         done = import_bot({'API_QUERY': 'off', 'MCSRVSTAT_DELAY': '2'}, 'bot.API_QUERY, bot.MCSRVSTAT_DELAY')
         self.assertEqual(done.stdout.strip(), 'False 2.0', done.stderr)
+
+    def test_the_saving_settings_come_from_the_environment(self):
+        done = import_bot({'CHECKPOINT_INTERVAL': '30', 'KEEP_FINISHED_PER_USER': '2', 'STATE_DIR': '/state'},
+                          'bot.CHECKPOINT_INTERVAL, bot.KEEP_FINISHED_PER_USER, bot.STATE_DIR')
+        self.assertEqual(done.stdout.strip(), '30 2 /state', done.stderr)
+
+    def test_keeping_fewer_than_two_finished_scans_is_refused(self):
+        done = import_bot({'KEEP_FINISHED_PER_USER': '1'}, '"started"')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('KEEP_FINISHED_PER_USER must be a whole number from 2 to 1,000', done.stdout)
 
     def test_a_bad_api_query_stops_the_bot(self):
         done = import_bot({'API_QUERY': 'sometimes'}, '"started"')

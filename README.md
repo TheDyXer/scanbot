@@ -56,6 +56,7 @@ First time? Create the Discord bot first; see [Discord bot setup](#discord-bot-s
 - **Slash commands** (`/scan`, `/stop`, `/help`) and the older `!scan`, `!stop`, `!help`; both do the same thing
 - **Several people can scan at once:** up to 5 scans run side by side, one per person, and more wait in a queue
 - **`/stop` at any point**, which posts what was found so far. It stops your own scan; moderators can stop anyone's
+- **Survives restarts:** a scan is saved as it runs, so an update, a crash or a reboot pauses it, and it carries on where it left off once the bot is back
 - **Country flags** for every online server, including hostnames and `host:port` entries, from an offline database: instant, no rate limits, and server IPs stay on your machine (only the few the database doesn't know are looked up at ip-api.com)
 - **Results as files** (`scan_results.txt`, `scan_results.csv`, `scan_results.json`) when they don't fit in one message. A huge scan's files are split to fit Discord's upload limit and arrive as several messages
 - **More than player counts** in the files: each server's network (AS number and name, from a second offline database), latency, protocol, software, plugins, Forge mods, secure chat, and Bedrock's game mode and map, as far as the server tells
@@ -111,14 +112,15 @@ curl -fsSL https://raw.githubusercontent.com/TheDyXer/scanbot/main/install.sh | 
 
 The installer:
 
-1. Creates a `scanbot` folder with the compose file and a `data` folder next to it:
+1. Creates a `scanbot` folder with the compose file, a `data` folder and a `state` folder next to it:
 
    ```text
    scanbot/
    ├── docker-compose.yml
    ├── .env              # settings: user ID, time zone
-   └── data/
-       └── token.txt     # your bot token
+   ├── data/
+   │   └── token.txt     # your bot token
+   └── state/            # running and recent scans, so a restart resumes them
    ```
 
 2. Asks for your bot token (hidden while you type) and saves it to `data/token.txt`, readable only by you.
@@ -131,7 +133,7 @@ Running it again is safe: it keeps your files and pulls the latest version. It a
 This works everywhere Docker does, including Docker Desktop on Windows and macOS:
 
 1. Make a folder and download [`docker-compose.yml`](docker-compose.yml) into it.
-2. Create a `data` folder next to it and put your token in `data/token.txt`.
+2. Create `data` and `state` folders next to it and put your token in `data/token.txt`. The bot saves its scans in `state`, so it must be able to write there: on Linux, give it to user `1000` (`sudo chown 1000:1000 state`), or to your `SCANBOT_UID` (see below). Without that the bot still works, but a restart ends running scans.
 3. Start it:
 
    ```bash
@@ -155,13 +157,13 @@ To uninstall, run `docker compose down --rmi all` and delete the folder.
 
 ### Automatic updates
 
-The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one. A scan that is running at that moment is stopped: it posts what it found so far, with a note that the bot is restarting, and the rest of the list isn't checked. Queued scans are cancelled and their owners told. So start very large scans (a 30,000-IP scan can take well over an hour) outside that time.
+The compose file includes [Watchtower](https://github.com/nicholas-fedor/watchtower), which checks for a new scanbot image **every day at 4 AM** and restarts the bot on the new version if there is one. A scan that is running at that moment is paused and carries on once the bot is back, usually within a minute; queued scans keep their place (see [Restarts and updates](#restarts-and-updates)).
 
 - It only touches scanbot, never your other containers.
 - The time zone is `TZ` in `.env` (default `UTC`), for example `TZ=Europe/Budapest`. It's also the time zone of the bot's log.
 - The image is also rebuilt weekly for security fixes, so expect a restart about once a week even without new features.
 - Watchtower needs access to the Docker socket to restart the bot.
-- Docker gives the bot 45 seconds to post those results (`stop_grace_period` in `docker-compose.yml`), and so does this Watchtower. The same happens on `docker compose stop`, `restart` or `down`. If your own Watchtower updates scanbot instead, note that the original `containrrr/watchtower` waits only 10 seconds: start it with `--stop-timeout 45s`.
+- Docker gives the bot 45 seconds to save running scans, or to post what they found when it can't save them (`stop_grace_period` in `docker-compose.yml`), and so does this Watchtower. The same happens on `docker compose stop`, `restart` or `down`. If your own Watchtower updates scanbot instead, note that the original `containrrr/watchtower` waits only 10 seconds: start it with `--stop-timeout 45s`.
 - Watchtower updates the bot, not `docker-compose.yml`. When a new version needs a changed compose file (a new setting, for example), run the [installer](#one-line-installer) again: it updates the file for you.
 
 **Already run Watchtower on this machine?** Delete the `watchtower:` block from `docker-compose.yml`. The scanbot container has the `com.centurylinklabs.watchtower.enable=true` label, so your existing Watchtower updates it. Keeping both can make an older Watchtower stop the new one. When the installer updates `docker-compose.yml`, it leaves the block out again.
@@ -189,7 +191,7 @@ Then run:
 python bot.py
 ```
 
-To keep it running and start it at boot, see [Keep it running without Docker](#keep-it-running-without-docker-linux).
+Scans are saved in a `state` folder next to `bot.py`, so a restart resumes them; set `STATE_DIR` to put them elsewhere. To keep it running and start it at boot, see [Keep it running without Docker](#keep-it-running-without-docker-linux).
 
 ### Startup log
 
@@ -352,6 +354,17 @@ flowchart TD
 
 `/stop` works in every phase. Direct pings already in flight finish (at most 3 seconds), API checks in flight are dropped, and nothing new starts.
 
+### Restarts and updates
+
+Every scan is saved in the `state` folder (`STATE_DIR`) while it runs: the list, how far it has got, and what it has found. The progress is saved every 10 seconds (`CHECKPOINT_INTERVAL`) and at the end of each phase.
+
+- **Stopping the bot** (an update, `docker compose stop` or `restart`, `systemctl stop`) pauses every running scan. Its progress message says so, and nothing is posted yet. Queued scans keep their place.
+- **When the bot is back**, each scan carries on from where it got to. It posts `Scan resumed` with how far it had got, and its results include everything it found before and after the restart. The time in the results counts only the time it ran.
+- **A crash or a power cut** loses at most the last 10 seconds: the servers being checked at that moment are checked again.
+- **If the channel is gone,** or the bot can't post there any more, the scan carries on in its owner's DMs. If the bot can't send them a DM either, the scan is dropped, and the log says why.
+- **Finished scans** are kept with their results, the newest 5 per person (`KEEP_FINISHED_PER_USER`). Older ones are deleted.
+- **If the folder can't be written,** the log says `Scans can't be saved` with the fix. Scans still work, but stopping the bot ends them: each posts what it found so far, with a note that the bot is restarting.
+
 ## Configuration
 
 These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_CONCURRENCY=100`). Run `docker compose up -d` afterwards to apply them. Without Docker, set them as environment variables, for the systemd service in `/etc/scanbot.env`. A value that isn't allowed stops the bot at startup with a message naming the setting and its range. An install made before these settings existed has a `docker-compose.yml` that doesn't pass them on: run the installer again, which updates the file.
@@ -370,6 +383,9 @@ These settings go in `.env`, next to `docker-compose.yml` (for example `DIRECT_C
 | `PROGRESS_INTERVAL` | `3` | 2 to 600 | Seconds between progress message updates |
 | `GEO_DB_MAX_AGE_DAYS` | `40` | 1 to 3,650 | Download a new country database when the current one is older than this (without Docker) |
 | `DIRECT_RECHECK` | `300` | 10 to 86,400 | Without the VPN: seconds between new tries of direct pings while they don't work |
+| `CHECKPOINT_INTERVAL` | `10` | 2 to 600 | Seconds between saves of a running scan's progress: a crash loses at most this much |
+| `KEEP_FINISHED_PER_USER` | `5` | 2 to 1,000 | Finished scans kept per person, with their results |
+| `STATE_DIR` | `/state` in Docker, else `state` next to `bot.py` | A folder the bot can write to | Where scans are saved (see [Restarts and updates](#restarts-and-updates)) |
 
 These are fixed in `bot.py`:
 
@@ -614,7 +630,7 @@ journalctl -u scanbot -f    # follow the log
 
 If you installed the packages in a virtual environment, point `ExecStart` at its Python, for example `/opt/scanbot/venv/bin/python`.
 
-`systemctl stop scanbot` and `systemctl restart scanbot` stop running scans the way an update does with Docker: each posts what it found so far before the bot exits, within about 35 seconds (systemd waits up to 90).
+`systemctl stop scanbot` and `systemctl restart scanbot` pause running scans the way an update does with Docker: they're saved in `/opt/scanbot/state` and carry on when the bot starts again, so the `scanbot` user must be able to write there (or set `STATE_DIR` in `/etc/scanbot.env`). If it can't, each scan posts what it found so far before the bot exits, within about 35 seconds (systemd waits up to 90).
 
 ## Troubleshooting
 
@@ -655,7 +671,9 @@ If you installed the packages in a virtual environment, point `ExecStart` at its
 | `No country database` at startup | The database couldn't be downloaded or saved | Check that `download.db-ip.com` is reachable and the folder with `bot.py` is writable. Flags still work through ip-api.com |
 | Many known-online servers missing | mcstatus.io rate-limited the bot, or both status services called them offline | The log shows `mcstatus.io is rate-limiting the bot` when it happened. Don't run other tools using the API from the same IP, and leave `API_DELAY` at `0.2` or higher. Servers that only answer by hostname need their hostname in the list |
 | `❔ N couldn't be checked` in the results | mcstatus.io (and, for Java, mcsrvstat.us) didn't answer about those servers: rate limits, outages or timeouts | Scan them again later. The log says when mcstatus.io failed often enough for Java checks to switch to mcsrvstat.us |
-| Results say `The bot is restarting`, or `your queued scan was cancelled because the bot is restarting` | The bot was stopped or updated while the scan ran or waited (Watchtower checks daily at 4 AM) | Start the scan again; the results show what was already found. Start very large scans outside the update time |
+| Results say `The bot is restarting`, or `your queued scan was cancelled because the bot is restarting` | The bot was stopped or updated while the scan ran or waited, and it couldn't save the scan to resume it (the log says `Scans can't be saved`) | Start the scan again; the results show what was already found. Then fix the `state` folder (next row), so the next restart resumes scans instead |
+| Log says `Scans can't be saved in /state` | `docker-compose.yml` is older than this version, or the `state` folder belongs to root (Docker creates a missing folder as root) | Run the [installer](#one-line-installer) again, or `sudo chown 1000:1000 state` (your `SCANBOT_UID` and `SCANBOT_GID`) in the scanbot folder, then `docker compose up -d` |
+| A scan carried on in my DMs after a restart | Its channel was deleted, or the bot can't see or post in it any more | Nothing to do: the results come in the DM. Give the bot back its permissions for the next scan |
 | `Error: DIRECT_CONCURRENCY must be a whole number from 1 to 2,000, not '...'` at startup (or another setting) | A setting in `.env` isn't a number, or is out of range | Fix it or delete the line: an empty or missing value means the default. The message gives the allowed range |
 | Log says `Only N files can be open at once` | The system's open-file limit is lower than `DIRECT_CONCURRENCY` needs, so some pings fail and count as offline | Run the [installer](#one-line-installer) again (its `docker-compose.yml` raises the limit), add `LimitNOFILE=65536` to the systemd unit, or lower `DIRECT_CONCURRENCY` |
 | `dmesg` shows `nf_conntrack: table full, dropping packet`, or the bot loses Discord during big scans | Too many unanswered pings at once for the kernel's connection table | Lower `DIRECT_CONCURRENCY_TOTAL`, or raise `net.netfilter.nf_conntrack_max` |

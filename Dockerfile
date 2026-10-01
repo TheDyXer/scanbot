@@ -44,7 +44,7 @@ for kind in ("country", "asn"):
         raise SystemExit(f"Could not download the DB-IP {kind} database")
 EOF
 
-COPY bot.py pinger.py vpn_select.py vpn_switch.py ./
+COPY bot.py jobs.py pinger.py vpn_select.py vpn_switch.py ./
 
 # The bot reads token.txt from its working directory, so mount the folder
 # holding token.txt at /data

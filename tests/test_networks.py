@@ -117,8 +117,8 @@ class ScanLookupTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.channel.send = mock.AsyncMock()
         self.send_results = mock.AsyncMock()
 
-        async def fake_run_direct(ips, results, state, edition='java', stop=None):
-            results.update({ip: bot.make_result(ip, ip, 1, 10, [], '1.21', '') for ip in ips})
+        async def fake_run_direct(ips, results, state, edition='java', stop=None, offset=0):
+            results.update({ip: bot.make_result(ip, ip, 1, 10, [], '1.21', '', source='direct') for ip in ips})
             return []
 
         async def fake_locations(session, ips, stop=None, networks=None):
