@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 LABEL org.opencontainers.image.source="https://github.com/TheDyXer/scanbot" \
       org.opencontainers.image.description="Discord bot that scans lists of Minecraft Java and Bedrock servers" \
